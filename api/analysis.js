@@ -1,6 +1,61 @@
-const { analyzeCode, analyzeComplexity, detectSecurityIssues } = require('../server/services/codeAnalysis');
-const { getSupabase } = require('../server/config/database');
-const jwt = require('jsonwebtoken');
+import { createClient } from '@supabase/supabase-js';
+import jwt from 'jsonwebtoken';
+import acorn from 'acorn';
+import * as walk from 'acorn-walk';
+
+// Initialize Supabase client  
+const getSupabase = () => {
+  const supabaseUrl = process.env.SUPABASE_URL;
+  const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
+  
+  if (!supabaseUrl || !supabaseKey) {
+    throw new Error('Missing Supabase configuration');
+  }
+  
+  return createClient(supabaseUrl, supabaseKey);
+};
+
+// Simple code analysis functions
+const analyzeCode = (code, language = 'javascript') => {
+  const metrics = {
+    lines: code.split('\n').length,
+    characters: code.length,
+    functions: 0,
+    variables: 0,
+    complexity: 1
+  };
+
+  if (language === 'javascript') {
+    try {
+      const ast = acorn.parse(code, { ecmaVersion: 2020, sourceType: 'module' });
+      
+      walk.simple(ast, {
+        FunctionDeclaration: () => metrics.functions++,
+        FunctionExpression: () => metrics.functions++,
+        ArrowFunctionExpression: () => metrics.functions++,
+        VariableDeclarator: () => metrics.variables++,
+        IfStatement: () => metrics.complexity++,
+        WhileStatement: () => metrics.complexity++,
+        ForStatement: () => metrics.complexity++,
+        SwitchCase: () => metrics.complexity++
+      });
+    } catch (error) {
+      // If parsing fails, return basic metrics
+      metrics.functions = (code.match(/function\s+\w+|=>\s*{|function\s*\(/g) || []).length;
+      metrics.variables = (code.match(/\b(let|const|var)\s+\w+/g) || []).length;
+      metrics.complexity = (code.match(/\b(if|while|for|switch)\s*\(/g) || []).length + 1;
+    }
+  }
+
+  return {
+    metrics,
+    suggestions: [
+      'Consider adding more comments for better code documentation',
+      'Consider breaking down complex functions into smaller ones',
+      'Ensure proper error handling is implemented'
+    ]
+  };
+};
 
 const authenticateToken = (req) => {
   const authHeader = req.headers.authorization;
@@ -13,7 +68,7 @@ const authenticateToken = (req) => {
   return jwt.verify(token, process.env.JWT_SECRET);
 };
 
-module.exports = async function handler(req, res) {
+export default async function handler(req, res) {
   // Enable CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');

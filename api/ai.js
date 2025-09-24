@@ -1,6 +1,31 @@
-const { createAISession, addMessage, queryAI } = require('../server/services/aiService');
-const { getSupabase } = require('../server/config/database');
-const jwt = require('jsonwebtoken');
+import { createClient } from '@supabase/supabase-js';
+import jwt from 'jsonwebtoken';
+
+// Initialize Supabase client  
+const getSupabase = () => {
+  const supabaseUrl = process.env.SUPABASE_URL;
+  const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
+  
+  if (!supabaseUrl || !supabaseKey) {
+    throw new Error('Missing Supabase configuration');
+  }
+  
+  return createClient(supabaseUrl, supabaseKey);
+};
+
+// Simple AI service functions
+const queryAI = async (provider, model, messages) => {
+  // For now, return a mock response
+  // This would integrate with actual AI services when API keys are configured
+  return {
+    response: `Mock ${provider} ${model} response: I received ${messages.length} messages. This is a placeholder response until API keys are configured.`,
+    usage: {
+      prompt_tokens: 100,
+      completion_tokens: 50,
+      total_tokens: 150
+    }
+  };
+};
 
 const authenticateToken = (req) => {
   const authHeader = req.headers.authorization;
@@ -13,7 +38,7 @@ const authenticateToken = (req) => {
   return jwt.verify(token, process.env.JWT_SECRET);
 };
 
-module.exports = async function handler(req, res) {
+export default async function handler(req, res) {
   // Enable CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');

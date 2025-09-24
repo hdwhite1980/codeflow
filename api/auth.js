@@ -1,6 +1,6 @@
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
-const { createClient } = require('@supabase/supabase-js');
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
+import { createClient } from '@supabase/supabase-js';
 
 // Initialize Supabase client
 const getSupabase = () => {
@@ -14,7 +14,7 @@ const getSupabase = () => {
   return createClient(supabaseUrl, supabaseKey);
 };
 
-module.exports = async function handler(req, res) {
+export default async function handler(req, res) {
   // Enable CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
