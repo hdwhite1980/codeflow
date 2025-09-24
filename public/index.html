@@ -85,22 +85,19 @@
                     });
                     
                     if (!response.ok) {
-                        throw new Error(`HTTP error! status: ${response.status}`);
+                        const errorData = await response.json().catch(() => ({}));
+                        throw new Error(errorData.error || `HTTP error! status: ${response.status}`);
                     }
                     
-                    const text = await response.text();
-                    let data;
-                    try {
-                        data = JSON.parse(text);
-                    } catch (e) {
-                        console.error('Invalid JSON response:', text);
-                        throw new Error('Server returned invalid response');
-                    }
+                    const data = await response.json();
                     
-                    if (data.token) {
-                        setToken(data.token);
+                    if (data.session && data.user) {
+                        // Store the access token from Supabase session
+                        const token = data.session.access_token;
+                        setToken(token);
                         setUser(data.user);
-                        localStorage.setItem('authToken', data.token);
+                        localStorage.setItem('authToken', token);
+                        localStorage.setItem('refreshToken', data.session.refresh_token);
                         return true;
                     }
                     throw new Error(data.error || 'Login failed');
@@ -119,22 +116,19 @@
                     });
                     
                     if (!response.ok) {
-                        throw new Error(`HTTP error! status: ${response.status}`);
+                        const errorData = await response.json().catch(() => ({}));
+                        throw new Error(errorData.error || `HTTP error! status: ${response.status}`);
                     }
                     
-                    const text = await response.text();
-                    let data;
-                    try {
-                        data = JSON.parse(text);
-                    } catch (e) {
-                        console.error('Invalid JSON response:', text);
-                        throw new Error('Server returned invalid response');
-                    }
+                    const data = await response.json();
                     
-                    if (data.token) {
-                        setToken(data.token);
+                    if (data.session && data.user) {
+                        // Store the access token from Supabase session
+                        const token = data.session.access_token;
+                        setToken(token);
                         setUser(data.user);
-                        localStorage.setItem('authToken', data.token);
+                        localStorage.setItem('authToken', token);
+                        localStorage.setItem('refreshToken', data.session.refresh_token);
                         return true;
                     }
                     throw new Error(data.error || 'Registration failed');
@@ -148,6 +142,7 @@
                 setToken(null);
                 setUser(null);
                 localStorage.removeItem('authToken');
+                localStorage.removeItem('refreshToken');
             };
             
             return (

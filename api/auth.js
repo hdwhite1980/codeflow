@@ -1,3 +1,22 @@
+const { createClient } = require('@supabase/supabase-js');
+
+// Initialize Supabase client
+function getSupabaseClient() {
+  const supabaseUrl = process.env.SUPABASE_URL;
+  const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  
+  if (!supabaseUrl || !supabaseServiceKey) {
+    throw new Error('Missing Supabase configuration. Please set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY environment variables.');
+  }
+  
+  return createClient(supabaseUrl, supabaseServiceKey, {
+    auth: {
+      autoRefreshToken: false,
+      persistSession: false
+    }
+  });
+}
+
 module.exports = async (req, res) => {
   // Enable CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -12,49 +31,139 @@ module.exports = async (req, res) => {
     const { action, email, password, name } = req.body || {};
 
     try {
-      if (action === 'register') {
-        // Mock registration
-        const mockUser = {
-          id: Date.now().toString(),
-          email,
-          name,
-          created_at: new Date().toISOString()
-        };
+      const supabase = getSupabaseClient();
 
-        const token = `token_${Date.now()}`;
+      if (action === 'register') {
+        if (!email || !password || !name) {
+          return res.status(400).json({ error: 'Email, password, and name are required' });
+        }
+
+        // Create user account
+        const { data: authData, error: authError } = await supabase.auth.admin.createUser({
+          email,
+          password,
+          email_confirm: true,
+          user_metadata: {
+            name: name
+          }
+        });
+
+        if (authError) {
+          return res.status(400).json({ error: authError.message });
+        }
+
+        // Create user profile
+        const { error: profileError } = await supabase
+          .from('profiles')
+          .insert([
+            {
+              id: authData.user.id,
+              email: authData.user.email,
+              name: name,
+              created_at: new Date().toISOString()
+            }
+          ]);
+
+        if (profileError) {
+          console.warn('Profile creation failed:', profileError.message);
+        }
 
         return res.status(200).json({
-          token,
-          user: mockUser
+          user: {
+            id: authData.user.id,
+            email: authData.user.email,
+            name: name,
+            created_at: authData.user.created_at
+          },
+          session: authData.session
         });
 
       } else if (action === 'login') {
-        // Mock login - accepts any email/password
-        if (email && password) {
-          const mockUser = {
-            id: Date.now().toString(),
-            email,
-            name: email.split('@')[0],
-            created_at: new Date().toISOString()
-          };
-
-          const token = `token_${Date.now()}`;
-
-          return res.status(200).json({
-            token,
-            user: mockUser
-          });
-        } else {
-          return res.status(401).json({ error: 'Email and password required' });
+        if (!email || !password) {
+          return res.status(400).json({ error: 'Email and password are required' });
         }
+
+        // Sign in user
+        const { data: authData, error: authError } = await supabase.auth.signInWithPassword({
+          email,
+          password
+        });
+
+        if (authError) {
+          return res.status(401).json({ error: authError.message });
+        }
+
+        // Get user profile
+        const { data: profile } = await supabase
+          .from('profiles')
+          .select('name')
+          .eq('id', authData.user.id)
+          .single();
+
+        return res.status(200).json({
+          user: {
+            id: authData.user.id,
+            email: authData.user.email,
+            name: profile?.name || authData.user.email.split('@')[0],
+            created_at: authData.user.created_at
+          },
+          session: authData.session
+        });
 
       } else {
         return res.status(400).json({ error: 'Invalid action. Use "login" or "register"' });
       }
+
     } catch (error) {
-      return res.status(500).json({ error: error.message || 'Authentication failed' });
+      console.error('Auth error:', error);
+      return res.status(500).json({ 
+        error: error.message || 'Authentication failed',
+        details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+      });
     }
+
+  } else if (req.method === 'GET') {
+    // Verify token endpoint
+    try {
+      const authorization = req.headers.authorization;
+      if (!authorization || !authorization.startsWith('Bearer ')) {
+        return res.status(401).json({ error: 'Missing or invalid authorization header' });
+      }
+
+      const token = authorization.split(' ')[1];
+      const supabase = getSupabaseClient();
+
+      const { data: { user }, error } = await supabase.auth.getUser(token);
+
+      if (error || !user) {
+        return res.status(401).json({ error: 'Invalid token' });
+      }
+
+      // Get user profile
+      const { data: profile } = await supabase
+        .from('profiles')
+        .select('name')
+        .eq('id', user.id)
+        .single();
+
+      return res.status(200).json({
+        user: {
+          id: user.id,
+          email: user.email,
+          name: profile?.name || user.email.split('@')[0],
+          created_at: user.created_at
+        }
+      });
+
+    } catch (error) {
+      console.error('Token verification error:', error);
+      return res.status(500).json({ 
+        error: 'Token verification failed',
+        details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+      });
+    }
+
   } else {
-    return res.status(405).json({ error: 'Method not allowed. Use POST.' });
+    return res.status(405).json({ error: 'Method not allowed. Use POST or GET.' });
   }
 };
