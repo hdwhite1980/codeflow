@@ -1,0 +1,36 @@
+{
+  "name": "codeflow",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "dev": "vercel dev",
+    "build": "vercel build",
+    "start": "vercel start",
+    "lint": "eslint *.jsx --ext .js,.jsx",
+    "lint:fix": "eslint *.jsx --ext .js,.jsx --fix",
+    "analyze": "node -e \"const cr = require('complexity-report'); const fs = require('fs'); const result = cr.run(fs.readFileSync('CodeFlow.jsx', 'utf8'), {}); console.log(JSON.stringify(result, null, 2));\"",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hdwhite1980/codeflow.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/hdwhite1980/codeflow/issues"
+  },
+  "homepage": "https://github.com/hdwhite1980/codeflow#readme",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.57.4",
+    "complexity-report": "^2.0.0-alpha",
+    "esprima": "^4.0.1",
+    "esquery": "^1.6.0"
+  },
+  "devDependencies": {
+    "eslint": "^9.36.0",
+    "eslint-plugin-security": "^3.0.1"
+  }
+}
