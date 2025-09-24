@@ -4,9 +4,10 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>CodeFlow - AI Code Analysis Tool</title>
-    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js"></script>
     <style>
         body {
             margin: 0;
@@ -17,10 +18,80 @@
         #root {
             min-height: 100vh;
         }
+        .loading {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            color: white;
+            font-size: 18px;
+        }
     </style>
 </head>
 <body>
-    <div id="root"></div>
-    <script type="text/babel" src="./CodeFlow.jsx"></script>
+    <div id="root">
+        <div class="loading">Loading CodeFlow...</div>
+    </div>
+    <script>
+        // Convert CodeFlow component to work without imports
+        const { useState, useRef, useCallback, useMemo, useEffect } = React;
+        
+        // Mock the imports with available alternatives or create simple versions
+        const icons = {
+            Upload: () => React.createElement('div', {className: 'icon'}, '📤'),
+            FileCode: () => React.createElement('div', {className: 'icon'}, '📄'),
+            Shield: () => React.createElement('div', {className: 'icon'}, '🛡️'),
+            Eye: () => React.createElement('div', {className: 'icon'}, '👁️'),
+            AlertTriangle: () => React.createElement('div', {className: 'icon'}, '⚠️'),
+            CheckCircle: () => React.createElement('div', {className: 'icon'}, '✅'),
+            XCircle: () => React.createElement('div', {className: 'icon'}, '❌'),
+            GitBranch: () => React.createElement('div', {className: 'icon'}, '🌳'),
+            Activity: () => React.createElement('div', {className: 'icon'}, '📊'),
+            Database: () => React.createElement('div', {className: 'icon'}, '🗄️'),
+            Cloud: () => React.createElement('div', {className: 'icon'}, '☁️'),
+            Settings: () => React.createElement('div', {className: 'icon'}, '⚙️'),
+            Download: () => React.createElement('div', {className: 'icon'}, '⬇️'),
+            Share2: () => React.createElement('div', {className: 'icon'}, '📤'),
+            Zap: () => React.createElement('div', {className: 'icon'}, '⚡'),
+            Brain: () => React.createElement('div', {className: 'icon'}, '🧠'),
+            Map: () => React.createElement('div', {className: 'icon'}, '🗺️'),
+            Plus: () => React.createElement('div', {className: 'icon'}, '➕'),
+            Search: () => React.createElement('div', {className: 'icon'}, '🔍'),
+            Filter: () => React.createElement('div', {className: 'icon'}, '🔽'),
+            MoreVertical: () => React.createElement('div', {className: 'icon'}, '⋮'),
+            Code: () => React.createElement('div', {className: 'icon'}, '💻'),
+            FileText: () => React.createElement('div', {className: 'icon'}, '📝'),
+            Users: () => React.createElement('div', {className: 'icon'}, '👥'),
+            Bell: () => React.createElement('div', {className: 'icon'}, '🔔'),
+            Menu: () => React.createElement('div', {className: 'icon'}, '☰'),
+            X: () => React.createElement('div', {className: 'icon'}, '✖️'),
+            ArrowRight: () => React.createElement('div', {className: 'icon'}, '→'),
+            TrendingUp: () => React.createElement('div', {className: 'icon'}, '📈'),
+            Smartphone: () => React.createElement('div', {className: 'icon'}, '📱'),
+            Bot: () => React.createElement('div', {className: 'icon'}, '🤖'),
+            Lock: () => React.createElement('div', {className: 'icon'}, '🔒'),
+            Unlock: () => React.createElement('div', {className: 'icon'}, '🔓'),
+            RotateCcw: () => React.createElement('div', {className: 'icon'}, '↺'),
+            PlayCircle: () => React.createElement('div', {className: 'icon'}, '▶️'),
+            PauseCircle: () => React.createElement('div', {className: 'icon'}, '⏸️'),
+            RefreshCw: () => React.createElement('div', {className: 'icon'}, '🔄'),
+            ExternalLink: () => React.createElement('div', {className: 'icon'}, '🔗'),
+            Copy: () => React.createElement('div', {className: 'icon'}, '📋'),
+            Edit3: () => React.createElement('div', {className: 'icon'}, '✏️'),
+            Trash2: () => React.createElement('div', {className: 'icon'}, '🗑️'),
+            FolderOpen: () => React.createElement('div', {className: 'icon'}, '📂'),
+            Tag: () => React.createElement('div', {className: 'icon'}, '🏷️'),
+            Calendar: () => React.createElement('div', {className: 'icon'}, '📅'),
+            Clock: () => React.createElement('div', {className: 'icon'}, '🕒'),
+            Layers: () => React.createElement('div', {className: 'icon'}, '📚'),
+            Network: () => React.createElement('div', {className: 'icon'}, '🌐'),
+            Cpu: () => React.createElement('div', {className: 'icon'}, '🔧'),
+            HardDrive: () => React.createElement('div', {className: 'icon'}, '💾'),
+        };
+        
+        // Add icons to global scope for the CodeFlow component
+        Object.assign(window, icons);
+    </script>
+    <script src="./codeflow-browser.js"></script>
 </body>
 </html>

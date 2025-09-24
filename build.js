@@ -8,6 +8,12 @@ if (!fs.existsSync('public')) {
 
 // Copy files to public directory
 fs.copyFileSync('index.html', path.join('public', 'index.html'));
-fs.copyFileSync('CodeFlow.jsx', path.join('public', 'CodeFlow.jsx'));
+fs.copyFileSync('codeflow-browser.js', path.join('public', 'codeflow-browser.js'));
+fs.copyFileSync('favicon.svg', path.join('public', 'favicon.svg'));
+
+// Also copy the original CodeFlow.jsx for reference
+if (fs.existsSync('CodeFlow.jsx')) {
+  fs.copyFileSync('CodeFlow.jsx', path.join('public', 'CodeFlow.jsx'));
+}
 
 console.log('Build completed successfully!');
