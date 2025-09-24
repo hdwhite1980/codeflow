@@ -77,42 +77,68 @@
             
             const login = async (email, password) => {
                 try {
-                    const response = await fetch(`${API_BASE}/api/auth`, {
+                    const response = await fetch(`${API_BASE}/api/auth-simple`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ action: 'login', email, password })
                     });
                     
-                    const data = await response.json();
+                    if (!response.ok) {
+                        throw new Error(`HTTP error! status: ${response.status}`);
+                    }
+                    
+                    const text = await response.text();
+                    let data;
+                    try {
+                        data = JSON.parse(text);
+                    } catch (e) {
+                        console.error('Invalid JSON response:', text);
+                        throw new Error('Server returned invalid response');
+                    }
+                    
                     if (data.token) {
                         setToken(data.token);
                         setUser(data.user);
                         localStorage.setItem('authToken', data.token);
                         return true;
                     }
-                    throw new Error(data.error);
+                    throw new Error(data.error || 'Login failed');
                 } catch (error) {
+                    console.error('Login error:', error);
                     throw new Error(error.message || 'Login failed');
                 }
             };
             
             const register = async (name, email, password) => {
                 try {
-                    const response = await fetch(`${API_BASE}/api/auth`, {
+                    const response = await fetch(`${API_BASE}/api/auth-simple`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ action: 'register', name, email, password })
                     });
                     
-                    const data = await response.json();
+                    if (!response.ok) {
+                        throw new Error(`HTTP error! status: ${response.status}`);
+                    }
+                    
+                    const text = await response.text();
+                    let data;
+                    try {
+                        data = JSON.parse(text);
+                    } catch (e) {
+                        console.error('Invalid JSON response:', text);
+                        throw new Error('Server returned invalid response');
+                    }
+                    
                     if (data.token) {
                         setToken(data.token);
                         setUser(data.user);
                         localStorage.setItem('authToken', data.token);
                         return true;
                     }
-                    throw new Error(data.error);
+                    throw new Error(data.error || 'Registration failed');
                 } catch (error) {
+                    console.error('Registration error:', error);
                     throw new Error(error.message || 'Registration failed');
                 }
             };
