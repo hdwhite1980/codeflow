@@ -7,6 +7,7 @@
     <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
     <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
     <style>
         * {
             margin: 0;
@@ -317,63 +318,684 @@
             const [code, setCode] = useState('');
             const [analysis, setAnalysis] = useState(null);
             const [loading, setLoading] = useState(false);
-            const [file, setFile] = useState(null);
-            
+            const [files, setFiles] = useState([]);
+            const [viewMode, setViewMode] = useState('single');
+            const [selectedNode, setSelectedNode] = useState(null);
+            const [error, setError] = useState('');
+            const [searchTerm, setSearchTerm] = useState('');
+            const [showGraph, setShowGraph] = useState(true);
+
+            const hasProjectFiles = files.length > 0;
+
             const analyzeCode = async () => {
-                if (!code.trim()) return;
-                
+                const trimmedCode = code.trim();
+
+                if (viewMode === 'single' && !trimmedCode) {
+                    setError('Provide code or upload a file to analyze.');
+                    return;
+                }
+
+                if (viewMode === 'project' && !hasProjectFiles) {
+                    setError('Upload one or more files to generate the project map.');
+                    return;
+                }
+
                 setLoading(true);
+                setError('');
+
                 try {
+                    const requestBody = viewMode === 'project' && hasProjectFiles
+                        ? { files: files.map(f => ({ name: f.name, content: f.content })) }
+                        : {
+                            code: trimmedCode || files[0]?.content || '',
+                            language: 'javascript',
+                            filename: files[0]?.name || 'code.js'
+                        };
+
                     const response = await fetch(`${API_BASE}/api/analysis`, {
                         method: 'POST',
                         headers: {
                             'Content-Type': 'application/json',
                             'Authorization': `Bearer ${localStorage.getItem('authToken')}`
                         },
-                        body: JSON.stringify({
-                            code,
-                            language: 'javascript',
-                            filename: file?.name || 'code.js'
-                        })
+                        body: JSON.stringify(requestBody)
                     });
-                    
+
                     const result = await response.json();
+
+                    if (!response.ok) {
+                        throw new Error(result.error || 'Analysis failed');
+                    }
+
                     setAnalysis(result);
-                } catch (error) {
-                    console.error('Analysis failed:', error);
-                    setAnalysis({
-                        error: 'Analysis failed. Please try again.',
-                        metrics: {
-                            lines: code.split('\n').length,
-                            characters: code.length,
-                            functions: (code.match(/function\s+\w+|=>\s*{|function\s*\(/g) || []).length,
-                            variables: (code.match(/\b(let|const|var)\s+\w+/g) || []).length,
-                            complexity: (code.match(/\b(if|while|for|switch)\s*\(/g) || []).length + 1
-                        },
-                        suggestions: [
-                            'Consider adding more comments for better documentation',
-                            'Break down complex functions into smaller ones',
-                            'Add proper error handling'
-                        ]
-                    });
+                    setSelectedNode(null);
+                } catch (err) {
+                    console.error('Analysis failed:', err);
+                    setError(err.message || 'Analysis failed. Please try again.');
                 } finally {
                     setLoading(false);
                 }
             };
-            
-            const handleFileUpload = (e) => {
-                const selectedFile = e.target.files[0];
-                if (selectedFile) {
-                    setFile(selectedFile);
-                    const reader = new FileReader();
-                    reader.onload = (e) => setCode(e.target.result);
-                    reader.readAsText(selectedFile);
+
+            const handleFileUpload = (event) => {
+                const chosenFiles = Array.from(event.target.files || []);
+                if (chosenFiles.length === 0) return;
+
+                Promise.all(chosenFiles.map(file => {
+                    return new Promise(resolve => {
+                        const reader = new FileReader();
+                        reader.onload = (loadEvent) => {
+                            resolve({
+                                name: file.name,
+                                size: file.size,
+                                content: loadEvent.target.result
+                            });
+                        };
+                        reader.readAsText(file);
+                    });
+                })).then(results => {
+                    if (viewMode === 'project') {
+                        setFiles(results);
+                    } else {
+                        setFiles([results[0]]);
+                        setCode(results[0].content);
+                    }
+                });
+            };
+
+            const clearFiles = () => {
+                setFiles([]);
+                if (viewMode === 'single') {
+                    setCode('');
                 }
             };
-            
+
+            const renderProjectStats = (stats) => {
+                if (!stats) return null;
+
+                const statCards = [
+                    { label: 'Files', value: stats.totalFiles, color: '#6366f1' },
+                    { label: 'Functions', value: stats.totalFunctions, color: '#059669' },
+                    { label: 'Classes', value: stats.totalClasses, color: '#d97706' },
+                    { label: 'Constants', value: stats.totalConstants, color: '#0ea5e9' },
+                    { label: 'Dependencies', value: stats.totalDependencies, color: '#dc2626' }
+                ];
+
+                return (
+                    <div style={{
+                        display: 'grid',
+                        gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
+                        gap: '16px',
+                        marginBottom: '24px'
+                    }}>
+                        {statCards.map((card, index) => (
+                            <div key={index} style={{
+                                background: '#f9fafb',
+                                borderRadius: '10px',
+                                padding: '18px'
+                            }}>
+                                <div style={{ fontSize: '0.85rem', fontWeight: 600, color: '#374151', marginBottom: '8px' }}>
+                                    {card.label}
+                                </div>
+                                <div style={{ fontSize: '1.75rem', fontWeight: 700, color: card.color }}>
+                                    {card.value}
+                                </div>
+                            </div>
+                        ))}
+                    </div>
+                );
+            };
+
+            const renderFileCards = (projectAnalysis) => {
+                if (!projectAnalysis?.files?.length) return null;
+
+                return (
+                    <div style={{
+                        display: 'grid',
+                        gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))',
+                        gap: '16px',
+                        marginBottom: '24px'
+                    }}>
+                        {projectAnalysis.files.map((fileAnalysis, index) => (
+                            <div
+                                key={index}
+                                role="button"
+                                onClick={() => setSelectedNode({ type: 'file', data: fileAnalysis })}
+                                style={{
+                                    border: '2px solid #e5e7eb',
+                                    borderRadius: '12px',
+                                    padding: '18px'
+                                }}
+                            >
+                                <div style={{ fontWeight: 600, color: '#1f2937', marginBottom: '12px' }}>
+                                    📄 {fileAnalysis.filename}
+                                </div>
+                                <div style={{ fontSize: '0.85rem', color: '#6b7280', marginBottom: '10px' }}>
+                                    Functions: {fileAnalysis.functions.length} · Classes: {fileAnalysis.classes.length}
+                                </div>
+                                {fileAnalysis.imports.length > 0 && (
+                                    <div style={{ fontSize: '0.8rem', color: '#374151' }}>
+                                        Imports:
+                                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', marginTop: '6px' }}>
+                                            {fileAnalysis.imports.slice(0, 5).map((imp, impIndex) => (
+                                                <span key={impIndex} style={{
+                                                    background: '#e0f2fe',
+                                                    color: '#1d4ed8',
+                                                    padding: '2px 8px',
+                                                    borderRadius: '6px',
+                                                    fontSize: '0.75rem'
+                                                }}>
+                                                    {imp.name}
+                                                </span>
+                                            ))}
+                                            {fileAnalysis.imports.length > 5 && (
+                                                <span style={{ fontSize: '0.75rem', color: '#6b7280' }}>
+                                                    +{fileAnalysis.imports.length - 5} more
+                                                </span>
+                                            )}
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
+                        ))}
+                    </div>
+                );
+            };
+
+            // Interactive D3 Graph Component
+            const GraphVisualization = ({ projectAnalysis, onNodeClick, searchTerm, selectedNode }) => {
+                const graphRef = useRef(null);
+                const svgRef = useRef(null);
+                
+                useEffect(() => {
+                    if (!projectAnalysis || !svgRef.current) return;
+                    
+                    const svg = d3.select(svgRef.current);
+                    svg.selectAll('*').remove(); // Clear previous graph
+                    
+                    const width = 800;
+                    const height = 600;
+                    
+                    // Create nodes from files and their contents
+                    const nodes = [];
+                    const links = [];
+                    
+                    // Add file nodes
+                    projectAnalysis.files.forEach(file => {
+                        nodes.push({
+                            id: file.filename,
+                            name: file.filename,
+                            type: 'file',
+                            size: Math.max(15, Math.min(30, file.functions.length + file.classes.length)),
+                            data: file
+                        });
+                        
+                        // Add function nodes
+                        file.functions.forEach(func => {
+                            const funcId = `${file.filename}:${func.name}`;
+                            nodes.push({
+                                id: funcId,
+                                name: func.name,
+                                type: 'function',
+                                size: 8,
+                                data: func,
+                                parent: file.filename
+                            });
+                            
+                            // Link function to file
+                            links.push({
+                                source: file.filename,
+                                target: funcId,
+                                type: 'contains'
+                            });
+                        });
+                        
+                        // Add class nodes
+                        file.classes.forEach(cls => {
+                            const classId = `${file.filename}:${cls.name}`;
+                            nodes.push({
+                                id: classId,
+                                name: cls.name,
+                                type: 'class',
+                                size: 12,
+                                data: cls,
+                                parent: file.filename
+                            });
+                            
+                            // Link class to file
+                            links.push({
+                                source: file.filename,
+                                target: classId,
+                                type: 'contains'
+                            });
+                        });
+                    });
+                    
+                    // Add dependency links
+                    projectAnalysis.dependencies.forEach(dep => {
+                        const sourceNode = nodes.find(n => n.id === dep.from);
+                        const targetNode = nodes.find(n => n.id === dep.to);
+                        
+                        if (sourceNode && targetNode) {
+                            links.push({
+                                source: dep.from,
+                                target: dep.to,
+                                type: dep.type,
+                                name: dep.name
+                            });
+                        }
+                    });
+                    
+                    // Filter nodes based on search term
+                    const filteredNodes = searchTerm 
+                        ? nodes.filter(node => 
+                            node.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
+                            node.type.toLowerCase().includes(searchTerm.toLowerCase())
+                          )
+                        : nodes;
+                    
+                    const filteredLinks = links.filter(link => 
+                        filteredNodes.find(n => n.id === link.source || n.id === link.source.id) &&
+                        filteredNodes.find(n => n.id === link.target || n.id === link.target.id)
+                    );
+                    
+                    // Set up D3 simulation
+                    const simulation = d3.forceSimulation(filteredNodes)
+                        .force('link', d3.forceLink(filteredLinks).id(d => d.id).distance(60))
+                        .force('charge', d3.forceManyBody().strength(-300))
+                        .force('center', d3.forceCenter(width / 2, height / 2))
+                        .force('collision', d3.forceCollide().radius(d => d.size + 2));
+                    
+                    svg.attr('width', width).attr('height', height);
+                    
+                    // Add links
+                    const link = svg.append('g')
+                        .selectAll('line')
+                        .data(filteredLinks)
+                        .enter().append('line')
+                        .attr('stroke', d => d.type === 'contains' ? '#e5e7eb' : '#6366f1')
+                        .attr('stroke-width', d => d.type === 'contains' ? 1 : 2)
+                        .attr('stroke-opacity', 0.6);
+                    
+                    // Add nodes
+                    const node = svg.append('g')
+                        .selectAll('circle')
+                        .data(filteredNodes)
+                        .enter().append('circle')
+                        .attr('r', d => d.size)
+                        .attr('fill', d => {
+                            if (selectedNode?.data === d.data) return '#dc2626';
+                            switch(d.type) {
+                                case 'file': return '#6366f1';
+                                case 'function': return '#059669';
+                                case 'class': return '#d97706';
+                                default: return '#6b7280';
+                            }
+                        })
+                        .attr('stroke', '#fff')
+                        .attr('stroke-width', 2)
+                        .style('cursor', 'pointer')
+                        .on('click', (event, d) => {
+                            onNodeClick({ type: d.type, data: d.data || d });
+                        })
+                        .call(d3.drag()
+                            .on('start', (event, d) => {
+                                if (!event.active) simulation.alphaTarget(0.3).restart();
+                                d.fx = d.x;
+                                d.fy = d.y;
+                            })
+                            .on('drag', (event, d) => {
+                                d.fx = event.x;
+                                d.fy = event.y;
+                            })
+                            .on('end', (event, d) => {
+                                if (!event.active) simulation.alphaTarget(0);
+                                d.fx = null;
+                                d.fy = null;
+                            }));
+                    
+                    // Add labels
+                    const label = svg.append('g')
+                        .selectAll('text')
+                        .data(filteredNodes)
+                        .enter().append('text')
+                        .text(d => d.name.length > 15 ? d.name.substring(0, 12) + '...' : d.name)
+                        .attr('font-size', '10px')
+                        .attr('font-family', 'Inter, sans-serif')
+                        .attr('text-anchor', 'middle')
+                        .attr('dy', d => d.size + 15)
+                        .attr('fill', '#374151')
+                        .style('pointer-events', 'none');
+                    
+                    // Update positions on simulation tick
+                    simulation.on('tick', () => {
+                        link
+                            .attr('x1', d => d.source.x)
+                            .attr('y1', d => d.source.y)
+                            .attr('x2', d => d.target.x)
+                            .attr('y2', d => d.target.y);
+                        
+                        node
+                            .attr('cx', d => d.x)
+                            .attr('cy', d => d.y);
+                        
+                        label
+                            .attr('x', d => d.x)
+                            .attr('y', d => d.y);
+                    });
+                    
+                    return () => {
+                        simulation.stop();
+                    };
+                }, [projectAnalysis, searchTerm, selectedNode]);
+                
+                return (
+                    <div ref={graphRef} style={{
+                        background: '#f9fafb',
+                        borderRadius: '12px',
+                        padding: '20px',
+                        marginBottom: '24px'
+                    }}>
+                        <div style={{ fontWeight: 600, marginBottom: '12px' }}>🌐 Interactive Dependency Graph</div>
+                        <div style={{ 
+                            border: '1px solid #e5e7eb', 
+                            borderRadius: '8px', 
+                            overflow: 'hidden',
+                            background: 'white'
+                        }}>
+                            <svg ref={svgRef}></svg>
+                        </div>
+                        <div style={{ 
+                            display: 'flex', 
+                            gap: '16px', 
+                            marginTop: '12px', 
+                            fontSize: '12px',
+                            color: '#6b7280'
+                        }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                                <div style={{ width: '12px', height: '12px', borderRadius: '50%', background: '#6366f1' }}></div>
+                                Files
+                            </div>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                                <div style={{ width: '12px', height: '12px', borderRadius: '50%', background: '#059669' }}></div>
+                                Functions
+                            </div>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                                <div style={{ width: '12px', height: '12px', borderRadius: '50%', background: '#d97706' }}></div>
+                                Classes
+                            </div>
+                        </div>
+                    </div>
+                );
+            };
+
+            const renderDependencies = (dependencies) => {
+                if (!dependencies?.length) return null;
+
+                return (
+                    <div style={{
+                        background: '#f9fafb',
+                        borderRadius: '12px',
+                        padding: '20px'
+                    }}>
+                        <div style={{ fontWeight: 600, marginBottom: '12px' }}>🔗 Dependency Network</div>
+                        {dependencies.map((dep, index) => (
+                            <div key={index} style={{
+                                display: 'flex',
+                                flexWrap: 'wrap',
+                                alignItems: 'center',
+                                marginBottom: '8px',
+                                fontSize: '0.85rem',
+                                color: '#374151'
+                            }}>
+                                <span style={{ fontWeight: 600 }}>{dep.from}</span>
+                                <span style={{ margin: '0 8px', color: '#9ca3af' }}>→</span>
+                                <span style={{ color: '#6366f1', fontWeight: 600 }}>{dep.to}</span>
+                                {dep.name && (
+                                    <span style={{
+                                        marginLeft: '8px',
+                                        background: '#e5e7eb',
+                                        padding: '2px 8px',
+                                        borderRadius: '6px'
+                                    }}>
+                                        {dep.name}
+                                    </span>
+                                )}
+                                <span style={{ marginLeft: '8px', color: '#6b7280' }}>
+                                    ({dep.type})
+                                </span>
+                            </div>
+                        ))}
+                    </div>
+                );
+            };
+
+            const renderSingleFileAnalysis = (singleAnalysis) => {
+                return (
+                    <div style={{
+                        background: 'rgba(255, 255, 255, 0.95)',
+                        borderRadius: '12px',
+                        padding: '30px',
+                        marginTop: '20px',
+                        boxShadow: '0 4px 6px rgba(0, 0, 0, 0.1)'
+                    }}>
+                        <h3 style={{ fontSize: '1.25rem', fontWeight: '600', marginBottom: '24px' }}>
+                            📊 Code Structure Overview
+                        </h3>
+
+                        {singleAnalysis.functions.length > 0 && (
+                            <div style={{ marginBottom: '24px' }}>
+                                <div style={{ fontWeight: 600, marginBottom: '12px' }}>Functions</div>
+                                <div style={{
+                                    display: 'grid',
+                                    gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
+                                    gap: '12px'
+                                }}>
+                                    {singleAnalysis.functions.map((func, index) => (
+                                        <div key={index} style={{
+                                            background: '#dcfce7',
+                                            color: '#166534',
+                                            padding: '12px',
+                                            borderRadius: '8px'
+                                        }}>
+                                            <div style={{ fontWeight: 600 }}>{func.name}</div>
+                                            <div style={{ fontSize: '0.8rem', opacity: 0.8 }}>Line {func.line}</div>
+                                            {func.isAsync && (
+                                                <div style={{ fontSize: '0.75rem', marginTop: '6px' }}>Async</div>
+                                            )}
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        )}
+
+                        {singleAnalysis.classes.length > 0 && (
+                            <div style={{ marginBottom: '24px' }}>
+                                <div style={{ fontWeight: 600, marginBottom: '12px' }}>Classes</div>
+                                <div style={{
+                                    display: 'grid',
+                                    gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
+                                    gap: '12px'
+                                }}>
+                                    {singleAnalysis.classes.map((cls, index) => (
+                                        <div key={index} style={{
+                                            background: '#fef3c7',
+                                            color: '#9a3412',
+                                            padding: '12px',
+                                            borderRadius: '8px'
+                                        }}>
+                                            <div style={{ fontWeight: 600 }}>{cls.name}</div>
+                                            {cls.extends && (
+                                                <div style={{ fontSize: '0.8rem' }}>extends {cls.extends}</div>
+                                            )}
+                                            <div style={{ fontSize: '0.8rem', opacity: 0.8 }}>Line {cls.line}</div>
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        )}
+
+                        {(singleAnalysis.imports.length > 0 || singleAnalysis.exports.length > 0) && (
+                            <div style={{
+                                display: 'grid',
+                                gridTemplateColumns: 'repeat(auto-fit, minmax(250px, 1fr))',
+                                gap: '16px'
+                            }}>
+                                {singleAnalysis.imports.length > 0 && (
+                                    <div>
+                                        <div style={{ fontWeight: 600, marginBottom: '12px' }}>Imports</div>
+                                        <div style={{
+                                            background: '#eff6ff',
+                                            borderRadius: '8px',
+                                            padding: '16px'
+                                        }}>
+                                            {singleAnalysis.imports.map((imp, index) => (
+                                                <div key={index} style={{ fontSize: '0.85rem', marginBottom: '8px', color: '#1e3a8a' }}>
+                                                    <strong>{imp.name}</strong> from <span>{imp.source}</span>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    </div>
+                                )}
+                                {singleAnalysis.exports.length > 0 && (
+                                    <div>
+                                        <div style={{ fontWeight: 600, marginBottom: '12px' }}>Exports</div>
+                                        <div style={{
+                                            background: '#ecfdf5',
+                                            borderRadius: '8px',
+                                            padding: '16px'
+                                        }}>
+                                            {singleAnalysis.exports.map((exp, index) => (
+                                                <div key={index} style={{ fontSize: '0.85rem', marginBottom: '8px', color: '#065f46' }}>
+                                                    <strong>{exp.name}</strong> ({exp.type}{exp.elementType ? ` ${exp.elementType}` : ''})
+                                                </div>
+                                            ))}
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
+                        )}
+                    </div>
+                );
+            };
+
+            const renderSelectedDetails = () => {
+                if (!selectedNode) return null;
+
+                if (selectedNode.type === 'file') {
+                    const data = selectedNode.data;
+                    return (
+                        <div style={{
+                            background: '#f8fafc',
+                            borderRadius: '12px',
+                            padding: '20px',
+                            marginTop: '20px'
+                        }}>
+                            <div style={{ fontWeight: 600, marginBottom: '12px' }}>📁 {data.filename}</div>
+                            <div style={{ fontSize: '0.85rem', color: '#6b7280', marginBottom: '12px' }}>
+                                Functions: {data.functions.length} · Classes: {data.classes.length} · Exports: {data.exports.length}
+                            </div>
+                            {data.functions.length > 0 && (
+                                <div style={{ marginBottom: '16px' }}>
+                                    <div style={{ fontWeight: 600, marginBottom: '8px' }}>Functions</div>
+                                    {data.functions.map((func, index) => (
+                                        <div key={index} style={{ fontSize: '0.85rem', color: '#1f2937' }}>
+                                            • {func.name} (line {func.line})
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
+                            {data.classes.length > 0 && (
+                                <div>
+                                    <div style={{ fontWeight: 600, marginBottom: '8px' }}>Classes</div>
+                                    {data.classes.map((cls, index) => (
+                                        <div key={index} style={{ fontSize: '0.85rem', color: '#1f2937' }}>
+                                            • {cls.name}{cls.extends ? ` extends ${cls.extends}` : ''}
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
+                        </div>
+                    );
+                }
+
+                return null;
+            };
+
+            const renderAnalysis = () => {
+                if (!analysis) return null;
+
+                if (analysis.type === 'project-map') {
+                    return (
+                        <div style={{ marginTop: '20px' }}>
+                            <div style={{
+                                background: 'rgba(255, 255, 255, 0.95)',
+                                borderRadius: '12px',
+                                padding: '30px',
+                                boxShadow: '0 4px 6px rgba(0, 0, 0, 0.1)'
+                            }}>
+                                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '24px' }}>
+                                    <h3 style={{ fontSize: '1.25rem', fontWeight: '600' }}>
+                                        🗺️ Project Code Map
+                                    </h3>
+                                    <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                                        <input
+                                            type="text"
+                                            placeholder="Search nodes..."
+                                            value={searchTerm}
+                                            onChange={(e) => setSearchTerm(e.target.value)}
+                                            style={{
+                                                padding: '8px 12px',
+                                                border: '1px solid #d1d5db',
+                                                borderRadius: '6px',
+                                                fontSize: '0.9rem',
+                                                width: '200px'
+                                            }}
+                                        />
+                                        <button
+                                            onClick={() => setShowGraph(!showGraph)}
+                                            style={{
+                                                padding: '8px 12px',
+                                                background: showGraph ? '#6366f1' : '#f3f4f6',
+                                                color: showGraph ? 'white' : '#374151',
+                                                border: 'none',
+                                                borderRadius: '6px',
+                                                fontSize: '0.85rem',
+                                                cursor: 'pointer'
+                                            }}
+                                        >
+                                            {showGraph ? '🌐 Graph View' : '📋 List View'}
+                                        </button>
+                                    </div>
+                                </div>
+                                
+                                {renderProjectStats(analysis.stats)}
+                                
+                                {showGraph ? (
+                                    <GraphVisualization 
+                                        projectAnalysis={analysis}
+                                        onNodeClick={setSelectedNode}
+                                        searchTerm={searchTerm}
+                                        selectedNode={selectedNode}
+                                    />
+                                ) : (
+                                    <>
+                                        {renderFileCards(analysis)}
+                                        {renderDependencies(analysis.dependencies)}
+                                    </>
+                                )}
+                                
+                                {renderSelectedDetails()}
+                            </div>
+                        </div>
+                    );
+                }
+
+                return renderSingleFileAnalysis(analysis);
+            };
+
             return (
                 <div style={{ minHeight: '100vh', background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)' }}>
-                    {/* Header */}
                     <div style={{
                         background: 'rgba(255, 255, 255, 0.95)',
                         padding: '20px',
@@ -402,8 +1024,7 @@
                             </div>
                         </div>
                     </div>
-                    
-                    {/* Main Content */}
+
                     <div style={{ maxWidth: '1200px', margin: '0 auto', padding: '0 20px' }}>
                         <div style={{
                             background: 'rgba(255, 255, 255, 0.95)',
@@ -412,118 +1033,161 @@
                             boxShadow: '0 4px 6px rgba(0, 0, 0, 0.1)'
                         }}>
                             <h2 style={{ fontSize: '1.25rem', fontWeight: '600', marginBottom: '20px' }}>
-                                📊 Upload Code File or Paste Code:
+                                🔍 Analyze Your Codebase
                             </h2>
-                            
-                            {/* File Upload */}
+
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '16px', marginBottom: '24px' }}>
+                                <div style={{ display: 'flex', background: '#f3f4f6', borderRadius: '8px', padding: '2px' }}>
+                                    <button
+                                        onClick={() => { setViewMode('single'); clearFiles(); }}
+                                        style={{
+                                            padding: '8px 16px',
+                                            border: 'none',
+                                            borderRadius: '6px',
+                                            background: viewMode === 'single' ? '#6366f1' : 'transparent',
+                                            color: viewMode === 'single' ? '#ffffff' : '#374151',
+                                            cursor: 'pointer',
+                                            fontSize: '0.9rem',
+                                            fontWeight: 500
+                                        }}
+                                    >
+                                        📄 Single File
+                                    </button>
+                                    <button
+                                        onClick={() => { setViewMode('project'); setCode(''); }}
+                                        style={{
+                                            padding: '8px 16px',
+                                            border: 'none',
+                                            borderRadius: '6px',
+                                            background: viewMode === 'project' ? '#6366f1' : 'transparent',
+                                            color: viewMode === 'project' ? '#ffffff' : '#374151',
+                                            cursor: 'pointer',
+                                            fontSize: '0.9rem',
+                                            fontWeight: 500
+                                        }}
+                                    >
+                                        📁 Project Map
+                                    </button>
+                                </div>
+                                <div style={{ fontSize: '0.9rem', color: '#6b7280' }}>
+                                    {viewMode === 'single' ? 'Inspect a single file in depth.' : 'Visualize relationships across your project.'}
+                                </div>
+                            </div>
+
                             <div style={{ marginBottom: '20px' }}>
-                                <input
-                                    type="file"
-                                    accept=".js,.jsx,.ts,.tsx,.py,.java,.cpp,.c,.html,.css"
-                                    onChange={handleFileUpload}
+                                <label style={{
+                                    display: 'inline-block',
+                                    padding: '12px 20px',
+                                    background: '#6366f1',
+                                    color: '#ffffff',
+                                    borderRadius: '8px',
+                                    cursor: 'pointer',
+                                    fontWeight: 500,
+                                    fontSize: '0.95rem'
+                                }}>
+                                    📂 {viewMode === 'project' ? 'Upload Project Files' : 'Upload File'}
+                                    <input
+                                        type="file"
+                                        multiple={viewMode === 'project'}
+                                        onChange={handleFileUpload}
+                                        accept=".js,.jsx,.ts,.tsx,.py,.java,.cpp,.c,.html,.css,.php,.rb,.go,.rs"
+                                        style={{ display: 'none' }}
+                                    />
+                                </label>
+                                {hasProjectFiles && (
+                                    <button
+                                        onClick={clearFiles}
+                                        style={{
+                                            marginLeft: '12px',
+                                            padding: '10px 18px',
+                                            border: '1px solid #e5e7eb',
+                                            borderRadius: '8px',
+                                            background: '#ffffff',
+                                            color: '#374151',
+                                            cursor: 'pointer'
+                                        }}
+                                    >
+                                        Clear Files
+                                    </button>
+                                )}
+                            </div>
+
+                            {viewMode === 'project' && hasProjectFiles && (
+                                <div style={{
+                                    maxHeight: '200px',
+                                    overflowY: 'auto',
+                                    border: '1px solid #e5e7eb',
+                                    borderRadius: '8px',
+                                    padding: '12px',
+                                    marginBottom: '20px'
+                                }}>
+                                    {files.map((file, index) => (
+                                        <div key={index} style={{
+                                            display: 'flex',
+                                            justifyContent: 'space-between',
+                                            alignItems: 'center',
+                                            padding: '8px 0',
+                                            borderBottom: index === files.length - 1 ? 'none' : '1px solid #f1f5f9'
+                                        }}>
+                                            <span style={{ fontWeight: 500, color: '#1f2937' }}>{file.name}</span>
+                                            <span style={{ fontSize: '0.8rem', color: '#6b7280' }}>
+                                                {(file.size / 1024).toFixed(1)} KB
+                                            </span>
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
+
+                            {viewMode === 'single' && (
+                                <textarea
+                                    value={code}
+                                    onChange={(event) => setCode(event.target.value)}
+                                    placeholder="Paste your code here or upload a file above..."
                                     style={{
-                                        padding: '10px',
-                                        border: '2px dashed #d1d5db',
-                                        borderRadius: '8px',
-                                        width: '100%'
+                                        width: '100%',
+                                        minHeight: '220px',
+                                        padding: '16px',
+                                        border: '1px solid #d1d5db',
+                                        borderRadius: '10px',
+                                        fontFamily: 'Monaco, Consolas, monospace',
+                                        fontSize: '0.9rem',
+                                        marginBottom: '20px',
+                                        resize: 'vertical'
                                     }}
                                 />
-                            </div>
-                            
-                            {/* Code Input */}
-                            <textarea
-                                value={code}
-                                onChange={(e) => setCode(e.target.value)}
-                                placeholder="Paste your code here or upload a file..."
-                                style={{
-                                    width: '100%',
-                                    height: '300px',
-                                    padding: '15px',
-                                    border: '1px solid #d1d5db',
+                            )}
+
+                            {error && (
+                                <div style={{
+                                    background: '#fee2e2',
+                                    color: '#b91c1c',
                                     borderRadius: '8px',
-                                    fontFamily: 'Monaco, Consolas, monospace',
-                                    fontSize: '14px',
-                                    resize: 'vertical'
-                                }}
-                            />
-                            
-                            {/* Analyze Button */}
+                                    padding: '12px',
+                                    marginBottom: '16px'
+                                }}>
+                                    {error}
+                                </div>
+                            )}
+
                             <button
                                 onClick={analyzeCode}
-                                disabled={loading || !code.trim()}
+                                disabled={loading}
                                 style={{
-                                    background: loading ? '#9ca3af' : 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
-                                    color: 'white',
                                     padding: '12px 24px',
+                                    background: loading ? '#9ca3af' : 'linear-gradient(135deg, #10b981 0%, #0ea5e9 100%)',
+                                    color: '#ffffff',
                                     border: 'none',
-                                    borderRadius: '8px',
-                                    fontSize: '16px',
-                                    fontWeight: '600',
-                                    cursor: loading ? 'not-allowed' : 'pointer',
-                                    marginTop: '15px'
+                                    borderRadius: '10px',
+                                    fontSize: '1rem',
+                                    fontWeight: 600,
+                                    cursor: loading ? 'not-allowed' : 'pointer'
                                 }}
                             >
-                                {loading ? '🔄 Analyzing...' : '🔍 Analyze Code'}
+                                {loading ? 'Analyzing…' : viewMode === 'project' ? 'Generate Project Map' : 'Analyze File'}
                             </button>
                         </div>
-                        
-                        {/* Analysis Results */}
-                        {analysis && (
-                            <div style={{
-                                background: 'rgba(255, 255, 255, 0.95)',
-                                borderRadius: '12px',
-                                padding: '30px',
-                                marginTop: '20px',
-                                boxShadow: '0 4px 6px rgba(0, 0, 0, 0.1)'
-                            }}>
-                                <h3 style={{ fontSize: '1.25rem', fontWeight: '600', marginBottom: '20px' }}>
-                                    📈 Analysis Results
-                                </h3>
-                                
-                                {analysis.error && (
-                                    <div style={{ color: '#dc2626', marginBottom: '20px' }}>
-                                        {analysis.error}
-                                    </div>
-                                )}
-                                
-                                {analysis.metrics && (
-                                    <div style={{ marginBottom: '20px' }}>
-                                        <h4 style={{ fontWeight: '600', marginBottom: '10px' }}>Code Metrics:</h4>
-                                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '15px' }}>
-                                            <div style={{ padding: '15px', background: '#f3f4f6', borderRadius: '8px' }}>
-                                                <div style={{ fontWeight: '600', color: '#374151' }}>Lines of Code</div>
-                                                <div style={{ fontSize: '1.5rem', fontWeight: 'bold', color: '#6366f1' }}>{analysis.metrics.lines}</div>
-                                            </div>
-                                            <div style={{ padding: '15px', background: '#f3f4f6', borderRadius: '8px' }}>
-                                                <div style={{ fontWeight: '600', color: '#374151' }}>Functions</div>
-                                                <div style={{ fontSize: '1.5rem', fontWeight: 'bold', color: '#059669' }}>{analysis.metrics.functions}</div>
-                                            </div>
-                                            <div style={{ padding: '15px', background: '#f3f4f6', borderRadius: '8px' }}>
-                                                <div style={{ fontWeight: '600', color: '#374151' }}>Variables</div>
-                                                <div style={{ fontSize: '1.5rem', fontWeight: 'bold', color: '#d97706' }}>{analysis.metrics.variables}</div>
-                                            </div>
-                                            <div style={{ padding: '15px', background: '#f3f4f6', borderRadius: '8px' }}>
-                                                <div style={{ fontWeight: '600', color: '#374151' }}>Complexity</div>
-                                                <div style={{ fontSize: '1.5rem', fontWeight: 'bold', color: '#dc2626' }}>{analysis.metrics.complexity}</div>
-                                            </div>
-                                        </div>
-                                    </div>
-                                )}
-                                
-                                {analysis.suggestions && (
-                                    <div>
-                                        <h4 style={{ fontWeight: '600', marginBottom: '10px' }}>Suggestions:</h4>
-                                        <ul style={{ paddingLeft: '20px' }}>
-                                            {analysis.suggestions.map((suggestion, index) => (
-                                                <li key={index} style={{ marginBottom: '5px', color: '#374151' }}>
-                                                    {suggestion}
-                                                </li>
-                                            ))}
-                                        </ul>
-                                    </div>
-                                )}
-                            </div>
-                        )}
+
+                        {renderAnalysis()}
                     </div>
                 </div>
             );
