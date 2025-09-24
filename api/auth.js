@@ -1,20 +1,4 @@
-import bcrypt from 'bcryptjs';
-import jwt from 'jsonwebtoken';
-import { createClient } from '@supabase/supabase-js';
-
-// Initialize Supabase client
-const getSupabase = () => {
-  const supabaseUrl = process.env.SUPABASE_URL;
-  const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
-  
-  if (!supabaseUrl || !supabaseKey) {
-    throw new Error('Missing Supabase configuration');
-  }
-  
-  return createClient(supabaseUrl, supabaseKey);
-};
-
-export default async function handler(req, res) {
+module.exports = async (req, res) => {
   // Enable CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
@@ -24,103 +8,53 @@ export default async function handler(req, res) {
     return res.status(200).end();
   }
 
-  const supabase = getSupabase();
-
   if (req.method === 'POST') {
-    const { action, email, password, name } = req.body;
+    const { action, email, password, name } = req.body || {};
 
     try {
       if (action === 'register') {
-        // Check if user exists
-        const { data: existingUser } = await supabase
-          .from('users')
-          .select('id')
-          .eq('email', email)
-          .single();
+        // Mock registration
+        const mockUser = {
+          id: Date.now().toString(),
+          email,
+          name,
+          created_at: new Date().toISOString()
+        };
 
-        if (existingUser) {
-          return res.status(400).json({ error: 'User already exists' });
-        }
+        const token = `token_${Date.now()}`;
 
-        // Hash password
-        const hashedPassword = await bcrypt.hash(password, 12);
-
-        // Create user
-        const { data: user, error } = await supabase
-          .from('users')
-          .insert([
-            {
-              email,
-              name,
-              password: hashedPassword,
-              created_at: new Date().toISOString(),
-              updated_at: new Date().toISOString()
-            }
-          ])
-          .select()
-          .single();
-
-        if (error) {
-          return res.status(400).json({ error: error.message });
-        }
-
-        // Generate JWT
-        const token = jwt.sign(
-          { userId: user.id, email: user.email },
-          process.env.JWT_SECRET,
-          { expiresIn: '7d' }
-        );
-
-        res.json({
+        return res.status(200).json({
           token,
-          user: {
-            id: user.id,
-            email: user.email,
-            name: user.name
-          }
+          user: mockUser
         });
 
       } else if (action === 'login') {
-        // Find user
-        const { data: user, error } = await supabase
-          .from('users')
-          .select('*')
-          .eq('email', email)
-          .single();
+        // Mock login - accepts any email/password
+        if (email && password) {
+          const mockUser = {
+            id: Date.now().toString(),
+            email,
+            name: email.split('@')[0],
+            created_at: new Date().toISOString()
+          };
 
-        if (error || !user) {
-          return res.status(401).json({ error: 'Invalid credentials' });
+          const token = `token_${Date.now()}`;
+
+          return res.status(200).json({
+            token,
+            user: mockUser
+          });
+        } else {
+          return res.status(401).json({ error: 'Email and password required' });
         }
-
-        // Check password
-        const isValid = await bcrypt.compare(password, user.password);
-        if (!isValid) {
-          return res.status(401).json({ error: 'Invalid credentials' });
-        }
-
-        // Generate JWT
-        const token = jwt.sign(
-          { userId: user.id, email: user.email },
-          process.env.JWT_SECRET,
-          { expiresIn: '7d' }
-        );
-
-        res.json({
-          token,
-          user: {
-            id: user.id,
-            email: user.email,
-            name: user.name
-          }
-        });
 
       } else {
-        res.status(400).json({ error: 'Invalid action' });
+        return res.status(400).json({ error: 'Invalid action. Use "login" or "register"' });
       }
     } catch (error) {
-      res.status(500).json({ error: error.message });
+      return res.status(500).json({ error: error.message || 'Authentication failed' });
     }
   } else {
-    res.status(405).json({ error: 'Method not allowed' });
+    return res.status(405).json({ error: 'Method not allowed. Use POST.' });
   }
-}
+};
