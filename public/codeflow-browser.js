@@ -273,7 +273,6 @@
     ]);
   };
 
-  // Render the app
-  const root = ReactDOM.createRoot(document.getElementById('root'));
-  root.render(h(CodeFlowPlatform));
+  // Render the app using the older, more stable ReactDOM.render
+  ReactDOM.render(h(CodeFlowPlatform), document.getElementById('root'));
 })();
