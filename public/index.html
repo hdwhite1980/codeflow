@@ -177,7 +177,7 @@
                     
                     // Provide better error messages for common issues
                     if (errorMessage.includes('Supabase not configured')) {
-                        errorMessage = `⚙️ Configuration Required: Please set up your Supabase credentials in the .env.local file. Check the README for setup instructions.`;
+                        errorMessage = `⚙️ Configuration Required: Please set up your Supabase credentials in the .env.local file. Contact your administrator for setup.`;
                     } else if (errorMessage.includes('Invalid login credentials') || errorMessage.includes('401')) {
                         errorMessage = 'Invalid email or password. Please check your credentials and try again.';
                     } else if (errorMessage.includes('Failed to fetch') || errorMessage.includes('Network')) {
@@ -299,38 +299,6 @@
                                 {loading ? 'Please wait...' : (isLogin ? 'Sign In' : 'Create Account')}
                             </button>
                         </form>
-
-                        {/* Demo Mode Button for when Supabase is not configured */}
-                        <button
-                            type="button"
-                            onClick={() => {
-                                // Demo mode - create a temporary user
-                                const demoUser = {
-                                    id: 'demo-user-' + Date.now(),
-                                    email: 'demo@codeflow.com',
-                                    name: 'Demo User',
-                                    created_at: new Date().toISOString()
-                                };
-                                setUser(demoUser);
-                                localStorage.setItem('authToken', 'demo-token');
-                                localStorage.setItem('demoMode', 'true');
-                            }}
-                            style={{
-                                width: '100%',
-                                padding: '12px',
-                                background: 'linear-gradient(135deg, #f59e0b 0%, #d97706 100%)',
-                                color: 'white',
-                                border: 'none',
-                                borderRadius: '8px',
-                                fontSize: '14px',
-                                fontWeight: 600,
-                                cursor: 'pointer',
-                                marginTop: '12px',
-                                marginBottom: '20px'
-                            }}
-                        >
-                            🚀 Try Demo Mode (No Setup Required)
-                        </button>
                         
                         <div style={{ textAlign: 'center', marginTop: '20px' }}>
                             <button
@@ -744,12 +712,16 @@
 
                         // Add import/export nodes
                         file.imports?.forEach(imp => {
+                            // Handle both string and object formats for imports
+                            const importName = typeof imp === 'string' ? imp : (imp.name || imp.source || 'unknown');
+                            const importSource = typeof imp === 'string' ? imp : (imp.source || imp.name || 'unknown');
+                            
                             const importNode = {
-                                id: `${file.filename}:import:${imp}`,
-                                name: imp.split('/').pop() || imp,
+                                id: `${file.filename}:import:${importSource}`,
+                                name: importName.split('/').pop() || importName,
                                 type: 'import',
                                 size: getNodeSize({ type: 'import' }),
-                                data: { module: imp, parentFile: file.filename },
+                                data: { module: importSource, parentFile: file.filename },
                                 parent: file.filename,
                                 group: 'imports',
                                 importance: 2,
@@ -1729,10 +1701,11 @@
                                     {error}
                                     {error.includes('Configuration Required') && (
                                         <div style={{ marginTop: '8px', fontSize: '12px' }}>
-                                            <strong>Quick Setup:</strong><br/>
+                                            <strong>Setup Required:</strong><br/>
                                             1. Create a Supabase project at <a href="https://supabase.com" target="_blank" style={{color: '#92400e', textDecoration: 'underline'}}>supabase.com</a><br/>
                                             2. Copy your URL and Service Role Key<br/>
-                                            3. Update the .env.local file with your credentials
+                                            3. Update the .env.local file with your credentials<br/>
+                                            4. Run the database setup script
                                         </div>
                                     )}
                                 </div>
@@ -1784,28 +1757,67 @@
             );
         };
         
-        // Global error handling for browser extension conflicts
-        window.addEventListener('error', (event) => {
-            // Suppress MutationObserver errors that come from browser extensions or React DevTools
-            if (event.message && (
-                event.message.includes('MutationObserver') || 
-                event.message.includes('parameter 1 is not of type \'Node\'') ||
-                event.filename && event.filename.includes('index.ts-dc94437b.js')
-            )) {
-                console.warn('Browser extension error suppressed:', event.message);
-                event.preventDefault();
-                return false;
-            }
-        });
+        // Comprehensive error handling for browser extension conflicts
+        const suppressBrowserExtensionErrors = () => {
+            // Handle synchronous errors
+            window.addEventListener('error', (event) => {
+                const errorIndicators = [
+                    'MutationObserver',
+                    'parameter 1 is not of type \'Node\'',
+                    'index.ts-dc94437b.js',
+                    'extension',
+                    'chrome-extension',
+                    'moz-extension'
+                ];
+                
+                if (errorIndicators.some(indicator => 
+                    event.message?.includes(indicator) || 
+                    event.filename?.includes(indicator) ||
+                    event.error?.stack?.includes(indicator)
+                )) {
+                    console.warn('Browser extension error suppressed:', event.message || event.error?.message);
+                    event.preventDefault();
+                    event.stopPropagation();
+                    return false;
+                }
+            });
 
-        // Suppress unhandled promise rejections from browser extensions
-        window.addEventListener('unhandledrejection', (event) => {
-            if (event.reason && event.reason.message && 
-                event.reason.message.includes('MutationObserver')) {
-                console.warn('Browser extension promise rejection suppressed:', event.reason.message);
-                event.preventDefault();
-            }
-        });
+            // Handle unhandled promise rejections
+            window.addEventListener('unhandledrejection', (event) => {
+                const errorIndicators = [
+                    'MutationObserver',
+                    'parameter 1 is not of type \'Node\'',
+                    'extension'
+                ];
+                
+                const errorMessage = event.reason?.message || event.reason?.toString() || '';
+                if (errorIndicators.some(indicator => errorMessage.includes(indicator))) {
+                    console.warn('Browser extension promise rejection suppressed:', errorMessage);
+                    event.preventDefault();
+                }
+            });
+
+            // Override console.error for extension-related errors
+            const originalConsoleError = console.error;
+            console.error = (...args) => {
+                const message = args.join(' ');
+                const suppressedIndicators = [
+                    'MutationObserver',
+                    'parameter 1 is not of type \'Node\'',
+                    'index.ts-dc94437b.js'
+                ];
+                
+                if (suppressedIndicators.some(indicator => message.includes(indicator))) {
+                    console.warn('Browser extension console error suppressed:', message);
+                    return;
+                }
+                
+                originalConsoleError.apply(console, args);
+            };
+        };
+
+        // Initialize error suppression immediately
+        suppressBrowserExtensionErrors();
         
         // Render the app (React 18 compatible)
         const initializeApp = () => {

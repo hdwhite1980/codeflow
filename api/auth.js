@@ -8,7 +8,7 @@ function getSupabaseClient() {
   if (!supabaseUrl || !supabaseServiceKey || 
       supabaseUrl.includes('your_supabase_project_url_here') ||
       supabaseServiceKey.includes('your_service_role_key_here')) {
-    throw new Error('Supabase not configured. Please update your .env.local file with actual Supabase credentials from your Supabase dashboard.');
+    throw new Error('Production configuration required: Supabase credentials must be properly configured in environment variables. Contact your system administrator.');
   }
   
   return createClient(supabaseUrl, supabaseServiceKey, {
