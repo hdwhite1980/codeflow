@@ -497,10 +497,15 @@
                 );
             };
 
-            // Interactive D3 Graph Component
+            // ADVANCED VISUAL GUI MAPPING ENGINE
             const GraphVisualization = ({ projectAnalysis, onNodeClick, searchTerm, selectedNode }) => {
                 const graphRef = useRef(null);
                 const svgRef = useRef(null);
+                const [hoveredNode, setHoveredNode] = useState(null);
+                const [impactNodes, setImpactNodes] = useState(new Set());
+                const [filterType, setFilterType] = useState('all');
+                const [showLabels, setShowLabels] = useState(true);
+                const [zoomLevel, setZoomLevel] = useState(1);
                 
                 useEffect(() => {
                     if (!projectAnalysis || !svgRef.current) return;
@@ -508,128 +513,400 @@
                     const svg = d3.select(svgRef.current);
                     svg.selectAll('*').remove(); // Clear previous graph
                     
-                    const width = 800;
-                    const height = 600;
+                    const containerWidth = graphRef.current?.offsetWidth || 1200;
+                    const width = Math.max(containerWidth, 1200);
+                    const height = Math.max(800, Math.min(1000, width * 0.7));
                     
-                    // Create nodes from files and their contents
+                    svg.attr('width', width)
+                       .attr('height', height)
+                       .attr('viewBox', `0 0 ${width} ${height}`)
+                       .style('background', 'linear-gradient(135deg, #0f172a 0%, #1e293b 100%)')
+                       .style('border-radius', '12px');
+
+                    // Add zoom and pan functionality
+                    const g = svg.append('g');
+                    const zoom = d3.zoom()
+                        .scaleExtent([0.1, 4])
+                        .on('zoom', (event) => {
+                            g.attr('transform', event.transform);
+                            setZoomLevel(event.transform.k);
+                        });
+                    
+                    svg.call(zoom);
+
+                    // Enhanced node and link creation
                     const nodes = [];
                     const links = [];
                     
-                    // Add file nodes
-                    projectAnalysis.files.forEach(file => {
-                        nodes.push({
-                            id: file.filename,
-                            name: file.filename,
-                            type: 'file',
-                            size: Math.max(15, Math.min(30, file.functions.length + file.classes.length)),
-                            data: file
-                        });
+                    // Color schemes for different node types
+                    const nodeColors = {
+                        file: '#3b82f6',      // Blue
+                        function: '#10b981',  // Green  
+                        class: '#f59e0b',     // Amber
+                        variable: '#8b5cf6',  // Purple
+                        constant: '#ef4444',  // Red
+                        import: '#06b6d4',    // Cyan
+                        export: '#84cc16'     // Lime
+                    };
+
+                    const getNodeSize = (node) => {
+                        const baseSize = {
+                            file: 25,
+                            function: 15,
+                            class: 20,
+                            variable: 10,
+                            constant: 12,
+                            import: 8,
+                            export: 8
+                        };
                         
-                        // Add function nodes
-                        file.functions.forEach(func => {
-                            const funcId = `${file.filename}:${func.name}`;
-                            nodes.push({
-                                id: funcId,
+                        let size = baseSize[node.type] || 10;
+                        
+                        // Scale based on complexity/importance
+                        if (node.data?.complexity) {
+                            size += Math.min(node.data.complexity * 2, 15);
+                        }
+                        if (node.data?.functions?.length) {
+                            size += Math.min(node.data.functions.length, 10);
+                        }
+                        
+                        return size;
+                    };
+                    
+                    // Build comprehensive node network
+                    projectAnalysis.files.forEach(file => {
+                        // Add file nodes (main hubs)
+                        const fileNode = {
+                            id: file.filename,
+                            name: file.filename.replace(/\.[^/.]+$/, ""), // Remove extension for cleaner display
+                            type: 'file',
+                            size: getNodeSize({ type: 'file', data: file }),
+                            data: file,
+                            group: 'files',
+                            importance: (file.functions?.length || 0) + (file.classes?.length || 0),
+                            connections: 0
+                        };
+                        nodes.push(fileNode);
+                        
+                        // Add function subnodes with enhanced data
+                        file.functions?.forEach(func => {
+                            const funcNode = {
+                                id: `${file.filename}:func:${func.name}`,
                                 name: func.name,
                                 type: 'function',
-                                size: 8,
-                                data: func,
-                                parent: file.filename
-                            });
+                                size: getNodeSize({ type: 'function', data: func }),
+                                data: { ...func, parentFile: file.filename },
+                                parent: file.filename,
+                                group: 'functions',
+                                importance: func.complexity || 1,
+                                connections: 0
+                            };
+                            nodes.push(funcNode);
                             
                             // Link function to file
                             links.push({
                                 source: file.filename,
-                                target: funcId,
-                                type: 'contains'
+                                target: funcNode.id,
+                                type: 'contains',
+                                strength: 0.8,
+                                distance: 50
                             });
                         });
                         
-                        // Add class nodes
-                        file.classes.forEach(cls => {
-                            const classId = `${file.filename}:${cls.name}`;
-                            nodes.push({
-                                id: classId,
+                        // Add class subnodes
+                        file.classes?.forEach(cls => {
+                            const classNode = {
+                                id: `${file.filename}:class:${cls.name}`,
                                 name: cls.name,
                                 type: 'class',
-                                size: 12,
-                                data: cls,
-                                parent: file.filename
-                            });
+                                size: getNodeSize({ type: 'class', data: cls }),
+                                data: { ...cls, parentFile: file.filename },
+                                parent: file.filename,
+                                group: 'classes',
+                                importance: (cls.methods?.length || 0) + 2,
+                                connections: 0
+                            };
+                            nodes.push(classNode);
                             
                             // Link class to file
                             links.push({
                                 source: file.filename,
-                                target: classId,
-                                type: 'contains'
+                                target: classNode.id,
+                                type: 'contains',
+                                strength: 0.8,
+                                distance: 45
+                            });
+
+                            // Add class methods as subnodes
+                            cls.methods?.forEach(method => {
+                                const methodNode = {
+                                    id: `${file.filename}:method:${cls.name}.${method.name}`,
+                                    name: method.name,
+                                    type: 'function',
+                                    size: getNodeSize({ type: 'function', data: method }),
+                                    data: { ...method, parentClass: cls.name, parentFile: file.filename },
+                                    parent: classNode.id,
+                                    group: 'methods',
+                                    importance: method.complexity || 1,
+                                    connections: 0
+                                };
+                                nodes.push(methodNode);
+                                
+                                // Link method to class
+                                links.push({
+                                    source: classNode.id,
+                                    target: methodNode.id,
+                                    type: 'contains',
+                                    strength: 0.6,
+                                    distance: 30
+                                });
+                            });
+                        });
+
+                        // Add variable/constant nodes
+                        file.variables?.forEach(variable => {
+                            const varNode = {
+                                id: `${file.filename}:var:${variable.name}`,
+                                name: variable.name,
+                                type: variable.isConstant ? 'constant' : 'variable',
+                                size: getNodeSize({ type: variable.isConstant ? 'constant' : 'variable' }),
+                                data: { ...variable, parentFile: file.filename },
+                                parent: file.filename,
+                                group: 'variables',
+                                importance: variable.isConstant ? 3 : 1,
+                                connections: 0
+                            };
+                            nodes.push(varNode);
+                            
+                            // Link variable to file
+                            links.push({
+                                source: file.filename,
+                                target: varNode.id,
+                                type: 'contains',
+                                strength: 0.4,
+                                distance: 35
+                            });
+                        });
+
+                        // Add import/export nodes
+                        file.imports?.forEach(imp => {
+                            const importNode = {
+                                id: `${file.filename}:import:${imp}`,
+                                name: imp.split('/').pop() || imp,
+                                type: 'import',
+                                size: getNodeSize({ type: 'import' }),
+                                data: { module: imp, parentFile: file.filename },
+                                parent: file.filename,
+                                group: 'imports',
+                                importance: 2,
+                                connections: 0
+                            };
+                            nodes.push(importNode);
+                            
+                            // Link import to file
+                            links.push({
+                                source: importNode.id,
+                                target: file.filename,
+                                type: 'imports',
+                                strength: 0.6,
+                                distance: 40
                             });
                         });
                     });
                     
-                    // Add dependency links
-                    projectAnalysis.dependencies.forEach(dep => {
-                        const sourceNode = nodes.find(n => n.id === dep.from);
-                        const targetNode = nodes.find(n => n.id === dep.to);
+                    // Add cross-file dependency links (the magic!)
+                    projectAnalysis.dependencies?.forEach(dep => {
+                        const sourceId = dep.from;
+                        const targetId = dep.to;
                         
-                        if (sourceNode && targetNode) {
+                        // Find specific nodes if function/class names are provided
+                        let sourceNode = nodes.find(n => n.id === sourceId);
+                        let targetNode = nodes.find(n => n.id === targetId);
+                        
+                        // If specific function/class mentioned, try to find it
+                        if (dep.name && !sourceNode) {
+                            sourceNode = nodes.find(n => 
+                                n.name === dep.name && n.data?.parentFile === sourceId
+                            );
+                        }
+                        if (dep.name && !targetNode) {
+                            targetNode = nodes.find(n => 
+                                n.name === dep.name && n.data?.parentFile === targetId
+                            );
+                        }
+                        
+                        // Fall back to file nodes
+                        if (!sourceNode) sourceNode = nodes.find(n => n.id === sourceId);
+                        if (!targetNode) targetNode = nodes.find(n => n.id === targetId);
+                        
+                        if (sourceNode && targetNode && sourceNode.id !== targetNode.id) {
+                            const linkType = dep.type || 'dependency';
+                            
                             links.push({
-                                source: dep.from,
-                                target: dep.to,
-                                type: dep.type,
-                                name: dep.name
+                                source: sourceNode.id,
+                                target: targetNode.id,
+                                type: linkType,
+                                strength: linkType === 'function-call' ? 0.9 : 0.7,
+                                distance: linkType === 'function-call' ? 80 : 100,
+                                name: dep.name,
+                                crossFile: true
                             });
+                            
+                            // Track connections for importance calculation
+                            sourceNode.connections++;
+                            targetNode.connections++;
                         }
                     });
+
+                    // Calculate final node importance (for sizing and grouping)
+                    nodes.forEach(node => {
+                        node.finalImportance = node.importance + (node.connections * 2);
+                        node.size = Math.max(node.size, Math.min(node.size + node.connections * 2, 40));
+                    });
+
+                    // Apply filters
+                    const filteredNodes = nodes.filter(node => {
+                        if (filterType !== 'all' && node.type !== filterType) return false;
+                        if (searchTerm && !node.name.toLowerCase().includes(searchTerm.toLowerCase())) {
+                            return false;
+                        }
+                        return true;
+                    });
                     
-                    // Filter nodes based on search term
-                    const filteredNodes = searchTerm 
-                        ? nodes.filter(node => 
-                            node.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
-                            node.type.toLowerCase().includes(searchTerm.toLowerCase())
-                          )
-                        : nodes;
+                    const filteredLinks = links.filter(link => {
+                        const sourceExists = filteredNodes.find(n => n.id === link.source || n.id === link.source?.id);
+                        const targetExists = filteredNodes.find(n => n.id === link.target || n.id === link.target?.id);
+                        return sourceExists && targetExists;
+                    });
                     
-                    const filteredLinks = links.filter(link => 
-                        filteredNodes.find(n => n.id === link.source || n.id === link.source.id) &&
-                        filteredNodes.find(n => n.id === link.target || n.id === link.target.id)
-                    );
-                    
-                    // Set up D3 simulation
+                    // ADVANCED PHYSICS SIMULATION
                     const simulation = d3.forceSimulation(filteredNodes)
-                        .force('link', d3.forceLink(filteredLinks).id(d => d.id).distance(60))
-                        .force('charge', d3.forceManyBody().strength(-300))
+                        .force('link', d3.forceLink(filteredLinks)
+                            .id(d => d.id)
+                            .strength(d => d.strength || 0.5)
+                            .distance(d => d.distance || 80)
+                        )
+                        .force('charge', d3.forceManyBody()
+                            .strength(d => {
+                                // Stronger repulsion for file nodes, weaker for subnodes
+                                return d.type === 'file' ? -400 : -200;
+                            })
+                        )
                         .force('center', d3.forceCenter(width / 2, height / 2))
-                        .force('collision', d3.forceCollide().radius(d => d.size + 2));
+                        .force('collision', d3.forceCollide()
+                            .radius(d => d.size + 5)
+                            .strength(0.7)
+                        )
+                        // Keep file nodes more central
+                        .force('radial', d3.forceRadial(
+                            d => d.type === 'file' ? 100 : 200,
+                            width / 2,
+                            height / 2
+                        ).strength(d => d.type === 'file' ? 0.3 : 0.1));
+
+                    // ENHANCED LINK RENDERING
+                    const linkGroup = g.append('g').attr('class', 'links');
+                    
+                    const link = linkGroup.selectAll('line')
+                        .data(filteredLinks)
+                        .enter().append('line')
+                        .attr('stroke', d => {
+                            if (d.crossFile) return '#ef4444'; // Red for cross-file
+                            if (d.type === 'contains') return '#64748b'; // Gray for containment
+                            if (d.type === 'function-call') return '#10b981'; // Green for calls
+                            return '#6b7280'; // Default gray
+                        })
+                        .attr('stroke-width', d => {
+                            if (d.crossFile) return 3;
+                            if (d.type === 'function-call') return 2;
+                            return 1;
+                        })
+                        .attr('stroke-opacity', d => d.crossFile ? 0.8 : 0.6)
+                        .attr('stroke-dasharray', d => {
+                            if (d.type === 'imports') return '5,5';
+                            return null;
+                        });
+
+                    // ADVANCED NODE RENDERING WITH GRADIENTS
+                    const defs = svg.append('defs');
+                    
+                    // Create gradients for each node type
+                    Object.entries(nodeColors).forEach(([type, color]) => {
+                        const gradient = defs.append('radialGradient')
+                            .attr('id', `gradient-${type}`)
+                            .attr('cx', '30%')
+                            .attr('cy', '30%');
+                        
+                        gradient.append('stop')
+                            .attr('offset', '0%')
+                            .attr('stop-color', d3.color(color).brighter(0.5));
+                        
+                        gradient.append('stop')
+                            .attr('offset', '100%')
+                            .attr('stop-color', color);
+                    });
+
+                    // Glow effect filter
+                    const filter = defs.append('filter')
+                        .attr('id', 'glow')
+                        .attr('x', '-50%')
+                        .attr('y', '-50%')
+                        .attr('width', '200%')
+                        .attr('height', '200%');
+                    
+                    filter.append('feGaussianBlur')
+                        .attr('stdDeviation', 3)
+                        .attr('result', 'coloredBlur');
+                    
+                    const feMerge = filter.append('feMerge');
+                    feMerge.append('feMergeNode').attr('in', 'coloredBlur');
+                    feMerge.append('feMergeNode').attr('in', 'SourceGraphic');
+
                     
                     svg.attr('width', width).attr('height', height);
                     
-                    // Add links
-                    const link = svg.append('g')
-                        .selectAll('line')
-                        .data(filteredLinks)
-                        .enter().append('line')
-                        .attr('stroke', d => d.type === 'contains' ? '#e5e7eb' : '#6366f1')
-                        .attr('stroke-width', d => d.type === 'contains' ? 1 : 2)
-                        .attr('stroke-opacity', 0.6);
-                    
-                    // Add nodes
-                    const node = svg.append('g')
-                        .selectAll('circle')
+                    // Enhanced nodes (using the existing link from linkGroup above)
+                    const node = nodeGroup.selectAll('circle')
                         .data(filteredNodes)
                         .enter().append('circle')
                         .attr('r', d => d.size)
-                        .attr('fill', d => {
-                            if (selectedNode?.data === d.data) return '#dc2626';
-                            switch(d.type) {
-                                case 'file': return '#6366f1';
-                                case 'function': return '#059669';
-                                case 'class': return '#d97706';
-                                default: return '#6b7280';
-                            }
+                        .attr('fill', d => `url(#gradient-${d.type})`)
+                        .attr('stroke', '#ffffff')
+                        .attr('stroke-width', d => {
+                            if (selectedNode?.id === d.id) return 4;
+                            return 1.5;
                         })
-                        .attr('stroke', '#fff')
-                        .attr('stroke-width', 2)
+                        .attr('stroke-opacity', 0.8)
                         .style('cursor', 'pointer')
+                        .on('mouseover', function(event, d) {
+                            // Impact highlighting on hover
+                            const connectedNodes = new Set();
+                            connectedNodes.add(d.id);
+                            
+                            filteredLinks.forEach(link => {
+                                const sourceId = typeof link.source === 'object' ? link.source.id : link.source;
+                                const targetId = typeof link.target === 'object' ? link.target.id : link.target;
+                                
+                                if (sourceId === d.id) connectedNodes.add(targetId);
+                                if (targetId === d.id) connectedNodes.add(sourceId);
+                            });
+                            
+                            // Highlight connected nodes and links
+                            d3.select(this).style('filter', 'url(#glow)');
+                            
+                            node.style('opacity', n => connectedNodes.has(n.id) ? 1 : 0.3);
+                            link.style('stroke-opacity', l => {
+                                const sourceId = typeof l.source === 'object' ? l.source.id : l.source;
+                                const targetId = typeof l.target === 'object' ? l.target.id : l.target;
+                                return (sourceId === d.id || targetId === d.id) ? 1 : 0.2;
+                            });
+                        })
+                        .on('mouseout', function(event, d) {
+                            // Reset styles
+                            d3.select(this).style('filter', null);
+                            node.style('opacity', 1);
+                            link.style('stroke-opacity', l => l.crossFile ? 0.8 : 0.6);
+                        })
                         .on('click', (event, d) => {
                             onNodeClick({ type: d.type, data: d.data || d });
                         })
@@ -649,18 +926,30 @@
                                 d.fy = null;
                             }));
                     
-                    // Add labels
-                    const label = svg.append('g')
+                    // Enhanced labels with better positioning
+                    const label = g.append('g').attr('class', 'labels')
                         .selectAll('text')
                         .data(filteredNodes)
                         .enter().append('text')
-                        .text(d => d.name.length > 15 ? d.name.substring(0, 12) + '...' : d.name)
-                        .attr('font-size', '10px')
-                        .attr('font-family', 'Inter, sans-serif')
+                        .text(d => {
+                            const maxLength = d.type === 'file' ? 20 : 12;
+                            return d.name.length > maxLength ? 
+                                d.name.substring(0, maxLength - 3) + '...' : d.name;
+                        })
+                        .attr('font-size', d => {
+                            const size = d.type === 'file' ? '12px' : '10px';
+                            return size;
+                        })
+                        .attr('font-family', 'Inter, -apple-system, sans-serif')
+                        .attr('font-weight', d => d.type === 'file' ? 600 : 400)
                         .attr('text-anchor', 'middle')
-                        .attr('dy', d => d.size + 15)
-                        .attr('fill', '#374151')
-                        .style('pointer-events', 'none');
+                        .attr('dy', d => d.size + 16)
+                        .attr('fill', d => {
+                            if (d.type === 'file') return '#1f2937';
+                            return '#4b5563';
+                        })
+                        .style('pointer-events', 'none')
+                        .style('user-select', 'none');
                     
                     // Update positions on simulation tick
                     simulation.on('tick', () => {
@@ -686,29 +975,151 @@
                 
                 return (
                     <div ref={graphRef} style={{
-                        background: '#f9fafb',
-                        borderRadius: '12px',
-                        padding: '20px',
-                        marginBottom: '24px'
+                        background: 'linear-gradient(135deg, #f8fafc 0%, #e2e8f0 100%)',
+                        borderRadius: '16px',
+                        padding: '24px',
+                        marginBottom: '24px',
+                        boxShadow: '0 10px 25px rgba(0,0,0,0.1)'
                     }}>
-                        <div style={{ fontWeight: 600, marginBottom: '12px' }}>🌐 Interactive Dependency Graph</div>
-                        <div style={{ 
-                            border: '1px solid #e5e7eb', 
-                            borderRadius: '8px', 
-                            overflow: 'hidden',
-                            background: 'white'
-                        }}>
-                            <svg ref={svgRef}></svg>
-                        </div>
                         <div style={{ 
                             display: 'flex', 
-                            gap: '16px', 
-                            marginTop: '12px', 
-                            fontSize: '12px',
-                            color: '#6b7280'
+                            justifyContent: 'space-between', 
+                            alignItems: 'center', 
+                            marginBottom: '20px',
+                            flexWrap: 'wrap',
+                            gap: '12px'
                         }}>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
-                                <div style={{ width: '12px', height: '12px', borderRadius: '50%', background: '#6366f1' }}></div>
+                            <h3 style={{ 
+                                fontSize: '1.5rem', 
+                                fontWeight: '700',
+                                background: 'linear-gradient(135deg, #6366f1, #8b5cf6)',
+                                WebkitBackgroundClip: 'text',
+                                WebkitTextFillColor: 'transparent',
+                                margin: 0
+                            }}>
+                                🌐 Visual GUI Mapping Engine
+                            </h3>
+                            
+                            <div style={{ 
+                                display: 'flex', 
+                                alignItems: 'center', 
+                                gap: '12px',
+                                flexWrap: 'wrap'
+                            }}>
+                                {/* Advanced Filter Controls */}
+                                <select 
+                                    value={filterType} 
+                                    onChange={(e) => setFilterType(e.target.value)}
+                                    style={{
+                                        padding: '8px 12px',
+                                        border: '1px solid #d1d5db',
+                                        borderRadius: '8px',
+                                        fontSize: '0.875rem',
+                                        background: 'white'
+                                    }}
+                                >
+                                    <option value="all">🔍 All Nodes</option>
+                                    <option value="file">📁 Files Only</option>
+                                    <option value="function">⚡ Functions Only</option>
+                                    <option value="class">�️ Classes Only</option>
+                                    <option value="variable">📊 Variables Only</option>
+                                    <option value="constant">🔒 Constants Only</option>
+                                </select>
+                                
+                                {/* Show Labels Toggle */}
+                                <button
+                                    onClick={() => setShowLabels(!showLabels)}
+                                    style={{
+                                        padding: '8px 12px',
+                                        background: showLabels ? '#6366f1' : '#f3f4f6',
+                                        color: showLabels ? 'white' : '#374151',
+                                        border: 'none',
+                                        borderRadius: '8px',
+                                        fontSize: '0.875rem',
+                                        cursor: 'pointer',
+                                        display: 'flex',
+                                        alignItems: 'center',
+                                        gap: '4px'
+                                    }}
+                                >
+                                    🏷️ Labels
+                                </button>
+                                
+                                {/* Zoom Info */}
+                                <div style={{
+                                    padding: '8px 12px',
+                                    background: '#f8fafc',
+                                    borderRadius: '8px',
+                                    fontSize: '0.75rem',
+                                    color: '#64748b',
+                                    border: '1px solid #e2e8f0'
+                                }}>
+                                    🔍 {Math.round(zoomLevel * 100)}%
+                                </div>
+                            </div>
+                        </div>
+                        
+                        {/* Interactive Graph Container */}
+                        <div style={{ 
+                            border: '2px solid #e5e7eb', 
+                            borderRadius: '12px', 
+                            overflow: 'hidden',
+                            background: 'linear-gradient(135deg, #0f172a 0%, #1e293b 100%)',
+                            position: 'relative'
+                        }}>
+                            <svg ref={svgRef} style={{ display: 'block' }}></svg>
+                            
+                            {/* Graph Instructions Overlay */}
+                            <div style={{
+                                position: 'absolute',
+                                top: '16px',
+                                right: '16px',
+                                background: 'rgba(0,0,0,0.8)',
+                                color: 'white',
+                                padding: '12px',
+                                borderRadius: '8px',
+                                fontSize: '0.75rem',
+                                maxWidth: '200px'
+                            }}>
+                                <div style={{ fontWeight: '600', marginBottom: '8px' }}>🔥 Interactive Features:</div>
+                                <div>• <strong>Hover</strong>: Impact highlights</div>
+                                <div>• <strong>Click</strong>: Trace connections</div>
+                                <div>• <strong>Drag</strong>: Reposition nodes</div>
+                                <div>• <strong>Scroll</strong>: Zoom in/out</div>
+                            </div>
+                        </div>
+                        
+                        {/* Advanced Legend */}
+                        <div style={{ 
+                            display: 'flex', 
+                            gap: '24px', 
+                            marginTop: '16px', 
+                            fontSize: '12px',
+                            color: '#6b7280',
+                            flexWrap: 'wrap',
+                            justifyContent: 'center'
+                        }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                <div style={{ width: '14px', height: '14px', borderRadius: '50%', background: '#3b82f6' }}></div>
+                                📁 Files
+                            </div>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                <div style={{ width: '12px', height: '12px', borderRadius: '50%', background: '#10b981' }}></div>
+                                ⚡ Functions
+                            </div>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                <div style={{ width: '12px', height: '12px', borderRadius: '50%', background: '#f59e0b' }}></div>
+                                🏗️ Classes
+                            </div>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                <div style={{ width: '3px', height: '12px', background: '#ef4444' }}></div>
+                                🔗 Cross-file Links
+                            </div>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                <div style={{ width: '3px', height: '12px', background: '#64748b' }}></div>
+                                📦 Contains
+                            </div>
+                        </div>
                                 Files
                             </div>
                             <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
