@@ -512,13 +512,15 @@
                 useEffect(() => {
                     if (!projectAnalysis || !svgRef.current || !graphRef.current) return;
                     
-                    // Ensure DOM elements are properly mounted
-                    const svgElement = svgRef.current;
-                    const containerElement = graphRef.current;
-                    
-                    if (!svgElement || !containerElement) return;
-                    
-                    try {
+                    // Small delay to ensure DOM elements are fully mounted
+                    const initializeGraph = () => {
+                        // Ensure DOM elements are properly mounted
+                        const svgElement = svgRef.current;
+                        const containerElement = graphRef.current;
+                        
+                        if (!svgElement || !containerElement) return;
+                        
+                        try {
                         const svg = d3.select(svgElement);
                         svg.selectAll('*').remove(); // Clear previous graph
                         
@@ -983,6 +985,14 @@
                     } catch (error) {
                         console.error('Error initializing D3 graph:', error);
                     }
+                };
+                
+                // Initialize with a small delay
+                const timeoutId = setTimeout(initializeGraph, 10);
+                
+                return () => {
+                    clearTimeout(timeoutId);
+                };
                 }, [projectAnalysis, searchTerm, selectedNode]);
                 
                 return (
@@ -1721,20 +1731,39 @@
             );
         };
         
-        // Render the app (React 18 compatible)
-        const rootElement = document.getElementById('root');
-        if (!rootElement) {
-            console.error('Root element not found');
-            return;
-        }
+        // Global error handling
+        window.addEventListener('error', (event) => {
+            // Suppress MutationObserver errors that come from browser extensions
+            if (event.message && event.message.includes('MutationObserver')) {
+                console.warn('MutationObserver error suppressed:', event.message);
+                event.preventDefault();
+                return false;
+            }
+        });
         
-        try {
-            const root = ReactDOM.createRoot(rootElement);
-            root.render(<App />);
-        } catch (error) {
-            console.error('Error rendering app:', error);
-            // Fallback for older React versions
-            ReactDOM.render(<App />, rootElement);
+        // Render the app (React 18 compatible)
+        const initializeApp = () => {
+            const rootElement = document.getElementById('root');
+            if (!rootElement) {
+                console.error('Root element not found');
+                return;
+            }
+            
+            try {
+                const root = ReactDOM.createRoot(rootElement);
+                root.render(<App />);
+            } catch (error) {
+                console.error('Error rendering app:', error);
+                // Fallback for older React versions
+                ReactDOM.render(<App />, rootElement);
+            }
+        };
+        
+        // Initialize the app when DOM is ready
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', initializeApp);
+        } else {
+            initializeApp();
         }
     </script>
 </body>
