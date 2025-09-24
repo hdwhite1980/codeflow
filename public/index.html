@@ -173,7 +173,18 @@
                         await register(formData.name, formData.email, formData.password);
                     }
                 } catch (err) {
-                    setError(err.message);
+                    let errorMessage = err.message;
+                    
+                    // Provide better error messages for common issues
+                    if (errorMessage.includes('Supabase not configured')) {
+                        errorMessage = `⚙️ Configuration Required: Please set up your Supabase credentials in the .env.local file. Check the README for setup instructions.`;
+                    } else if (errorMessage.includes('Invalid login credentials') || errorMessage.includes('401')) {
+                        errorMessage = 'Invalid email or password. Please check your credentials and try again.';
+                    } else if (errorMessage.includes('Failed to fetch') || errorMessage.includes('Network')) {
+                        errorMessage = 'Network error. Please check your connection and try again.';
+                    }
+                    
+                    setError(errorMessage);
                 } finally {
                     setLoading(false);
                 }
@@ -288,6 +299,38 @@
                                 {loading ? 'Please wait...' : (isLogin ? 'Sign In' : 'Create Account')}
                             </button>
                         </form>
+
+                        {/* Demo Mode Button for when Supabase is not configured */}
+                        <button
+                            type="button"
+                            onClick={() => {
+                                // Demo mode - create a temporary user
+                                const demoUser = {
+                                    id: 'demo-user-' + Date.now(),
+                                    email: 'demo@codeflow.com',
+                                    name: 'Demo User',
+                                    created_at: new Date().toISOString()
+                                };
+                                setUser(demoUser);
+                                localStorage.setItem('authToken', 'demo-token');
+                                localStorage.setItem('demoMode', 'true');
+                            }}
+                            style={{
+                                width: '100%',
+                                padding: '12px',
+                                background: 'linear-gradient(135deg, #f59e0b 0%, #d97706 100%)',
+                                color: 'white',
+                                border: 'none',
+                                borderRadius: '8px',
+                                fontSize: '14px',
+                                fontWeight: 600,
+                                cursor: 'pointer',
+                                marginTop: '12px',
+                                marginBottom: '20px'
+                            }}
+                        >
+                            🚀 Try Demo Mode (No Setup Required)
+                        </button>
                         
                         <div style={{ textAlign: 'center', marginTop: '20px' }}>
                             <button
@@ -1675,13 +1718,23 @@
 
                             {error && (
                                 <div style={{
-                                    background: '#fee2e2',
-                                    color: '#b91c1c',
+                                    background: error.includes('Configuration Required') ? '#fef3c7' : '#fee2e2',
+                                    color: error.includes('Configuration Required') ? '#92400e' : '#b91c1c',
                                     borderRadius: '8px',
                                     padding: '12px',
-                                    marginBottom: '16px'
+                                    marginBottom: '16px',
+                                    fontSize: '14px',
+                                    lineHeight: '1.5'
                                 }}>
                                     {error}
+                                    {error.includes('Configuration Required') && (
+                                        <div style={{ marginTop: '8px', fontSize: '12px' }}>
+                                            <strong>Quick Setup:</strong><br/>
+                                            1. Create a Supabase project at <a href="https://supabase.com" target="_blank" style={{color: '#92400e', textDecoration: 'underline'}}>supabase.com</a><br/>
+                                            2. Copy your URL and Service Role Key<br/>
+                                            3. Update the .env.local file with your credentials
+                                        </div>
+                                    )}
                                 </div>
                             )}
 
@@ -1731,13 +1784,26 @@
             );
         };
         
-        // Global error handling
+        // Global error handling for browser extension conflicts
         window.addEventListener('error', (event) => {
-            // Suppress MutationObserver errors that come from browser extensions
-            if (event.message && event.message.includes('MutationObserver')) {
-                console.warn('MutationObserver error suppressed:', event.message);
+            // Suppress MutationObserver errors that come from browser extensions or React DevTools
+            if (event.message && (
+                event.message.includes('MutationObserver') || 
+                event.message.includes('parameter 1 is not of type \'Node\'') ||
+                event.filename && event.filename.includes('index.ts-dc94437b.js')
+            )) {
+                console.warn('Browser extension error suppressed:', event.message);
                 event.preventDefault();
                 return false;
+            }
+        });
+
+        // Suppress unhandled promise rejections from browser extensions
+        window.addEventListener('unhandledrejection', (event) => {
+            if (event.reason && event.reason.message && 
+                event.reason.message.includes('MutationObserver')) {
+                console.warn('Browser extension promise rejection suppressed:', event.reason.message);
+                event.preventDefault();
             }
         });
         

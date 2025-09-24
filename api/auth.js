@@ -5,8 +5,10 @@ function getSupabaseClient() {
   const supabaseUrl = process.env.SUPABASE_URL;
   const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
   
-  if (!supabaseUrl || !supabaseServiceKey) {
-    throw new Error('Missing Supabase configuration. Please set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY environment variables.');
+  if (!supabaseUrl || !supabaseServiceKey || 
+      supabaseUrl.includes('your_supabase_project_url_here') ||
+      supabaseServiceKey.includes('your_service_role_key_here')) {
+    throw new Error('Supabase not configured. Please update your .env.local file with actual Supabase credentials from your Supabase dashboard.');
   }
   
   return createClient(supabaseUrl, supabaseServiceKey, {
