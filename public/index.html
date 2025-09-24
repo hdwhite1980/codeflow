@@ -3,95 +3,530 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CodeFlow - AI Code Analysis Tool</title>
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg">
-    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-    <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js"></script>
+    <title>CodeFlow - AI-Powered Code Analysis Platform</title>
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
     <style>
-        body {
+        * {
             margin: 0;
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', sans-serif;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             min-height: 100vh;
+            overflow-x: hidden;
         }
+
         #root {
             min-height: 100vh;
         }
+
         .loading {
             display: flex;
             justify-content: center;
             align-items: center;
             height: 100vh;
             color: white;
-            font-size: 18px;
+            font-size: 1.2rem;
+        }
+
+        .spinner {
+            width: 40px;
+            height: 40px;
+            border: 4px solid rgba(255,255,255,0.3);
+            border-radius: 50%;
+            border-top-color: white;
+            animation: spin 1s ease-in-out infinite;
+            margin-right: 15px;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
         }
     </style>
 </head>
 <body>
     <div id="root">
-        <div class="loading">Loading CodeFlow...</div>
+        <div class="loading">
+            <div class="spinner"></div>
+            Loading CodeFlow...
+        </div>
     </div>
-    <script>
-        // Convert CodeFlow component to work without imports
+
+    <script type="text/babel">
         const { useState, useRef, useCallback, useMemo, useEffect } = React;
         
-        // Mock the imports with available alternatives or create simple versions
-        const icons = {
-            Upload: () => React.createElement('div', {className: 'icon'}, '📤'),
-            FileCode: () => React.createElement('div', {className: 'icon'}, '📄'),
-            Shield: () => React.createElement('div', {className: 'icon'}, '🛡️'),
-            Eye: () => React.createElement('div', {className: 'icon'}, '👁️'),
-            AlertTriangle: () => React.createElement('div', {className: 'icon'}, '⚠️'),
-            CheckCircle: () => React.createElement('div', {className: 'icon'}, '✅'),
-            XCircle: () => React.createElement('div', {className: 'icon'}, '❌'),
-            GitBranch: () => React.createElement('div', {className: 'icon'}, '🌳'),
-            Activity: () => React.createElement('div', {className: 'icon'}, '📊'),
-            Database: () => React.createElement('div', {className: 'icon'}, '🗄️'),
-            Cloud: () => React.createElement('div', {className: 'icon'}, '☁️'),
-            Settings: () => React.createElement('div', {className: 'icon'}, '⚙️'),
-            Download: () => React.createElement('div', {className: 'icon'}, '⬇️'),
-            Share2: () => React.createElement('div', {className: 'icon'}, '📤'),
-            Zap: () => React.createElement('div', {className: 'icon'}, '⚡'),
-            Brain: () => React.createElement('div', {className: 'icon'}, '🧠'),
-            Map: () => React.createElement('div', {className: 'icon'}, '🗺️'),
-            Plus: () => React.createElement('div', {className: 'icon'}, '➕'),
-            Search: () => React.createElement('div', {className: 'icon'}, '🔍'),
-            Filter: () => React.createElement('div', {className: 'icon'}, '🔽'),
-            MoreVertical: () => React.createElement('div', {className: 'icon'}, '⋮'),
-            Code: () => React.createElement('div', {className: 'icon'}, '💻'),
-            FileText: () => React.createElement('div', {className: 'icon'}, '📝'),
-            Users: () => React.createElement('div', {className: 'icon'}, '👥'),
-            Bell: () => React.createElement('div', {className: 'icon'}, '🔔'),
-            Menu: () => React.createElement('div', {className: 'icon'}, '☰'),
-            X: () => React.createElement('div', {className: 'icon'}, '✖️'),
-            ArrowRight: () => React.createElement('div', {className: 'icon'}, '→'),
-            TrendingUp: () => React.createElement('div', {className: 'icon'}, '📈'),
-            Smartphone: () => React.createElement('div', {className: 'icon'}, '📱'),
-            Bot: () => React.createElement('div', {className: 'icon'}, '🤖'),
-            Lock: () => React.createElement('div', {className: 'icon'}, '🔒'),
-            Unlock: () => React.createElement('div', {className: 'icon'}, '🔓'),
-            RotateCcw: () => React.createElement('div', {className: 'icon'}, '↺'),
-            PlayCircle: () => React.createElement('div', {className: 'icon'}, '▶️'),
-            PauseCircle: () => React.createElement('div', {className: 'icon'}, '⏸️'),
-            RefreshCw: () => React.createElement('div', {className: 'icon'}, '🔄'),
-            ExternalLink: () => React.createElement('div', {className: 'icon'}, '🔗'),
-            Copy: () => React.createElement('div', {className: 'icon'}, '📋'),
-            Edit3: () => React.createElement('div', {className: 'icon'}, '✏️'),
-            Trash2: () => React.createElement('div', {className: 'icon'}, '🗑️'),
-            FolderOpen: () => React.createElement('div', {className: 'icon'}, '📂'),
-            Tag: () => React.createElement('div', {className: 'icon'}, '🏷️'),
-            Calendar: () => React.createElement('div', {className: 'icon'}, '📅'),
-            Clock: () => React.createElement('div', {className: 'icon'}, '🕒'),
-            Layers: () => React.createElement('div', {className: 'icon'}, '📚'),
-            Network: () => React.createElement('div', {className: 'icon'}, '🌐'),
-            Cpu: () => React.createElement('div', {className: 'icon'}, '🔧'),
-            HardDrive: () => React.createElement('div', {className: 'icon'}, '💾'),
+        // API Configuration
+        const API_BASE = window.location.origin;
+        
+        // Authentication Context
+        const AuthContext = React.createContext();
+        
+        const AuthProvider = ({ children }) => {
+            const [user, setUser] = useState(null);
+            const [token, setToken] = useState(localStorage.getItem('authToken'));
+            const [loading, setLoading] = useState(false);
+            
+            useEffect(() => {
+                setLoading(false);
+            }, []);
+            
+            const login = async (email, password) => {
+                try {
+                    const response = await fetch(`${API_BASE}/api/auth`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ action: 'login', email, password })
+                    });
+                    
+                    const data = await response.json();
+                    if (data.token) {
+                        setToken(data.token);
+                        setUser(data.user);
+                        localStorage.setItem('authToken', data.token);
+                        return true;
+                    }
+                    throw new Error(data.error);
+                } catch (error) {
+                    throw new Error(error.message || 'Login failed');
+                }
+            };
+            
+            const register = async (name, email, password) => {
+                try {
+                    const response = await fetch(`${API_BASE}/api/auth`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ action: 'register', name, email, password })
+                    });
+                    
+                    const data = await response.json();
+                    if (data.token) {
+                        setToken(data.token);
+                        setUser(data.user);
+                        localStorage.setItem('authToken', data.token);
+                        return true;
+                    }
+                    throw new Error(data.error);
+                } catch (error) {
+                    throw new Error(error.message || 'Registration failed');
+                }
+            };
+            
+            const logout = () => {
+                setToken(null);
+                setUser(null);
+                localStorage.removeItem('authToken');
+            };
+            
+            return (
+                <AuthContext.Provider value={{ user, token, login, register, logout, loading }}>
+                    {children}
+                </AuthContext.Provider>
+            );
         };
         
-        // Add icons to global scope for the CodeFlow component
-        Object.assign(window, icons);
+        // Login/Register Component
+        const AuthScreen = () => {
+            const { login, register } = React.useContext(AuthContext);
+            const [isLogin, setIsLogin] = useState(true);
+            const [formData, setFormData] = useState({ name: '', email: '', password: '' });
+            const [error, setError] = useState('');
+            const [loading, setLoading] = useState(false);
+            
+            const handleSubmit = async (e) => {
+                e.preventDefault();
+                setError('');
+                setLoading(true);
+                
+                try {
+                    if (isLogin) {
+                        await login(formData.email, formData.password);
+                    } else {
+                        await register(formData.name, formData.email, formData.password);
+                    }
+                } catch (err) {
+                    setError(err.message);
+                } finally {
+                    setLoading(false);
+                }
+            };
+            
+            return (
+                <div style={{
+                    minHeight: '100vh',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    padding: '20px'
+                }}>
+                    <div style={{
+                        background: 'rgba(255, 255, 255, 0.95)',
+                        borderRadius: '16px',
+                        padding: '40px',
+                        width: '100%',
+                        maxWidth: '400px',
+                        boxShadow: '0 20px 25px -5px rgba(0, 0, 0, 0.1)'
+                    }}>
+                        <div style={{ textAlign: 'center', marginBottom: '30px' }}>
+                            <h1 style={{ fontSize: '2rem', fontWeight: 'bold', marginBottom: '8px' }}>
+                                🧠 CodeFlow
+                            </h1>
+                            <p style={{ color: '#6b7280' }}>
+                                {isLogin ? 'Welcome back' : 'Create your account'}
+                            </p>
+                        </div>
+                        
+                        <form onSubmit={handleSubmit}>
+                            {!isLogin && (
+                                <div style={{ marginBottom: '20px' }}>
+                                    <input
+                                        type="text"
+                                        placeholder="Full Name"
+                                        value={formData.name}
+                                        onChange={(e) => setFormData({...formData, name: e.target.value})}
+                                        required
+                                        style={{
+                                            width: '100%',
+                                            padding: '12px',
+                                            border: '1px solid #d1d5db',
+                                            borderRadius: '8px',
+                                            fontSize: '14px'
+                                        }}
+                                    />
+                                </div>
+                            )}
+                            
+                            <div style={{ marginBottom: '20px' }}>
+                                <input
+                                    type="email"
+                                    placeholder="Email"
+                                    value={formData.email}
+                                    onChange={(e) => setFormData({...formData, email: e.target.value})}
+                                    required
+                                    style={{
+                                        width: '100%',
+                                        padding: '12px',
+                                        border: '1px solid #d1d5db',
+                                        borderRadius: '8px',
+                                        fontSize: '14px'
+                                    }}
+                                />
+                            </div>
+                            
+                            <div style={{ marginBottom: '20px' }}>
+                                <input
+                                    type="password"
+                                    placeholder="Password"
+                                    value={formData.password}
+                                    onChange={(e) => setFormData({...formData, password: e.target.value})}
+                                    required
+                                    style={{
+                                        width: '100%',
+                                        padding: '12px',
+                                        border: '1px solid #d1d5db',
+                                        borderRadius: '8px',
+                                        fontSize: '14px'
+                                    }}
+                                />
+                            </div>
+                            
+                            {error && (
+                                <div style={{ 
+                                    color: '#ef4444', 
+                                    fontSize: '14px', 
+                                    marginBottom: '20px',
+                                    textAlign: 'center'
+                                }}>
+                                    {error}
+                                </div>
+                            )}
+                            
+                            <button
+                                type="submit"
+                                disabled={loading}
+                                style={{
+                                    width: '100%',
+                                    background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+                                    color: 'white',
+                                    padding: '12px',
+                                    border: 'none',
+                                    borderRadius: '8px',
+                                    fontSize: '16px',
+                                    fontWeight: '600',
+                                    cursor: loading ? 'not-allowed' : 'pointer',
+                                    opacity: loading ? 0.7 : 1
+                                }}
+                            >
+                                {loading ? 'Please wait...' : (isLogin ? 'Sign In' : 'Create Account')}
+                            </button>
+                        </form>
+                        
+                        <div style={{ textAlign: 'center', marginTop: '20px' }}>
+                            <button
+                                onClick={() => setIsLogin(!isLogin)}
+                                style={{
+                                    background: 'none',
+                                    border: 'none',
+                                    color: '#6366f1',
+                                    cursor: 'pointer',
+                                    textDecoration: 'underline'
+                                }}
+                            >
+                                {isLogin ? "Don't have an account? Sign up" : "Already have an account? Sign in"}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+        
+        // Main Dashboard Component
+        const Dashboard = () => {
+            const { user, logout } = React.useContext(AuthContext);
+            const [code, setCode] = useState('');
+            const [analysis, setAnalysis] = useState(null);
+            const [loading, setLoading] = useState(false);
+            const [file, setFile] = useState(null);
+            
+            const analyzeCode = async () => {
+                if (!code.trim()) return;
+                
+                setLoading(true);
+                try {
+                    const response = await fetch(`${API_BASE}/api/analysis`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Authorization': `Bearer ${localStorage.getItem('authToken')}`
+                        },
+                        body: JSON.stringify({
+                            code,
+                            language: 'javascript',
+                            filename: file?.name || 'code.js'
+                        })
+                    });
+                    
+                    const result = await response.json();
+                    setAnalysis(result);
+                } catch (error) {
+                    console.error('Analysis failed:', error);
+                    setAnalysis({
+                        error: 'Analysis failed. Please try again.',
+                        metrics: {
+                            lines: code.split('\n').length,
+                            characters: code.length,
+                            functions: (code.match(/function\s+\w+|=>\s*{|function\s*\(/g) || []).length,
+                            variables: (code.match(/\b(let|const|var)\s+\w+/g) || []).length,
+                            complexity: (code.match(/\b(if|while|for|switch)\s*\(/g) || []).length + 1
+                        },
+                        suggestions: [
+                            'Consider adding more comments for better documentation',
+                            'Break down complex functions into smaller ones',
+                            'Add proper error handling'
+                        ]
+                    });
+                } finally {
+                    setLoading(false);
+                }
+            };
+            
+            const handleFileUpload = (e) => {
+                const selectedFile = e.target.files[0];
+                if (selectedFile) {
+                    setFile(selectedFile);
+                    const reader = new FileReader();
+                    reader.onload = (e) => setCode(e.target.result);
+                    reader.readAsText(selectedFile);
+                }
+            };
+            
+            return (
+                <div style={{ minHeight: '100vh', background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)' }}>
+                    {/* Header */}
+                    <div style={{
+                        background: 'rgba(255, 255, 255, 0.95)',
+                        padding: '20px',
+                        marginBottom: '20px',
+                        boxShadow: '0 2px 4px rgba(0,0,0,0.1)'
+                    }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', maxWidth: '1200px', margin: '0 auto' }}>
+                            <h1 style={{ fontSize: '1.5rem', fontWeight: 'bold' }}>
+                                🧠 CodeFlow
+                            </h1>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '15px' }}>
+                                <span>Welcome, {user?.name || 'User'}</span>
+                                <button
+                                    onClick={logout}
+                                    style={{
+                                        background: '#ef4444',
+                                        color: 'white',
+                                        padding: '8px 16px',
+                                        border: 'none',
+                                        borderRadius: '6px',
+                                        cursor: 'pointer'
+                                    }}
+                                >
+                                    Logout
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    {/* Main Content */}
+                    <div style={{ maxWidth: '1200px', margin: '0 auto', padding: '0 20px' }}>
+                        <div style={{
+                            background: 'rgba(255, 255, 255, 0.95)',
+                            borderRadius: '12px',
+                            padding: '30px',
+                            boxShadow: '0 4px 6px rgba(0, 0, 0, 0.1)'
+                        }}>
+                            <h2 style={{ fontSize: '1.25rem', fontWeight: '600', marginBottom: '20px' }}>
+                                📊 Upload Code File or Paste Code:
+                            </h2>
+                            
+                            {/* File Upload */}
+                            <div style={{ marginBottom: '20px' }}>
+                                <input
+                                    type="file"
+                                    accept=".js,.jsx,.ts,.tsx,.py,.java,.cpp,.c,.html,.css"
+                                    onChange={handleFileUpload}
+                                    style={{
+                                        padding: '10px',
+                                        border: '2px dashed #d1d5db',
+                                        borderRadius: '8px',
+                                        width: '100%'
+                                    }}
+                                />
+                            </div>
+                            
+                            {/* Code Input */}
+                            <textarea
+                                value={code}
+                                onChange={(e) => setCode(e.target.value)}
+                                placeholder="Paste your code here or upload a file..."
+                                style={{
+                                    width: '100%',
+                                    height: '300px',
+                                    padding: '15px',
+                                    border: '1px solid #d1d5db',
+                                    borderRadius: '8px',
+                                    fontFamily: 'Monaco, Consolas, monospace',
+                                    fontSize: '14px',
+                                    resize: 'vertical'
+                                }}
+                            />
+                            
+                            {/* Analyze Button */}
+                            <button
+                                onClick={analyzeCode}
+                                disabled={loading || !code.trim()}
+                                style={{
+                                    background: loading ? '#9ca3af' : 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+                                    color: 'white',
+                                    padding: '12px 24px',
+                                    border: 'none',
+                                    borderRadius: '8px',
+                                    fontSize: '16px',
+                                    fontWeight: '600',
+                                    cursor: loading ? 'not-allowed' : 'pointer',
+                                    marginTop: '15px'
+                                }}
+                            >
+                                {loading ? '🔄 Analyzing...' : '🔍 Analyze Code'}
+                            </button>
+                        </div>
+                        
+                        {/* Analysis Results */}
+                        {analysis && (
+                            <div style={{
+                                background: 'rgba(255, 255, 255, 0.95)',
+                                borderRadius: '12px',
+                                padding: '30px',
+                                marginTop: '20px',
+                                boxShadow: '0 4px 6px rgba(0, 0, 0, 0.1)'
+                            }}>
+                                <h3 style={{ fontSize: '1.25rem', fontWeight: '600', marginBottom: '20px' }}>
+                                    📈 Analysis Results
+                                </h3>
+                                
+                                {analysis.error && (
+                                    <div style={{ color: '#dc2626', marginBottom: '20px' }}>
+                                        {analysis.error}
+                                    </div>
+                                )}
+                                
+                                {analysis.metrics && (
+                                    <div style={{ marginBottom: '20px' }}>
+                                        <h4 style={{ fontWeight: '600', marginBottom: '10px' }}>Code Metrics:</h4>
+                                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '15px' }}>
+                                            <div style={{ padding: '15px', background: '#f3f4f6', borderRadius: '8px' }}>
+                                                <div style={{ fontWeight: '600', color: '#374151' }}>Lines of Code</div>
+                                                <div style={{ fontSize: '1.5rem', fontWeight: 'bold', color: '#6366f1' }}>{analysis.metrics.lines}</div>
+                                            </div>
+                                            <div style={{ padding: '15px', background: '#f3f4f6', borderRadius: '8px' }}>
+                                                <div style={{ fontWeight: '600', color: '#374151' }}>Functions</div>
+                                                <div style={{ fontSize: '1.5rem', fontWeight: 'bold', color: '#059669' }}>{analysis.metrics.functions}</div>
+                                            </div>
+                                            <div style={{ padding: '15px', background: '#f3f4f6', borderRadius: '8px' }}>
+                                                <div style={{ fontWeight: '600', color: '#374151' }}>Variables</div>
+                                                <div style={{ fontSize: '1.5rem', fontWeight: 'bold', color: '#d97706' }}>{analysis.metrics.variables}</div>
+                                            </div>
+                                            <div style={{ padding: '15px', background: '#f3f4f6', borderRadius: '8px' }}>
+                                                <div style={{ fontWeight: '600', color: '#374151' }}>Complexity</div>
+                                                <div style={{ fontSize: '1.5rem', fontWeight: 'bold', color: '#dc2626' }}>{analysis.metrics.complexity}</div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                )}
+                                
+                                {analysis.suggestions && (
+                                    <div>
+                                        <h4 style={{ fontWeight: '600', marginBottom: '10px' }}>Suggestions:</h4>
+                                        <ul style={{ paddingLeft: '20px' }}>
+                                            {analysis.suggestions.map((suggestion, index) => (
+                                                <li key={index} style={{ marginBottom: '5px', color: '#374151' }}>
+                                                    {suggestion}
+                                                </li>
+                                            ))}
+                                        </ul>
+                                    </div>
+                                )}
+                            </div>
+                        )}
+                    </div>
+                </div>
+            );
+        };
+        
+        // Main App Component
+        const App = () => {
+            return (
+                <AuthProvider>
+                    <AuthContext.Consumer>
+                        {({ user, loading }) => {
+                            if (loading) {
+                                return (
+                                    <div className="loading">
+                                        <div className="spinner"></div>
+                                        Loading CodeFlow...
+                                    </div>
+                                );
+                            }
+                            
+                            return user ? <Dashboard /> : <AuthScreen />;
+                        }}
+                    </AuthContext.Consumer>
+                </AuthProvider>
+            );
+        };
+        
+        // Render the app
+        ReactDOM.render(<App />, document.getElementById('root'));
     </script>
-    <script src="./codeflow-browser.js"></script>
 </body>
 </html>

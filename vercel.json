@@ -1,13 +1,10 @@
 {
   "version": 2,
+  "public": true,
   "routes": [
     {
       "src": "/",
-      "dest": "/index.html"
-    },
-    {
-      "src": "/app.html",
-      "dest": "/app.html"
+      "dest": "/public/index.html"
     },
     {
       "src": "/api/(.*)",
