@@ -4,7 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "dev": "vercel dev",
+    "dev": "node server/server.js",
     "start": "node server/server.js",
     "build": "echo \"Build completed\"",
     "deploy": "vercel --prod",

@@ -47,11 +47,16 @@ NODE_ENV=production
 2. Copy the contents of `supabase-setup.sql` from this project
 3. Paste it into the SQL editor and click **Run**
 4. This will create:
-   - `profiles` table for user profiles
-   - `projects` table for user projects (future use)
-   - `analysis_history` table for analysis results (future use)
-   - Row Level Security policies
+   - `profiles` table for user profiles (extends Supabase auth)
+   - `projects` table for user projects with enhanced features
+   - `code_files` table for storing uploaded/analyzed files
+   - `ai_sessions` table for tracking AI interactions (OpenAI, Anthropic, Google)
+   - `analysis_results` table for storing code analysis results
+   - `security_vulnerabilities` table for security scan results
+   - Comprehensive indexes for performance
+   - Row Level Security policies for data protection
    - Auto-profile creation trigger
+   - Updated timestamp triggers
 
 ## Step 5: Configure Vercel Environment Variables
 

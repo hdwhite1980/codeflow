@@ -1,11 +1,60 @@
--- CodeFlow Supabase Database Setup
--- Run these commands in your Supabase SQL Editor
--- This combines Supabase auth with comprehensive CodeFlow schema
+-- COMPLETE DATABASE RESET FOR CODEFLOW
+-- WARNING: This will DELETE ALL DATA in your database!
+-- Only run this if you want to start completely fresh
 
--- Note: auth.users table is managed by Supabase and already has RLS enabled
+-- ========================================
+-- STEP 1: DROP ALL EXISTING TABLES
+-- ========================================
+
+-- Drop all policies first (to avoid dependency issues)
+DROP POLICY IF EXISTS "Users can view own profile" ON public.profiles;
+DROP POLICY IF EXISTS "Users can update own profile" ON public.profiles;
+DROP POLICY IF EXISTS "Users can insert own profile" ON public.profiles;
+DROP POLICY IF EXISTS "Users can view own projects" ON public.projects;
+DROP POLICY IF EXISTS "Users can insert own projects" ON public.projects;
+DROP POLICY IF EXISTS "Users can update own projects" ON public.projects;
+DROP POLICY IF EXISTS "Users can delete own projects" ON public.projects;
+DROP POLICY IF EXISTS "Users can view code files from own projects" ON public.code_files;
+DROP POLICY IF EXISTS "Users can insert code files to own projects" ON public.code_files;
+DROP POLICY IF EXISTS "Users can update code files in own projects" ON public.code_files;
+DROP POLICY IF EXISTS "Users can delete code files from own projects" ON public.code_files;
+DROP POLICY IF EXISTS "Users can view own ai sessions" ON public.ai_sessions;
+DROP POLICY IF EXISTS "Users can insert own ai sessions" ON public.ai_sessions;
+DROP POLICY IF EXISTS "Users can update own ai sessions" ON public.ai_sessions;
+DROP POLICY IF EXISTS "Users can view own analysis results" ON public.analysis_results;
+DROP POLICY IF EXISTS "Users can insert own analysis results" ON public.analysis_results;
+DROP POLICY IF EXISTS "Users can view own security vulnerabilities" ON public.security_vulnerabilities;
+DROP POLICY IF EXISTS "Users can insert own security vulnerabilities" ON public.security_vulnerabilities;
+
+-- Drop all triggers
+DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
+DROP TRIGGER IF EXISTS update_profiles_updated_at ON public.profiles;
+DROP TRIGGER IF EXISTS update_projects_updated_at ON public.projects;
+DROP TRIGGER IF EXISTS update_code_files_updated_at ON public.code_files;
+DROP TRIGGER IF EXISTS update_ai_sessions_updated_at ON public.ai_sessions;
+
+-- Drop all functions
+DROP FUNCTION IF EXISTS public.handle_new_user();
+DROP FUNCTION IF EXISTS public.update_updated_at_column();
+
+-- Drop all tables (in reverse dependency order)
+DROP TABLE IF EXISTS public.security_vulnerabilities CASCADE;
+DROP TABLE IF EXISTS public.analysis_results CASCADE;
+DROP TABLE IF EXISTS public.ai_sessions CASCADE;
+DROP TABLE IF EXISTS public.code_files CASCADE;
+DROP TABLE IF EXISTS public.projects CASCADE;
+DROP TABLE IF EXISTS public.profiles CASCADE;
+
+-- Drop any old tables that might exist
+DROP TABLE IF EXISTS public.users CASCADE;
+DROP TABLE IF EXISTS public.analysis_history CASCADE;
+
+-- ========================================
+-- STEP 2: CREATE FRESH TABLES
+-- ========================================
 
 -- Create profiles table (extends Supabase auth.users)
-CREATE TABLE IF NOT EXISTS public.profiles (
+CREATE TABLE public.profiles (
   id UUID REFERENCES auth.users(id) ON DELETE CASCADE,
   email TEXT,
   name TEXT,
@@ -14,21 +63,8 @@ CREATE TABLE IF NOT EXISTS public.profiles (
   PRIMARY KEY (id)
 );
 
--- Enable RLS on profiles
-ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
-
--- Create policy for profiles (users can only see/edit their own profile)
-CREATE POLICY "Users can view own profile" ON public.profiles
-  FOR SELECT USING (auth.uid() = id);
-
-CREATE POLICY "Users can update own profile" ON public.profiles
-  FOR UPDATE USING (auth.uid() = id);
-
-CREATE POLICY "Users can insert own profile" ON public.profiles
-  FOR INSERT WITH CHECK (auth.uid() = id);
-
--- Projects table (enhanced from existing schema)
-CREATE TABLE IF NOT EXISTS public.projects (
+-- Projects table
+CREATE TABLE public.projects (
   id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
   user_id UUID REFERENCES auth.users(id) ON DELETE CASCADE,
   name VARCHAR(255) NOT NULL,
@@ -40,8 +76,8 @@ CREATE TABLE IF NOT EXISTS public.projects (
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- Code files table (from existing schema)
-CREATE TABLE IF NOT EXISTS public.code_files (
+-- Code files table
+CREATE TABLE public.code_files (
   id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
   project_id UUID REFERENCES public.projects(id) ON DELETE CASCADE,
   filename VARCHAR(500) NOT NULL,
@@ -53,8 +89,8 @@ CREATE TABLE IF NOT EXISTS public.code_files (
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- AI sessions table (from existing schema)
-CREATE TABLE IF NOT EXISTS public.ai_sessions (
+-- AI sessions table
+CREATE TABLE public.ai_sessions (
   id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
   user_id UUID REFERENCES auth.users(id) ON DELETE CASCADE,
   project_id UUID REFERENCES public.projects(id) ON DELETE CASCADE,
@@ -68,8 +104,8 @@ CREATE TABLE IF NOT EXISTS public.ai_sessions (
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- Analysis results table (enhanced from existing schema)
-CREATE TABLE IF NOT EXISTS public.analysis_results (
+-- Analysis results table
+CREATE TABLE public.analysis_results (
   id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
   user_id UUID REFERENCES auth.users(id) ON DELETE CASCADE,
   project_id UUID REFERENCES public.projects(id) ON DELETE CASCADE,
@@ -81,8 +117,8 @@ CREATE TABLE IF NOT EXISTS public.analysis_results (
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- Security vulnerabilities table (from existing schema)
-CREATE TABLE IF NOT EXISTS public.security_vulnerabilities (
+-- Security vulnerabilities table
+CREATE TABLE public.security_vulnerabilities (
   id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
   user_id UUID REFERENCES auth.users(id) ON DELETE CASCADE,
   project_id UUID REFERENCES public.projects(id) ON DELETE CASCADE,
@@ -95,14 +131,30 @@ CREATE TABLE IF NOT EXISTS public.security_vulnerabilities (
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- Enable RLS on all tables
+-- ========================================
+-- STEP 3: ENABLE RLS
+-- ========================================
+
+ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.projects ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.code_files ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.ai_sessions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.analysis_results ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.security_vulnerabilities ENABLE ROW LEVEL SECURITY;
 
--- Create RLS policies for projects
+-- ========================================
+-- STEP 4: CREATE RLS POLICIES
+-- ========================================
+
+-- Profiles policies
+CREATE POLICY "Users can view own profile" ON public.profiles
+  FOR SELECT USING (auth.uid() = id);
+CREATE POLICY "Users can update own profile" ON public.profiles
+  FOR UPDATE USING (auth.uid() = id);
+CREATE POLICY "Users can insert own profile" ON public.profiles
+  FOR INSERT WITH CHECK (auth.uid() = id);
+
+-- Projects policies
 CREATE POLICY "Users can view own projects" ON public.projects
   FOR SELECT USING (auth.uid() = user_id);
 CREATE POLICY "Users can insert own projects" ON public.projects
@@ -112,7 +164,7 @@ CREATE POLICY "Users can update own projects" ON public.projects
 CREATE POLICY "Users can delete own projects" ON public.projects
   FOR DELETE USING (auth.uid() = user_id);
 
--- Create RLS policies for code_files (through project ownership)
+-- Code files policies (through project ownership)
 CREATE POLICY "Users can view code files from own projects" ON public.code_files
   FOR SELECT USING (EXISTS (
     SELECT 1 FROM public.projects WHERE projects.id = code_files.project_id AND projects.user_id = auth.uid()
@@ -130,7 +182,7 @@ CREATE POLICY "Users can delete code files from own projects" ON public.code_fil
     SELECT 1 FROM public.projects WHERE projects.id = code_files.project_id AND projects.user_id = auth.uid()
   ));
 
--- Create RLS policies for ai_sessions
+-- AI sessions policies
 CREATE POLICY "Users can view own ai sessions" ON public.ai_sessions
   FOR SELECT USING (auth.uid() = user_id);
 CREATE POLICY "Users can insert own ai sessions" ON public.ai_sessions
@@ -138,32 +190,39 @@ CREATE POLICY "Users can insert own ai sessions" ON public.ai_sessions
 CREATE POLICY "Users can update own ai sessions" ON public.ai_sessions
   FOR UPDATE USING (auth.uid() = user_id);
 
--- Create RLS policies for analysis_results
+-- Analysis results policies
 CREATE POLICY "Users can view own analysis results" ON public.analysis_results
   FOR SELECT USING (auth.uid() = user_id);
 CREATE POLICY "Users can insert own analysis results" ON public.analysis_results
   FOR INSERT WITH CHECK (auth.uid() = user_id);
 
--- Create RLS policies for security_vulnerabilities
+-- Security vulnerabilities policies
 CREATE POLICY "Users can view own security vulnerabilities" ON public.security_vulnerabilities
   FOR SELECT USING (auth.uid() = user_id);
 CREATE POLICY "Users can insert own security vulnerabilities" ON public.security_vulnerabilities
   FOR INSERT WITH CHECK (auth.uid() = user_id);
 
--- Create indexes for better performance
-CREATE INDEX IF NOT EXISTS idx_profiles_email ON public.profiles(email);
-CREATE INDEX IF NOT EXISTS idx_projects_user_id ON public.projects(user_id);
-CREATE INDEX IF NOT EXISTS idx_code_files_project_id ON public.code_files(project_id);
-CREATE INDEX IF NOT EXISTS idx_ai_sessions_user_id ON public.ai_sessions(user_id);
-CREATE INDEX IF NOT EXISTS idx_ai_sessions_project_id ON public.ai_sessions(project_id);
-CREATE INDEX IF NOT EXISTS idx_analysis_results_user_id ON public.analysis_results(user_id);
-CREATE INDEX IF NOT EXISTS idx_analysis_results_project_id ON public.analysis_results(project_id);
-CREATE INDEX IF NOT EXISTS idx_analysis_results_file_id ON public.analysis_results(file_id);
-CREATE INDEX IF NOT EXISTS idx_vulnerabilities_user_id ON public.security_vulnerabilities(user_id);
-CREATE INDEX IF NOT EXISTS idx_vulnerabilities_project_id ON public.security_vulnerabilities(project_id);
-CREATE INDEX IF NOT EXISTS idx_vulnerabilities_file_id ON public.security_vulnerabilities(file_id);
+-- ========================================
+-- STEP 5: CREATE INDEXES
+-- ========================================
 
--- Create function to automatically create profile on signup
+CREATE INDEX idx_profiles_email ON public.profiles(email);
+CREATE INDEX idx_projects_user_id ON public.projects(user_id);
+CREATE INDEX idx_code_files_project_id ON public.code_files(project_id);
+CREATE INDEX idx_ai_sessions_user_id ON public.ai_sessions(user_id);
+CREATE INDEX idx_ai_sessions_project_id ON public.ai_sessions(project_id);
+CREATE INDEX idx_analysis_results_user_id ON public.analysis_results(user_id);
+CREATE INDEX idx_analysis_results_project_id ON public.analysis_results(project_id);
+CREATE INDEX idx_analysis_results_file_id ON public.analysis_results(file_id);
+CREATE INDEX idx_vulnerabilities_user_id ON public.security_vulnerabilities(user_id);
+CREATE INDEX idx_vulnerabilities_project_id ON public.security_vulnerabilities(project_id);
+CREATE INDEX idx_vulnerabilities_file_id ON public.security_vulnerabilities(file_id);
+
+-- ========================================
+-- STEP 6: CREATE FUNCTIONS AND TRIGGERS
+-- ========================================
+
+-- Function to automatically create profile on signup
 CREATE OR REPLACE FUNCTION public.handle_new_user()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -178,12 +237,11 @@ END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
 -- Create trigger to automatically create profile
-DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
 CREATE TRIGGER on_auth_user_created
   AFTER INSERT ON auth.users
   FOR EACH ROW EXECUTE FUNCTION public.handle_new_user();
 
--- Create function to update updated_at timestamp
+-- Function to update updated_at timestamp
 CREATE OR REPLACE FUNCTION public.update_updated_at_column()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -205,7 +263,10 @@ CREATE TRIGGER update_code_files_updated_at BEFORE UPDATE ON public.code_files
 CREATE TRIGGER update_ai_sessions_updated_at BEFORE UPDATE ON public.ai_sessions
   FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();
 
--- Grant necessary permissions
+-- ========================================
+-- STEP 7: GRANT PERMISSIONS
+-- ========================================
+
 GRANT USAGE ON SCHEMA public TO anon, authenticated;
 GRANT ALL ON public.profiles TO authenticated;
 GRANT ALL ON public.projects TO authenticated;
@@ -213,3 +274,10 @@ GRANT ALL ON public.code_files TO authenticated;
 GRANT ALL ON public.ai_sessions TO authenticated;
 GRANT ALL ON public.analysis_results TO authenticated;
 GRANT ALL ON public.security_vulnerabilities TO authenticated;
+
+-- ========================================
+-- COMPLETION MESSAGE
+-- ========================================
+
+-- If you see this message, the reset was successful!
+SELECT 'CodeFlow database reset completed successfully! All tables, policies, functions, and triggers have been created.' AS status;

@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Debug Test - CodeFlow</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        .debug-info {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            margin: 10px 0;
+        }
+        .success { border-left: 4px solid #10b981; }
+        .error { border-left: 4px solid #ef4444; }
+        .warning { border-left: 4px solid #f59e0b; }
+    </style>
+</head>
+<body>
+    <h1>CodeFlow Debug Information</h1>
+    
+    <div class="debug-info success">
+        <h3>✅ Fixes Applied:</h3>
+        <ul>
+            <li>Updated ReactDOM.render to use createRoot (React 18 compatible)</li>
+            <li>Added error handling for D3 graph initialization</li>
+            <li>Fixed MutationObserver issues with proper DOM element checks</li>
+            <li>Added fallback handling for React rendering</li>
+            <li>Fixed npm dev script recursive invocation</li>
+        </ul>
+    </div>
+    
+    <div class="debug-info warning">
+        <h3>⚠️ Production Notes:</h3>
+        <ul>
+            <li>Babel transformer is used for in-browser JSX compilation (development only)</li>
+            <li>For production: Use bundled and minified React builds</li>
+            <li>For production: Pre-compile JSX using build tools like Webpack or Vite</li>
+        </ul>
+    </div>
+    
+    <div class="debug-info">
+        <h3>🔧 Server Status:</h3>
+        <p>CodeFlow server should be running on <a href="http://localhost:5000" target="_blank">http://localhost:5000</a></p>
+        <p>Check browser console for any remaining errors.</p>
+    </div>
+    
+    <script>
+        console.log('🚀 Debug test loaded successfully');
+        console.log('✅ All fixes have been applied to the main CodeFlow application');
+        
+        // Test that the main fixes are working
+        const testReactDOM = () => {
+            if (typeof ReactDOM !== 'undefined' && ReactDOM.createRoot) {
+                console.log('✅ ReactDOM.createRoot is available');
+                return true;
+            } else {
+                console.warn('⚠️ ReactDOM.createRoot not available, using legacy render');
+                return false;
+            }
+        };
+        
+        // This would normally be called, but we don't have React loaded here
+        // testReactDOM();
+    </script>
+</body>
+</html>

@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>CodeFlow - AI-Powered Code Analysis Platform</title>
+    <!-- Production note: In production, these scripts should be bundled and minified -->
     <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
     <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -319,6 +320,7 @@
             const [error, setError] = useState('');
             const [searchTerm, setSearchTerm] = useState('');
             const [showGraph, setShowGraph] = useState(true);
+            const [showGraphView, setShowGraphView] = useState(false); // For single file analysis toggle
 
             const hasProjectFiles = files.length > 0;
 
@@ -508,14 +510,21 @@
                 const [zoomLevel, setZoomLevel] = useState(1);
                 
                 useEffect(() => {
-                    if (!projectAnalysis || !svgRef.current) return;
+                    if (!projectAnalysis || !svgRef.current || !graphRef.current) return;
                     
-                    const svg = d3.select(svgRef.current);
-                    svg.selectAll('*').remove(); // Clear previous graph
+                    // Ensure DOM elements are properly mounted
+                    const svgElement = svgRef.current;
+                    const containerElement = graphRef.current;
                     
-                    const containerWidth = graphRef.current?.offsetWidth || 1200;
-                    const width = Math.max(containerWidth, 1200);
-                    const height = Math.max(800, Math.min(1000, width * 0.7));
+                    if (!svgElement || !containerElement) return;
+                    
+                    try {
+                        const svg = d3.select(svgElement);
+                        svg.selectAll('*').remove(); // Clear previous graph
+                        
+                        const containerWidth = containerElement.offsetWidth || 1200;
+                        const width = Math.max(containerWidth, 1200);
+                        const height = Math.max(800, Math.min(1000, width * 0.7));
                     
                     svg.attr('width', width)
                        .attr('height', height)
@@ -971,6 +980,9 @@
                     return () => {
                         simulation.stop();
                     };
+                    } catch (error) {
+                        console.error('Error initializing D3 graph:', error);
+                    }
                 }, [projectAnalysis, searchTerm, selectedNode]);
                 
                 return (
@@ -1120,17 +1132,6 @@
                                 📦 Contains
                             </div>
                         </div>
-                                Files
-                            </div>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
-                                <div style={{ width: '12px', height: '12px', borderRadius: '50%', background: '#059669' }}></div>
-                                Functions
-                            </div>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
-                                <div style={{ width: '12px', height: '12px', borderRadius: '50%', background: '#d97706' }}></div>
-                                Classes
-                            </div>
-                        </div>
                     </div>
                 );
             };
@@ -1177,6 +1178,14 @@
             };
 
             const renderSingleFileAnalysis = (singleAnalysis) => {
+                // Convert single file to project-like structure for graph
+                const createGraphData = () => {
+                    return {
+                        files: [singleAnalysis],
+                        dependencies: [] // Single file has no cross-file dependencies
+                    };
+                };
+                
                 return (
                     <div style={{
                         background: 'rgba(255, 255, 255, 0.95)',
@@ -1185,9 +1194,98 @@
                         marginTop: '20px',
                         boxShadow: '0 4px 6px rgba(0, 0, 0, 0.1)'
                     }}>
-                        <h3 style={{ fontSize: '1.25rem', fontWeight: '600', marginBottom: '24px' }}>
-                            📊 Code Structure Overview
-                        </h3>
+                        <div style={{ 
+                            display: 'flex', 
+                            justifyContent: 'space-between', 
+                            alignItems: 'center', 
+                            marginBottom: '24px',
+                            flexWrap: 'wrap',
+                            gap: '12px'
+                        }}>
+                            <h3 style={{ fontSize: '1.25rem', fontWeight: '600', margin: 0 }}>
+                                📊 Code Structure Overview
+                            </h3>
+                            
+                            {/* Toggle between List and Graph View */}
+                            <button
+                                onClick={() => setShowGraphView(!showGraphView)}
+                                style={{
+                                    padding: '10px 16px',
+                                    background: showGraphView ? 'linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%)' : '#f3f4f6',
+                                    color: showGraphView ? 'white' : '#374151',
+                                    border: 'none',
+                                    borderRadius: '8px',
+                                    fontSize: '0.875rem',
+                                    fontWeight: '500',
+                                    cursor: 'pointer',
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    gap: '8px',
+                                    transition: 'all 0.2s ease',
+                                    boxShadow: showGraphView ? '0 4px 12px rgba(99, 102, 241, 0.3)' : '0 2px 4px rgba(0,0,0,0.1)'
+                                }}
+                                onMouseOver={(e) => {
+                                    if (!showGraphView) {
+                                        e.target.style.background = '#e5e7eb';
+                                    }
+                                }}
+                                onMouseOut={(e) => {
+                                    if (!showGraphView) {
+                                        e.target.style.background = '#f3f4f6';
+                                    }
+                                }}
+                            >
+                                {showGraphView ? (
+                                    <>🌐 Advanced Graph View</>
+                                ) : (
+                                    <>� Switch to Graph View</>
+                                )}
+                            </button>
+                        </div>
+
+                        {showGraphView ? (
+                            <div>
+                                <div style={{
+                                    background: 'linear-gradient(135deg, #f8fafc 0%, #e2e8f0 100%)',
+                                    borderRadius: '12px',
+                                    padding: '20px',
+                                    marginBottom: '20px',
+                                    border: '2px solid #e5e7eb'
+                                }}>
+                                    <div style={{ 
+                                        fontSize: '1rem', 
+                                        fontWeight: '600', 
+                                        marginBottom: '12px',
+                                        color: '#1f2937',
+                                        display: 'flex',
+                                        alignItems: 'center',
+                                        gap: '8px'
+                                    }}>
+                                        🎯 Visual GUI Mapping Engine
+                                        <span style={{
+                                            background: '#10b981',
+                                            color: 'white',
+                                            fontSize: '0.75rem',
+                                            padding: '2px 6px',
+                                            borderRadius: '4px'
+                                        }}>
+                                            ACTIVE
+                                        </span>
+                                    </div>
+                                    <div style={{ fontSize: '0.875rem', color: '#6b7280' }}>
+                                        Interactive node-based visualization with click-to-trace, impact analysis, and advanced filtering.
+                                    </div>
+                                </div>
+                                <GraphVisualization 
+                                    projectAnalysis={createGraphData()}
+                                    onNodeClick={setSelectedNode}
+                                    searchTerm={searchTerm}
+                                    selectedNode={selectedNode}
+                                />
+                                {renderSelectedDetails()}
+                            </div>
+                        ) : (
+                            <div>
 
                         {singleAnalysis.functions.length > 0 && (
                             <div style={{ marginBottom: '24px' }}>
@@ -1279,6 +1377,8 @@
                                         </div>
                                     </div>
                                 )}
+                            </div>
+                        )}
                             </div>
                         )}
                     </div>
@@ -1621,8 +1721,21 @@
             );
         };
         
-        // Render the app
-        ReactDOM.render(<App />, document.getElementById('root'));
+        // Render the app (React 18 compatible)
+        const rootElement = document.getElementById('root');
+        if (!rootElement) {
+            console.error('Root element not found');
+            return;
+        }
+        
+        try {
+            const root = ReactDOM.createRoot(rootElement);
+            root.render(<App />);
+        } catch (error) {
+            console.error('Error rendering app:', error);
+            // Fallback for older React versions
+            ReactDOM.render(<App />, rootElement);
+        }
     </script>
 </body>
 </html>
