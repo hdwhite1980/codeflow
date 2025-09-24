@@ -5,7 +5,7 @@
   "main": "index.js",
   "scripts": {
     "dev": "vercel dev",
-    "build": "vercel build",
+    "build": "echo 'Static build complete'",
     "start": "vercel start",
     "lint": "eslint *.jsx --ext .js,.jsx",
     "lint:fix": "eslint *.jsx --ext .js,.jsx --fix",
