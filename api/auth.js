@@ -1,6 +1,18 @@
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const { getSupabase } = require('../server/config/database');
+const { createClient } = require('@supabase/supabase-js');
+
+// Initialize Supabase client
+const getSupabase = () => {
+  const supabaseUrl = process.env.SUPABASE_URL;
+  const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
+  
+  if (!supabaseUrl || !supabaseKey) {
+    throw new Error('Missing Supabase configuration');
+  }
+  
+  return createClient(supabaseUrl, supabaseKey);
+};
 
 module.exports = async function handler(req, res) {
   // Enable CORS
