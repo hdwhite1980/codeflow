@@ -32,6 +32,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from ledger import ArtifactKind, EdgeKind, LedgerStore, Tier
+from jobqueue import JobQueue, make_job, make_queue
 from runtime_sync import (
     ChangeImpactAnalyzer, DatabaseConnector, GitConnector, RailwayConnector,
 )
@@ -94,8 +95,17 @@ async def lifespan(app: FastAPI):
     settings = Settings()
     app.state.settings = settings
     app.state.store = LedgerStore(database_url=settings.database_url)
-    # psycopg connections are per-call in LedgerStore; nothing to close here.
-    yield
+    # The queue is the producer side. If REDIS_URL isn't set we fall back
+    # to an in-process queue, which means jobs enqueued here go nowhere
+    # because the worker is a different process. That's a warning the
+    # factory prints, not an error — useful for local dev without Redis.
+    app.state.queue: JobQueue = make_queue(settings.redis_url)
+    try:
+        yield
+    finally:
+        # psycopg connections are per-call in LedgerStore; nothing to close
+        # for the store. The queue does hold a Redis connection pool.
+        await app.state.queue.close()
 
 
 app = FastAPI(
@@ -155,7 +165,19 @@ async def health() -> dict[str, str]:
 @app.post("/api/projects", response_model=CreateProjectResponse)
 async def create_project(req: CreateProjectRequest) -> CreateProjectResponse:
     store: LedgerStore = app.state.store
+    queue: JobQueue = app.state.queue
     project_id = store.create_project(req.slug, req.prompt)
+    # Enqueue the build asynchronously. We don't await any AI work here
+    # because that would tie the response time to whichever frontier API
+    # happens to be slow today. The worker picks this up and writes
+    # progress to the ledger; the frontend learns about progress via
+    # Supabase realtime, not via this response.
+    await queue.enqueue(make_job(
+        "build_project",
+        project_id=project_id,
+        prompt=req.prompt,
+        slug=req.slug,
+    ))
     return CreateProjectResponse(project_id=project_id, slug=req.slug)
 
 
