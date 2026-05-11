@@ -1,0 +1,9 @@
+# Production requirements for Code Flow.
+# Pinned to known-good versions — bump deliberately, not opportunistically.
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+pydantic==2.9.2
+psycopg[binary]==3.2.3
+httpx==0.27.2
+# Worker-side: Redis client for the build queue.
+redis==5.1.1
