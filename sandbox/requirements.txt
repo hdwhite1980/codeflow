@@ -1,0 +1,6 @@
+# Code Flow sandbox runner — runs on the Hetzner box.
+# Deliberately minimal: this service does ONE thing (wrap docker run via HTTP)
+# so dependencies stay small. Update with intention, not by reflex.
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+pydantic==2.9.2
