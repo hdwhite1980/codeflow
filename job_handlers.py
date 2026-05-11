@@ -32,8 +32,10 @@ from __future__ import annotations
 
 import traceback
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Optional
 
+from anthropic_client import AnthropicClient
+from build_pipeline import BuildOutcome, run_build
 from ledger import ArtifactKind, LedgerStore, Tier
 
 
@@ -44,8 +46,14 @@ from ledger import ArtifactKind, LedgerStore, Tier
 @dataclass
 class HandlerContext:
     """Bag of dependencies passed into each handler. Keeps handlers easy
-    to test — no module-level state to monkey-patch."""
+    to test — no module-level state to monkey-patch.
+
+    `anthropic` is Optional because the worker can run without an API key
+    (e.g. early in development, or if reconciliation is the only thing
+    happening on this replica). Handlers that need it check and refuse
+    cleanly instead of crashing the worker on import."""
     store: LedgerStore
+    anthropic: Optional[AnthropicClient] = None
 
 
 # ---------------------------------------------------------------------------
@@ -53,13 +61,12 @@ class HandlerContext:
 # ---------------------------------------------------------------------------
 
 async def handle_build_project(job: dict[str, Any], ctx: HandlerContext) -> None:
-    """Stub for the multi-AI build pipeline.
+    """Run the build pipeline for one project.
 
-    Today this writes one ledger entry saying "we received the job, the
-    real pipeline isn't wired yet." That's enough to verify end-to-end
-    queue flow and gives us a real audit trail to look at after a test
-    POST. The real implementation will replace this body with the spec →
-    parallel generation → vote → synthesize → audit loop."""
+    Writes a decision_record at the start and end so the audit trail
+    captures both intent and outcome. The actual work happens in
+    build_pipeline.run_build, which writes its own ledger entries for
+    every spec item and file it produces."""
 
     project_id = job.get("project_id")
     prompt = job.get("prompt", "")
@@ -67,32 +74,72 @@ async def handle_build_project(job: dict[str, Any], ctx: HandlerContext) -> None
         print(f"[handlers] build_project: missing project_id in {job!r}, dropping")
         return
 
-    # Write a decision_record artifact so the user can see "we got the
-    # request, here's what we'd do with it." Once the real pipeline lands,
-    # this entry will be the first of many — we keep its key stable so the
-    # impact graph treats subsequent runs as supersessions, not new nodes.
-    artifact_key = f"plan:{project_id}:initial"
-    rationale = (
-        f"Received build request for project {project_id}. "
-        "The multi-AI orchestration pipeline is not yet wired up; "
-        "this entry confirms the queue plumbing works end-to-end. "
-        f"Prompt preview: {prompt[:200]}"
-    )
+    # Hard requirement: an Anthropic client. Without it we can't generate
+    # anything. Record a clear ledger entry so the user sees why nothing
+    # happened, rather than just timing out.
+    if ctx.anthropic is None:
+        print(f"[handlers] build_project: ANTHROPIC_API_KEY not configured; "
+              f"writing skip-record for {project_id}")
+        ctx.store.write_entry(
+            project_id=project_id,
+            tier=Tier.SPEC,
+            artifact_kind=ArtifactKind.DECISION_RECORD,
+            artifact_key=f"build:{project_id}:skipped",
+            body={
+                "stage": "skipped",
+                "reason": "ANTHROPIC_API_KEY not configured on worker",
+                "prompt_preview": prompt[:200],
+            },
+            rationale="Cannot run build pipeline: no Anthropic client available.",
+            author="worker:handle_build_project",
+        )
+        return
 
+    # Pre-build marker — useful in the frontend for "we started" UX.
     ctx.store.write_entry(
         project_id=project_id,
         tier=Tier.SPEC,
         artifact_kind=ArtifactKind.DECISION_RECORD,
-        artifact_key=artifact_key,
-        body={
-            "stage": "received",
-            "prompt_preview": prompt[:200],
-            "note": "Multi-AI pipeline not yet wired up; queue plumbing only.",
-        },
-        rationale=rationale,
+        artifact_key=f"build:{project_id}:started",
+        body={"stage": "started", "prompt_preview": prompt[:200]},
+        rationale=f"Build pipeline started for project {project_id}.",
         author="worker:handle_build_project",
     )
-    print(f"[handlers] build_project: wrote stub plan for {project_id}")
+
+    outcome: BuildOutcome = await run_build(
+        project_id=project_id,
+        prompt=prompt,
+        client=ctx.anthropic,
+        store=ctx.store,
+    )
+
+    # Final outcome record. Always written, success or failure, so the
+    # frontend always sees a clear terminal state.
+    ctx.store.write_entry(
+        project_id=project_id,
+        tier=Tier.SPEC,
+        artifact_kind=ArtifactKind.DECISION_RECORD,
+        artifact_key=f"build:{project_id}:outcome",
+        body={
+            "succeeded": outcome.succeeded,
+            "spec_summary": outcome.spec.summary if outcome.spec else None,
+            "files_written": outcome.files_written,
+            "files_failed": [{"path": p, "error": err}
+                             for p, err in outcome.files_failed],
+            "input_tokens": outcome.total_input_tokens,
+            "output_tokens": outcome.total_output_tokens,
+        },
+        rationale=(
+            f"Build {'succeeded' if outcome.succeeded else 'completed with failures'}: "
+            f"{len(outcome.files_written)} files written, "
+            f"{len(outcome.files_failed)} failed. "
+            f"Tokens used: {outcome.total_input_tokens} in / "
+            f"{outcome.total_output_tokens} out."
+        ),
+        author="worker:handle_build_project",
+    )
+    print(f"[handlers] build_project: completed for {project_id} — "
+          f"{len(outcome.files_written)} written, {len(outcome.files_failed)} failed")
 
 
 # ---------------------------------------------------------------------------

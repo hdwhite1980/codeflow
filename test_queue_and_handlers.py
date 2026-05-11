@@ -112,11 +112,17 @@ class TestMakeQueueFactory(unittest.TestCase):
 
 class TestDispatch(unittest.TestCase):
     def test_build_project_writes_ledger_entry(self):
-        """Verify the end-to-end path: enqueue → dequeue → dispatch → ledger."""
+        """Verify the end-to-end path: enqueue → dequeue → dispatch → ledger.
+
+        Without an Anthropic client in the context, the handler writes a
+        skip-record explaining why nothing happened. That's the correct,
+        observable behavior — earlier in development this test asserted a
+        stub `plan:` entry, but the real handler now refuses without an
+        API key and the test was updated to match."""
         async def go():
             store = InMemoryLedgerStore()
             project_id = store.create_project("smoke", "build me something nice please")
-            ctx = HandlerContext(store=store)
+            ctx = HandlerContext(store=store, anthropic=None)
             queue = MemoryJobQueue()
             await queue.enqueue(make_job(
                 "build_project",
@@ -130,10 +136,10 @@ class TestDispatch(unittest.TestCase):
 
         project_id, store = _run(go())
         entries = store.all_current(project_id)
-        plan_entries = [e for e in entries
-                        if e.artifact_key.startswith("plan:")]
-        self.assertEqual(len(plan_entries), 1)
-        self.assertIn("Received build request", plan_entries[0].rationale)
+        skip_entries = [e for e in entries
+                        if e.artifact_key.endswith(":skipped")]
+        self.assertEqual(len(skip_entries), 1)
+        self.assertIn("no Anthropic client", skip_entries[0].rationale)
 
     def test_unknown_kind_is_logged_not_raised(self):
         """A typo in kind should never crash the worker loop."""

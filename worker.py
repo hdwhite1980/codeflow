@@ -43,6 +43,7 @@ import os
 import signal
 import time
 
+from anthropic_client import AnthropicClient
 from jobqueue import JobQueue, make_queue
 from job_handlers import HandlerContext, dispatch
 from ledger import LedgerStore
@@ -66,9 +67,19 @@ class Worker:
     def __init__(self) -> None:
         self.database_url = os.environ["DATABASE_URL"]
         self.redis_url = os.environ.get("REDIS_URL", "")
+        self.anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
         self.store = LedgerStore(database_url=self.database_url)
         self.queue: JobQueue = make_queue(self.redis_url)
-        self.ctx = HandlerContext(store=self.store)
+        # AnthropicClient is constructed only if the key is present. The
+        # handler logic refuses cleanly when it's missing and writes a
+        # diagnostic ledger entry so users see why builds aren't progressing.
+        self.anthropic: AnthropicClient | None = (
+            AnthropicClient(self.anthropic_key) if self.anthropic_key else None
+        )
+        if self.anthropic is None:
+            print("[worker] ANTHROPIC_API_KEY not set; build_project jobs "
+                  "will write skip-records instead of running the pipeline.")
+        self.ctx = HandlerContext(store=self.store, anthropic=self.anthropic)
         self.shutdown = asyncio.Event()
         self._last_reconcile_at: dict[str, float] = {}
 
@@ -89,6 +100,8 @@ class Worker:
                 await self._maybe_tick_reconciliations()
         finally:
             await self.queue.close()
+            if self.anthropic is not None:
+                await self.anthropic.aclose()
             print("[worker] shut down cleanly")
 
     async def _maybe_process_build_job(self) -> None:

@@ -20,12 +20,19 @@ codeflow/
 ├── guardian.py                        # Local-LLM-powered code companion
 ├── kinds_v2.py                        # Artifact and edge kind enums (v2 set)
 │
+├── jobqueue.py                        # Redis / in-memory job queue abstraction
+├── job_handlers.py                    # Worker handlers keyed by job kind
+├── anthropic_client.py                # Async httpx wrapper for Messages API
+├── build_pipeline.py                  # Spec + file generation via Anthropic
+│
 ├── app.py                             # FastAPI orchestrator
 ├── worker.py                          # Background queue + reconcile worker
 ├── hetzner_client.py                  # Clients for Ollama and the sandbox
 │
 ├── test_runtime_sync.py               # End-to-end runtime sync tests
 ├── test_guardian.py                   # Guardian tests with fake LLM
+├── test_queue_and_handlers.py         # Queue + dispatcher tests
+├── test_build_pipeline.py             # Build pipeline tests with fake Anthropic
 │
 ├── Dockerfile                         # Image for Railway (web + worker)
 ├── docker-entrypoint.sh               # Branches on CODEFLOW_ROLE
