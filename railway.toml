@@ -1,0 +1,65 @@
+# =============================================================================
+# Railway configuration for Code Flow
+# -----------------------------------------------------------------------------
+# Railway reads this file at deploy time. It describes the two services that
+# share this repo: the web API and the background worker. Both use the same
+# Dockerfile; CODEFLOW_ROLE selects which one runs.
+#
+# Why two services and not one
+# -----------------------------
+# A FastAPI request handler shouldn't be doing 60-second AI orchestration —
+# it head-of-lines everything else. Splitting lets us scale the request path
+# (cheap, many replicas) and the build path (expensive, few replicas)
+# independently. Railway makes this trivial; both share the image so build
+# time only counts once.
+#
+# Required env vars (set these in Railway's service settings, not here):
+#   DATABASE_URL              - Supabase connection string (postgres://...)
+#   REDIS_URL                 - Railway Redis plugin URL (internal network)
+#   GITHUB_WEBHOOK_SECRET     - HMAC secret you set in GitHub
+#   SUPABASE_WEBHOOK_SECRET   - HMAC secret you set in Supabase
+#   GITHUB_APP_TOKEN          - For the Git connector's API polling
+#   RAILWAY_API_TOKEN         - For the Railway connector to read user deploys
+#   HETZNER_OLLAMA_URL        - https://ollama.your-hetzner.com
+#   HETZNER_SANDBOX_URL       - https://sandbox.your-hetzner.com
+#   HETZNER_API_TOKEN         - shared bearer for both Hetzner services
+#   ANTHROPIC_API_KEY         - Tier 3 frontier AI
+#   OPENAI_API_KEY            - Tier 3 frontier AI
+#   CODEFLOW_ENV              - 'production' | 'staging'
+# =============================================================================
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+# -----------------------------------------------------------------------------
+# Web service: FastAPI orchestrator. Public HTTPS.
+# -----------------------------------------------------------------------------
+[[services]]
+name = "web"
+
+  [services.deploy]
+  # Railway sets $PORT; uvicorn binds to it via docker-entrypoint.sh.
+  startCommand = "./docker-entrypoint.sh"
+  healthcheckPath = "/health"
+  healthcheckTimeout = 30
+  restartPolicyType = "ON_FAILURE"
+  restartPolicyMaxRetries = 5
+
+  [services.variables]
+  CODEFLOW_ROLE = "web"
+
+# -----------------------------------------------------------------------------
+# Worker service: build queue consumer + reconciliation scheduler. Internal.
+# No public network — only reachable via Railway's private DNS.
+# -----------------------------------------------------------------------------
+[[services]]
+name = "worker"
+
+  [services.deploy]
+  startCommand = "./docker-entrypoint.sh"
+  restartPolicyType = "ON_FAILURE"
+  restartPolicyMaxRetries = 5
+
+  [services.variables]
+  CODEFLOW_ROLE = "worker"

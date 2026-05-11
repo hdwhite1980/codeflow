@@ -1,0 +1,35 @@
+# /etc/systemd/system/codeflow-sandbox.service
+# ----------------------------------------------------------------------------
+# Systemd unit for the Code Flow sandbox runner. Install with:
+#   sudo cp codeflow-sandbox.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now codeflow-sandbox
+#
+# Logs: journalctl -u codeflow-sandbox -f
+# ----------------------------------------------------------------------------
+
+[Unit]
+Description=Code Flow Sandbox Runner
+After=network.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=codeflow
+Group=docker
+WorkingDirectory=/opt/codeflow/sandbox
+# Bind to loopback only; Caddy fronts the public side with TLS + bearer auth.
+Environment=PORT=8080
+Environment=SANDBOX_WORKDIR_ROOT=/var/lib/codeflow-sandbox
+ExecStart=/opt/codeflow/sandbox/.venv/bin/uvicorn runner:app --host 127.0.0.1 --port 8080
+Restart=on-failure
+RestartSec=5s
+
+# Hardening
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/codeflow-sandbox /tmp
+
+[Install]
+WantedBy=multi-user.target
