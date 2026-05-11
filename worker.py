@@ -47,6 +47,7 @@ from anthropic_client import AnthropicClient
 from jobqueue import JobQueue, make_queue
 from job_handlers import HandlerContext, dispatch
 from ledger import LedgerStore
+from openai_client import OpenAIClient
 
 
 # How often each reconciliation type runs. These intervals trade fresh state
@@ -68,18 +69,29 @@ class Worker:
         self.database_url = os.environ["DATABASE_URL"]
         self.redis_url = os.environ.get("REDIS_URL", "")
         self.anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        self.openai_key = os.environ.get("OPENAI_API_KEY", "")
         self.store = LedgerStore(database_url=self.database_url)
         self.queue: JobQueue = make_queue(self.redis_url)
-        # AnthropicClient is constructed only if the key is present. The
-        # handler logic refuses cleanly when it's missing and writes a
-        # diagnostic ledger entry so users see why builds aren't progressing.
+        # Each AI client is optional; the handlers refuse cleanly when their
+        # required client is missing and write a diagnostic ledger entry.
         self.anthropic: AnthropicClient | None = (
             AnthropicClient(self.anthropic_key) if self.anthropic_key else None
+        )
+        self.openai: OpenAIClient | None = (
+            OpenAIClient(self.openai_key) if self.openai_key else None
         )
         if self.anthropic is None:
             print("[worker] ANTHROPIC_API_KEY not set; build_project jobs "
                   "will write skip-records instead of running the pipeline.")
-        self.ctx = HandlerContext(store=self.store, anthropic=self.anthropic)
+        if self.openai is None:
+            print("[worker] OPENAI_API_KEY not set; audit_project jobs "
+                  "will write skip-records instead of auditing.")
+        self.ctx = HandlerContext(
+            store=self.store,
+            anthropic=self.anthropic,
+            openai=self.openai,
+            queue=self.queue,
+        )
         self.shutdown = asyncio.Event()
         self._last_reconcile_at: dict[str, float] = {}
 
@@ -93,15 +105,14 @@ class Worker:
         print(f"[worker] started; queue backend = {type(self.queue).__name__}")
         try:
             while not self.shutdown.is_set():
-                # Try one build job. The dequeue itself blocks up to
-                # DEQUEUE_TIMEOUT_SECONDS, which doubles as our idle delay —
-                # no separate sleep needed.
                 await self._maybe_process_build_job()
                 await self._maybe_tick_reconciliations()
         finally:
             await self.queue.close()
             if self.anthropic is not None:
                 await self.anthropic.aclose()
+            if self.openai is not None:
+                await self.openai.aclose()
             print("[worker] shut down cleanly")
 
     async def _maybe_process_build_job(self) -> None:
