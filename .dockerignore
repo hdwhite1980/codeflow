@@ -1,0 +1,55 @@
+# What stays out of the Docker image.
+#
+# Pairs with the `COPY . .` step in the Dockerfile. Everything in the repo
+# is fair game except what's listed here. Keep this list defensive — when
+# in doubt, exclude. The web/worker image only needs the production Python
+# modules; everything else is dead weight that slows pulls and bloats the
+# registry.
+
+# Version control internals
+.git
+.gitignore
+.gitattributes
+
+# Tests are unit-test-only; we don't run them in the production image.
+# (CI runs them outside Docker.)
+test_*.py
+**/test_*.py
+
+# Local-only dev stuff
+.venv
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Editor / OS scratch
+.vscode
+.idea
+.DS_Store
+Thumbs.db
+*.swp
+
+# Documentation that has no business inside the runtime image
+README.md
+deploy/
+docs/
+
+# The sandbox folder runs on Hetzner, not in this image
+sandbox/
+
+# Don't include the Dockerfile or compose files inside the image
+Dockerfile
+docker-compose*.yml
+.dockerignore
+
+# Railway's own metadata file
+railway.toml
+
+# Environment files — these should always come from Railway's UI, never baked in
+.env
+.env.*

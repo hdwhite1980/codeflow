@@ -47,11 +47,12 @@ RUN pip install -r requirements.txt
 # ----------------------------------------------------------------------------
 # Application layer
 # ----------------------------------------------------------------------------
-# Copy the whole package after deps so a code-only change doesn't bust the
-# pip layer.
-COPY ledger.py runtime_sync.py symbol_extractor.py kinds_v2.py \
-     app.py hetzner_client.py worker.py \
-     ./
+# Copy the whole project after deps so a code-only change doesn't bust the
+# pip layer. We previously listed each .py file explicitly, but that meant
+# every new module had to be added here too — and forgetting it produced
+# confusing ModuleNotFoundError at runtime. The .dockerignore file controls
+# what stays out of the image (tests, deploy notes, sandbox folder, etc.).
+COPY . .
 
 # Ownership and permissions.
 RUN chown -R codeflow:codeflow /home/codeflow/app
