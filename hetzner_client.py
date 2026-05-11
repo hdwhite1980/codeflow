@@ -26,6 +26,22 @@ use a shared bearer token (HETZNER_API_TOKEN env var) for both — simple,
 rotatable, and the Hetzner box is the only thing holding the secret. NOT
 mTLS in v1; revisit when we have a security audit.
 
+TLS verification model
+----------------------
+The Hetzner box uses a self-signed certificate because we don't have a
+public domain pointed at it (yet). Production httpx defaults to verifying
+certs against the system CA bundle, which would reject self-signed certs.
+
+We expose `verify_tls` on each client (default False) so callers can either:
+  - Skip verification entirely (the default, fine for self-signed setups
+    where the bearer token is the real auth)
+  - Provide a path to a specific cert file to pin
+  - Set verify=True once a real CA-signed cert is in place
+
+The bearer token IS the authentication. TLS encrypts transport but does not
+authenticate identity in this model. If you upgrade to a real domain + Let's
+Encrypt later, set CODEFLOW_VERIFY_HETZNER_TLS=true in the orchestrator env.
+
 Network surface
 ---------------
 The Hetzner box should expose ONLY:
@@ -39,10 +55,39 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import dataclass
-from typing import Any, Optional
+import os
+from dataclasses import dataclass, field
+from typing import Any, Optional, Union
 
 import httpx
+
+
+# ---------------------------------------------------------------------------
+# Shared TLS verification setting. Read from env once at import time so all
+# clients in a single process share the same posture.
+# ---------------------------------------------------------------------------
+
+def _resolve_verify() -> Union[bool, str]:
+    """
+    Decide what to pass to httpx as the verify= parameter.
+
+    Returns:
+        False         -> skip TLS verification (default for self-signed)
+        True          -> verify against system CA bundle (use with real cert)
+        <path string> -> verify against the cert at this path (pinned)
+
+    Controlled by CODEFLOW_VERIFY_HETZNER_TLS env var:
+        unset or "false" -> False (skip)
+        "true"           -> True (system CA)
+        <any path>       -> that path (pinned)
+    """
+    raw = os.environ.get("CODEFLOW_VERIFY_HETZNER_TLS", "false").strip()
+    if raw.lower() == "false" or raw == "":
+        return False
+    if raw.lower() == "true":
+        return True
+    # Anything else is treated as a path to a CA bundle / pinned cert file.
+    return raw
 
 
 # ---------------------------------------------------------------------------
@@ -61,8 +106,14 @@ class OllamaClient:
 
     base_url: str                    # e.g. "https://ollama.hetzner.you.com"
     auth_token: str
-    model: str = "qwen2.5-coder:32b"
-    timeout_seconds: float = 120.0   # 32B models are slow but accurate
+    # Default to 7B because that's the model we ship on the default Hetzner
+    # box. Override to qwen2.5-coder:32b if you have GPU hardware and pulled
+    # the larger model.
+    model: str = "qwen2.5-coder:7b"
+    timeout_seconds: float = 120.0
+    # Default False because the Hetzner box uses a self-signed cert.
+    # Override via constructor or via CODEFLOW_VERIFY_HETZNER_TLS env var.
+    verify_tls: Union[bool, str] = field(default_factory=_resolve_verify)
 
     async def generate(
         self, prompt: str, *, system: Optional[str] = None,
@@ -85,7 +136,9 @@ class OllamaClient:
         if system:
             body["system"] = system
 
-        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+        async with httpx.AsyncClient(
+            timeout=self.timeout_seconds, verify=self.verify_tls,
+        ) as client:
             resp = await client.post(
                 f"{self.base_url}/api/generate",
                 headers=headers, json=body,
@@ -99,7 +152,9 @@ class OllamaClient:
         right now. If the Hetzner box is rebooting, we skip Tier 2 and let
         the request escalate to cloud APIs immediately."""
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
+            async with httpx.AsyncClient(
+                timeout=5.0, verify=self.verify_tls,
+            ) as client:
                 resp = await client.get(
                     f"{self.base_url}/api/tags",
                     headers={"Authorization": f"Bearer {self.auth_token}"},
@@ -147,6 +202,7 @@ class SandboxClient:
     base_url: str
     auth_token: str
     timeout_seconds: float = 600.0       # builds can be slow
+    verify_tls: Union[bool, str] = field(default_factory=_resolve_verify)
 
     async def run_build(
         self,
@@ -172,7 +228,9 @@ class SandboxClient:
             "env": env or {},
             "limits": {"cpu": cpu_limit, "memory_mb": memory_mb},
         }
-        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+        async with httpx.AsyncClient(
+            timeout=self.timeout_seconds, verify=self.verify_tls,
+        ) as client:
             resp = await client.post(
                 f"{self.base_url}/run", headers=headers, json=body,
             )
@@ -191,7 +249,9 @@ class SandboxClient:
 
     async def healthy(self) -> bool:
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
+            async with httpx.AsyncClient(
+                timeout=5.0, verify=self.verify_tls,
+            ) as client:
                 resp = await client.get(
                     f"{self.base_url}/health",
                     headers={"Authorization": f"Bearer {self.auth_token}"},
