@@ -46,6 +46,7 @@ from build_pipeline import BuildOutcome, run_build
 from jobqueue import JobQueue, make_job
 from ledger import ArtifactKind, LedgerStore, Tier
 from openai_client import OpenAIClient
+from usage_recorder import UsageRecorder
 
 
 # ---------------------------------------------------------------------------
@@ -64,6 +65,7 @@ class HandlerContext:
     anthropic: Optional[AnthropicClient] = None
     openai: Optional[OpenAIClient] = None
     queue: Optional[JobQueue] = None
+    recorder: Optional[UsageRecorder] = None
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +126,7 @@ async def handle_build_project(job: dict[str, Any], ctx: HandlerContext) -> None
         prompt=prompt,
         client=ctx.anthropic,
         store=ctx.store,
+        recorder=ctx.recorder,
     )
 
     # Final outcome record.
@@ -258,6 +261,7 @@ async def handle_audit_project(job: dict[str, Any], ctx: HandlerContext) -> None
         client=ctx.openai,
         store=ctx.store,
         auditor_name="openai",
+        recorder=ctx.recorder,
     )
 
     # Outcome record.

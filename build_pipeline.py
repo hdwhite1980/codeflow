@@ -50,6 +50,13 @@ from typing import Any, Optional
 
 from anthropic_client import AnthropicClient, AnthropicError, CompletionResult
 from ledger import ArtifactKind, EdgeKind, LedgerStore, Tier
+from usage_recorder import UsageRecorder
+
+
+# Provider tag baked into usage rows so the recorder can stay
+# provider-agnostic. If we ever swap the build model from Anthropic to
+# something else, this is the one knob to flip.
+_PROVIDER = "anthropic"
 
 
 # Hard ceiling so a confused model can't produce an unbounded run.
@@ -281,6 +288,7 @@ async def run_build(
     prompt: str,
     client: AnthropicClient,
     store: LedgerStore,
+    recorder: Optional[UsageRecorder] = None,
 ) -> BuildOutcome:
     """Execute the build pipeline for one project.
 
@@ -295,10 +303,16 @@ async def run_build(
 
     All ledger writes happen one at a time. We don't batch because the
     ledger's transactional unit is the entry — interleaving is a feature
-    (the frontend can show progress as it happens via realtime)."""
+    (the frontend can show progress as it happens via realtime).
+
+    The optional `recorder` writes one row per API call to the
+    token_usage table. Passing None disables recording — the pipeline
+    still works, you just lose the per-call audit trail."""
 
     # Step 1+2: spec.
-    spec, spec_tokens_in, spec_tokens_out = await _generate_spec(prompt, client)
+    spec, spec_tokens_in, spec_tokens_out = await _generate_spec(
+        prompt, client, project_id=project_id, recorder=recorder,
+    )
     if spec is None:
         return BuildOutcome(
             spec=None,
@@ -363,6 +377,7 @@ async def run_build(
         try:
             content, tin, tout = await _generate_file(
                 spec=spec, target=f, client=client,
+                project_id=project_id, recorder=recorder,
             )
             total_in += tin
             total_out += tout
@@ -406,6 +421,9 @@ async def run_build(
 
 async def _generate_spec(
     prompt: str, client: AnthropicClient,
+    *,
+    project_id: str,
+    recorder: Optional[UsageRecorder],
 ) -> tuple[Optional[ProjectSpec], int, int]:
     """Ask the model for a spec, with a single retry on parse failure.
 
@@ -428,6 +446,17 @@ async def _generate_spec(
             # Lower temperature for spec — we want structure, not creativity.
             temperature=0.1,
         )
+        # Record this API call's tokens. Every retry counts as its own
+        # call because the API charges us for each round trip; if the
+        # first attempt returned garbage, we still paid for it.
+        if recorder is not None:
+            recorder.record(
+                project_id=project_id, provider=_PROVIDER,
+                model=result.model, stage="spec",
+                subject=None,
+                input_tokens=result.input_tokens,
+                output_tokens=result.output_tokens,
+            )
         tokens_in += result.input_tokens
         tokens_out += result.output_tokens
         last_text = result.text
@@ -467,11 +496,14 @@ _FILE_MAX_TOKENS = {
 
 async def _generate_file(
     *, spec: ProjectSpec, target: SpecFile, client: AnthropicClient,
+    project_id: str,
+    recorder: Optional[UsageRecorder],
 ) -> tuple[str, int, int]:
     """Ask Anthropic for the contents of one file.
 
     Returns (text, input_tokens, output_tokens). Raises AnthropicError on
-    API failure (caller decides how to handle)."""
+    API failure (caller decides how to handle). Records one usage row
+    via `recorder` if provided."""
 
     # Tell the model what else is in the project, but don't include the
     # full file list every time — that bloats prompts. Just paths + purposes,
@@ -500,6 +532,14 @@ async def _generate_file(
         temperature=0.3,
         max_tokens=max_tokens,
     )
+    if recorder is not None:
+        recorder.record(
+            project_id=project_id, provider=_PROVIDER,
+            model=result.model, stage="file",
+            subject=target.path,
+            input_tokens=result.input_tokens,
+            output_tokens=result.output_tokens,
+        )
     text = _strip_code_fences(result.text)
     return text, result.input_tokens, result.output_tokens
 

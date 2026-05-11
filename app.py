@@ -36,6 +36,7 @@ from jobqueue import JobQueue, make_job, make_queue
 from runtime_sync import (
     ChangeImpactAnalyzer, DatabaseConnector, GitConnector, RailwayConnector,
 )
+from usage_recorder import PostgresUsageRecorder, summarize
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +96,9 @@ async def lifespan(app: FastAPI):
     settings = Settings()
     app.state.settings = settings
     app.state.store = LedgerStore(database_url=settings.database_url)
+    # Usage recorder reads/writes the token_usage table. The web service
+    # reads via the usage endpoint; the worker is what writes rows.
+    app.state.recorder = PostgresUsageRecorder(settings.database_url)
     # The queue is the producer side. If REDIS_URL isn't set we fall back
     # to an in-process queue, which means jobs enqueued here go nowhere
     # because the worker is a different process. That's a warning the
@@ -206,6 +210,28 @@ async def list_artifacts(
             for e in entries
         ],
     }
+
+
+@app.get("/api/projects/{project_id}/usage")
+async def project_usage(project_id: str) -> dict[str, Any]:
+    """Return per-call token usage and cost breakdown for one project.
+
+    Used by the GUI to show "what is this build costing me?" — both in
+    real time (as rows land) and after the fact. The response includes:
+
+      * `total_cost_usd`, `total_tokens` — headline numbers
+      * `by_stage`     — rolled up by spec / file / audit
+      * `by_provider`  — rolled up by anthropic / openai / etc.
+      * `rows`         — the individual API calls, in chronological order
+
+    The frontend can render any of these views without further queries.
+    For live updates the frontend subscribes to the `token_usage` table
+    on Supabase realtime and recomputes locally rather than re-polling
+    this endpoint."""
+    recorder: PostgresUsageRecorder = app.state.recorder
+    rows = recorder.list_for_project(project_id)
+    summary = summarize(project_id, rows)
+    return summary.to_dict()
 
 
 @app.get("/api/projects/{project_id}/manifest/gaps")

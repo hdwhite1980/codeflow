@@ -51,6 +51,12 @@ from typing import Any, Optional
 
 from ledger import ArtifactKind, LedgerStore, Tier
 from openai_client import OpenAIClient, OpenAIError
+from usage_recorder import UsageRecorder
+
+
+# Provider tag for the usage recorder. If we ever swap the auditor model
+# to a different vendor, this is the knob to flip.
+_PROVIDER = "openai"
 
 
 # Max files to audit per project. Same cap as the build pipeline — if the
@@ -244,6 +250,7 @@ async def run_audit(
     client: OpenAIClient,
     store: LedgerStore,
     auditor_name: str = "openai",
+    recorder: Optional[UsageRecorder] = None,
 ) -> AuditOutcome:
     """Audit each generated file in the project.
 
@@ -276,6 +283,8 @@ async def run_audit(
                 file_path=path, file_content=content,
                 purpose=purpose, language=language,
                 client=client,
+                project_id=project_id, auditor_name=auditor_name,
+                recorder=recorder,
             )
             total_in += tin
             total_out += tout
@@ -337,6 +346,9 @@ async def run_audit(
 async def _audit_one_file(
     *, file_path: str, file_content: str, purpose: str, language: str,
     client: OpenAIClient,
+    project_id: str,
+    auditor_name: str,
+    recorder: Optional[UsageRecorder],
 ) -> tuple[list[dict[str, Any]], bool, int, int]:
     """Run one audit. Returns (findings, parse_failed, tokens_in, tokens_out).
 
@@ -360,6 +372,14 @@ async def _audit_one_file(
         )
         tokens_in += result.input_tokens
         tokens_out += result.output_tokens
+        if recorder is not None:
+            recorder.record(
+                project_id=project_id, provider=_PROVIDER,
+                model=result.model, stage="audit",
+                subject=file_path,
+                input_tokens=result.input_tokens,
+                output_tokens=result.output_tokens,
+            )
         raw = _extract_json(result.text)
         if raw is not None:
             findings = _validate_findings(raw)

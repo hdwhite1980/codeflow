@@ -48,6 +48,7 @@ from jobqueue import JobQueue, make_queue
 from job_handlers import HandlerContext, dispatch
 from ledger import LedgerStore
 from openai_client import OpenAIClient
+from usage_recorder import PostgresUsageRecorder
 
 
 # How often each reconciliation type runs. These intervals trade fresh state
@@ -91,6 +92,7 @@ class Worker:
             anthropic=self.anthropic,
             openai=self.openai,
             queue=self.queue,
+            recorder=PostgresUsageRecorder(self.database_url),
         )
         self.shutdown = asyncio.Event()
         self._last_reconcile_at: dict[str, float] = {}
