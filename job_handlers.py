@@ -84,7 +84,7 @@ async def handle_build_project(job: dict[str, Any], ctx: HandlerContext) -> None
             project_id=project_id,
             tier=Tier.SPEC,
             artifact_kind=ArtifactKind.DECISION_RECORD,
-            artifact_key=f"build:{project_id}:skipped",
+            artifact_key=f"ref:{project_id}:build:skipped",
             body={
                 "stage": "skipped",
                 "reason": "ANTHROPIC_API_KEY not configured on worker",
@@ -100,7 +100,7 @@ async def handle_build_project(job: dict[str, Any], ctx: HandlerContext) -> None
         project_id=project_id,
         tier=Tier.SPEC,
         artifact_kind=ArtifactKind.DECISION_RECORD,
-        artifact_key=f"build:{project_id}:started",
+        artifact_key=f"ref:{project_id}:build:started",
         body={"stage": "started", "prompt_preview": prompt[:200]},
         rationale=f"Build pipeline started for project {project_id}.",
         author="worker:handle_build_project",
@@ -119,7 +119,7 @@ async def handle_build_project(job: dict[str, Any], ctx: HandlerContext) -> None
         project_id=project_id,
         tier=Tier.SPEC,
         artifact_kind=ArtifactKind.DECISION_RECORD,
-        artifact_key=f"build:{project_id}:outcome",
+        artifact_key=f"ref:{project_id}:build:outcome",
         body={
             "succeeded": outcome.succeeded,
             "spec_summary": outcome.spec.summary if outcome.spec else None,

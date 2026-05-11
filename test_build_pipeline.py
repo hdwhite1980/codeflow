@@ -232,6 +232,32 @@ class TestRunBuildHappyPath(unittest.TestCase):
         file_temp = client.calls[1]["temperature"]
         self.assertLess(spec_temp, file_temp)
 
+    def test_forward_reference_imports_dont_crash(self):
+        """Regression: in production, the spec arrived with the first file
+        importing the second, which forced placeholder-node creation for
+        a key that hadn't been written yet. With a bad key prefix the
+        ledger's _infer_node_kind would raise ValueError and abort the
+        build. This exercises that path: a.py declares an import of b.py
+        BEFORE b.py's spec entry is written, so the ledger must create a
+        placeholder under the 'entity:' prefix."""
+        store = InMemoryLedgerStore()
+        pid = store.create_project("fwd", "a forward-ref project")
+        client = FakeAnthropicClient([
+            # First file imports the second (forward reference).
+            make_spec_json(
+                {"path": "a.py", "imports": ["b.py"]},
+                {"path": "b.py"},
+            ),
+            "import b\n",
+            "value = 1\n",
+        ])
+        outcome = _run(run_build(
+            project_id=pid, prompt="forward refs",
+            client=client, store=store,
+        ))
+        self.assertTrue(outcome.succeeded)
+        self.assertEqual(set(outcome.files_written), {"a.py", "b.py"})
+
 
 class TestRunBuildSpecFailures(unittest.TestCase):
     def test_invalid_json_retried_once_then_gives_up(self):
@@ -354,8 +380,8 @@ class TestHandlerBuildProjectNoKey(unittest.TestCase):
         entries = store.all_current(pid)
         keys = {e.artifact_key for e in entries}
         # Skip record should have landed; no started/outcome.
-        self.assertIn(f"build:{pid}:skipped", keys)
-        self.assertNotIn(f"build:{pid}:started", keys)
+        self.assertIn(f"ref:{pid}:build:skipped", keys)
+        self.assertNotIn(f"ref:{pid}:build:started", keys)
 
 
 class TestHandlerBuildProjectHappy(unittest.TestCase):
@@ -378,8 +404,8 @@ class TestHandlerBuildProjectHappy(unittest.TestCase):
         entries = store.all_current(pid)
         keys = {e.artifact_key for e in entries}
         # Both bookend records present.
-        self.assertIn(f"build:{pid}:started", keys)
-        self.assertIn(f"build:{pid}:outcome", keys)
+        self.assertIn(f"ref:{pid}:build:started", keys)
+        self.assertIn(f"ref:{pid}:build:outcome", keys)
         # File artifact present.
         self.assertIn(file_artifact_key(pid, "main.py"), keys)
         # Spec manifest present.

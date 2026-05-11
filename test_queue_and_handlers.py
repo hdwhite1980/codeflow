@@ -137,7 +137,7 @@ class TestDispatch(unittest.TestCase):
         project_id, store = _run(go())
         entries = store.all_current(project_id)
         skip_entries = [e for e in entries
-                        if e.artifact_key.endswith(":skipped")]
+                        if e.artifact_key.endswith(":build:skipped")]
         self.assertEqual(len(skip_entries), 1)
         self.assertIn("no Anthropic client", skip_entries[0].rationale)
 

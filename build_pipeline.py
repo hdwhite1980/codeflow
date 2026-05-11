@@ -234,14 +234,22 @@ def _parse_spec(raw: dict[str, Any]) -> Optional[ProjectSpec]:
 # ---------------------------------------------------------------------------
 # Ledger key helpers. Stable across runs so re-generation supersedes
 # rather than producing parallel artifacts.
+#
+# The ledger validates artifact_key prefixes against a fixed allowlist
+# (`_KEY_PREFIX_TO_NODE_KIND` in ledger.py). We use:
+#   - "manifest:..."  for the top-level project manifest entry
+#   - "entity:..."    for each planned file's spec entry (a SPEC_ENTITY)
+#   - "file:..."      for the actual generated file content
+#   - "ref:..."       for the bookend decision_records (started, outcome,
+#                     skipped). The ledger maps "ref" to DECISION_RECORD.
 # ---------------------------------------------------------------------------
 
 def spec_manifest_key(project_id: str) -> str:
-    return f"spec:{project_id}:manifest"
+    return f"manifest:{project_id}:spec"
 
 
 def spec_file_item_key(project_id: str, path: str) -> str:
-    return f"spec:{project_id}:file:{path}"
+    return f"entity:{project_id}:{path}"
 
 
 def file_artifact_key(project_id: str, path: str) -> str:
@@ -313,7 +321,12 @@ async def run_build(
         author="anthropic:spec",
     )
 
-    # Per-file manifest entries with declared dependency edges.
+    # Per-file spec entries with declared dependency edges. We use
+    # SPEC_ENTITY here, not SPEC_MANIFEST_ITEM — each planned file is an
+    # entity in the spec graph, and the prefix-to-kind mapping in the
+    # ledger expects "entity:" keys to be SPEC_ENTITY nodes. Using the
+    # manifest item kind would silently disagree with the placeholder
+    # nodes the ledger creates for forward-referenced edges.
     for f in spec.files:
         depends_on_keys = [
             spec_file_item_key(project_id, dep) for dep in f.imports
@@ -325,7 +338,7 @@ async def run_build(
         store.write_entry(
             project_id=project_id,
             tier=Tier.SPEC,
-            artifact_kind=ArtifactKind.SPEC_MANIFEST_ITEM,
+            artifact_kind=ArtifactKind.SPEC_ENTITY,
             artifact_key=spec_file_item_key(project_id, f.path),
             body={
                 "path": f.path,
