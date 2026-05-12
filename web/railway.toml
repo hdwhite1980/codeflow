@@ -1,0 +1,21 @@
+# Railway service configuration for codeflow-web.
+#
+# Usage on Railway:
+#   - Set the service's root directory to `/web` so this file and the
+#     Dockerfile are picked up.
+#   - Set NEXT_PUBLIC_API_URL to the FastAPI service's public URL.
+#
+# We don't need to point to ../requirements.txt or share the codeflow
+# Docker image. The web service is a standalone Next.js container.
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+# Next.js standalone reads PORT from the environment automatically.
+startCommand = "node server.js"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 5
+healthcheckPath = "/"
+healthcheckTimeout = 30
