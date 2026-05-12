@@ -37,16 +37,24 @@ from typing import Any, Optional
 import httpx
 
 
-# Default model. We pick mini for audit because audit is mostly reading
-# (input-heavy) with short structured output, and mini-class models are
-# accurate enough on "is this code OK" tasks. The price difference vs
-# flagship is meaningful at our expected call volume.
+# Default model. gpt-5.4-mini is the right balance for code audit:
+# strong enough for security/correctness review, far cheaper than the
+# flagship at our expected volume ($0.75/$4.50 per Mtok vs $5/$30 for
+# gpt-5.5). New OpenAI projects sometimes need a usage-tier upgrade
+# before this model is enabled — if you see 403s with
+# "Project does not have access to model `gpt-5.4-mini`", either fall
+# back to `gpt-5-mini` (broadly available, ~3x cheaper, slightly older)
+# or enable 5.4-mini on the project at platform.openai.com.
 DEFAULT_MODEL = "gpt-5.4-mini"
 
 # Output cap. Audit findings are structured JSON — usually 200-1000
-# tokens total. 2048 leaves room for a verbose response without
-# allowing runaway generations to inflate cost.
-DEFAULT_MAX_TOKENS = 2048
+# tokens of visible output. We set this high because GPT-5 family models
+# also produce hidden "reasoning_tokens" that count against the same
+# budget; if the cap is too tight the model spends it all reasoning and
+# returns an empty response with finish_reason='length'. 8192 gives the
+# model room to think and still leaves an order-of-magnitude safety vs
+# what a real audit response needs.
+DEFAULT_MAX_TOKENS = 8192
 
 # Per-call HTTP timeout. Audit calls should be faster than generation
 # calls because output is shorter; 90s is generous but bounded.
@@ -176,12 +184,19 @@ class OpenAIClient:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
 
+        model_id = model or self._default_model
         body: dict[str, Any] = {
-            "model": model or self._default_model,
+            "model": model_id,
             "messages": messages,
             "max_completion_tokens": max_tokens,
-            "temperature": temperature,
         }
+        # GPT-5 family rejects non-default `temperature` with a 400. They
+        # only accept the implicit default. We just omit the parameter for
+        # those models. Earlier and other families honor it normally.
+        # If you add another reasoning-family model that also rejects it,
+        # extend this prefix check.
+        if not model_id.startswith(("gpt-5", "o1", "o3", "o4")):
+            body["temperature"] = temperature
         if json_mode:
             body["response_format"] = {"type": "json_object"}
 
