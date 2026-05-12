@@ -273,11 +273,18 @@ async def run_audit(
     nit = 0
     total_findings = 0
 
-    for fa in file_artifacts[:MAX_FILES_PER_AUDIT]:
+    print(f"[audit] run_audit starting: project={project_id} "
+          f"files={len(file_artifacts)} auditor={auditor_name}",
+          flush=True)
+
+    for idx, fa in enumerate(file_artifacts[:MAX_FILES_PER_AUDIT]):
         path = fa["path"]
         content = fa["content"]
         purpose = fa.get("purpose", "(unknown)")
         language = fa.get("language", "(unknown)")
+        print(f"[audit] iteration {idx+1}: file={path} "
+              f"content_len={len(content)} purpose={purpose!r}",
+              flush=True)
         try:
             findings, parse_failed, tin, tout = await _audit_one_file(
                 file_path=path, file_content=content,
@@ -286,6 +293,9 @@ async def run_audit(
                 project_id=project_id, auditor_name=auditor_name,
                 recorder=recorder,
             )
+            print(f"[audit] _audit_one_file returned for {path}: "
+                  f"findings={len(findings)} parse_failed={parse_failed} "
+                  f"tin={tin} tout={tout}", flush=True)
             total_in += tin
             total_out += tout
 
@@ -324,12 +334,22 @@ async def run_audit(
             )
             audited.append(path)
         except OpenAIError as exc:
+            print(f"[audit] OpenAIError on {path}: status={exc.status_code} "
+                  f"body={exc.body[:200]!r}", flush=True)
             failed.append((path, f"OpenAIError {exc.status_code}: {exc.body[:200]}"))
             if exc.status_code in (401, 403):
                 # Auth error means every subsequent call will fail. Stop.
+                print(f"[audit] auth error: aborting remaining audits",
+                      flush=True)
                 break
         except Exception as exc:
+            print(f"[audit] unexpected error on {path}: "
+                  f"{type(exc).__name__}: {exc!r}", flush=True)
             failed.append((path, f"{type(exc).__name__}: {exc}"))
+
+    print(f"[audit] run_audit done: audited={len(audited)} "
+          f"failed={len(failed)} total_findings={total_findings}",
+          flush=True)
 
     return AuditOutcome(
         audited_files=audited,
