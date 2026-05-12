@@ -29,9 +29,11 @@ import os
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from event_bus import make_event_bus
 from ledger import ArtifactKind, EdgeKind, LedgerStore, Tier
 from jobqueue import JobQueue, make_job, make_queue
 from runtime_sync import (
@@ -105,18 +107,38 @@ async def lifespan(app: FastAPI):
     # because the worker is a different process. That's a warning the
     # factory prints, not an error — useful for local dev without Redis.
     app.state.queue: JobQueue = make_queue(settings.redis_url)
+    # Event bus: subscribed-to by WebSocket connections, published-to by
+    # the worker. The web service only reads from it. If REDIS_URL is
+    # unset, falls back to an in-memory bus that won't receive worker
+    # events (since the worker is a different process) — that's expected
+    # in local dev without Redis.
+    app.state.event_bus = make_event_bus(settings.redis_url)
     try:
         yield
     finally:
         # psycopg connections are per-call in LedgerStore; nothing to close
         # for the store. The queue does hold a Redis connection pool.
         await app.state.queue.close()
+        bus_close = getattr(app.state.event_bus, "aclose", None)
+        if bus_close is not None:
+            await bus_close()
 
 
 app = FastAPI(
     title="Code Flow",
     description="Multi-AI app builder with auditable ledger and impact analysis.",
     lifespan=lifespan,
+)
+
+# CORS: the frontend lives on a different Railway service / subdomain.
+# Allow same-origin and the configured frontend origin. For now permissive
+# while we ship the demo; tighten before public launch.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -385,6 +407,108 @@ def _verify_hmac_sha256(
     received = signature_header.removeprefix("sha256=")
     # constant-time compare to avoid timing leaks
     return hmac.compare_digest(expected, received)
+
+
+# ---------------------------------------------------------------------------
+# Project list endpoint — drives the frontend project picker.
+# ---------------------------------------------------------------------------
+
+@app.get("/api/projects")
+async def list_projects(limit: int = 50) -> dict[str, Any]:
+    """Return recent projects newest-first.
+
+    Used by the frontend's home page to show a list of past builds.
+    Returns only metadata (id, slug, prompt, status, created_at); the
+    detail view fetches artifacts and findings separately via the
+    per-project endpoints.
+
+    Note: this endpoint currently has no auth and returns ALL projects.
+    When we add Supabase Auth, it will filter by owner_user_id via RLS."""
+    # Bypass the LedgerStore's higher-level API and just hit the table —
+    # this is a simple metadata query, no need for the artifact machinery.
+    import psycopg
+    from psycopg.rows import dict_row
+    db_url = app.state.settings.database_url
+    limit = max(1, min(limit, 200))  # sanity clamp
+    rows: list[dict[str, Any]] = []
+    with psycopg.connect(db_url, row_factory=dict_row) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, slug, prompt, status, created_at "
+                "FROM projects ORDER BY created_at DESC LIMIT %s",
+                (limit,),
+            )
+            for r in cur.fetchall():
+                rows.append({
+                    "id": str(r["id"]),
+                    "slug": r["slug"],
+                    "prompt": r["prompt"],
+                    "status": r["status"],
+                    "created_at": r["created_at"].isoformat(),
+                })
+    return {"projects": rows, "count": len(rows)}
+
+
+# ---------------------------------------------------------------------------
+# WebSocket — live updates for one project.
+# ---------------------------------------------------------------------------
+
+@app.websocket("/ws/projects/{project_id}")
+async def project_events(websocket: WebSocket, project_id: str) -> None:
+    """Push live events for one project as they happen.
+
+    Wire protocol
+    -------------
+    Each frame is a JSON object with at least:
+      {"kind": "ledger_entry" | "usage_row", "project_id": "<uuid>", "data": {...}}
+
+    The `data` payload matches the shape of the corresponding REST endpoint's
+    row, so the frontend can integrate events into its state without
+    special cases — same merge logic for REST fetches and live updates.
+
+    Connection lifecycle
+    --------------------
+    1. Client opens WS to /ws/projects/<id>.
+    2. Server accepts, sends a {"kind": "hello"} frame, then begins
+       streaming events as they arrive on the Redis channel.
+    3. Either side may close at any time. We unsubscribe and release
+       the Redis connection on disconnect.
+
+    Auth note
+    ---------
+    No auth on the WS yet (matches the REST endpoints). Anyone with the
+    project_id can subscribe. When we add Supabase Auth we'll verify
+    the JWT during the upgrade handshake and check that the user owns
+    the project before subscribing.
+    """
+    await websocket.accept()
+    try:
+        await websocket.send_json({
+            "kind": "hello",
+            "project_id": project_id,
+            "message": "Subscribed to live events for this project.",
+        })
+        bus = app.state.event_bus
+        async for event in bus.subscribe(project_id):
+            try:
+                await websocket.send_json(event)
+            except Exception:
+                # Send failures usually mean the client disconnected.
+                # Break out of the subscribe loop to release Redis resources.
+                break
+    except WebSocketDisconnect:
+        # Normal client-initiated close. Nothing to do.
+        pass
+    except Exception as exc:
+        # Surface unexpected server-side errors in logs but don't crash
+        # the whole app. The client will reconnect.
+        print(f"[ws] project_events error for {project_id}: "
+              f"{type(exc).__name__}: {exc}", flush=True)
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 
 @app.post("/webhooks/github/{project_id}")

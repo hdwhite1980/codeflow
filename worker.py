@@ -44,11 +44,13 @@ import signal
 import time
 
 from anthropic_client import AnthropicClient
+from event_bus import make_event_bus
 from gemini_client import GeminiClient
 from jobqueue import JobQueue, make_queue
 from job_handlers import HandlerContext, dispatch
 from ledger import LedgerStore
 from openai_client import OpenAIClient
+from publishing_store import PublishingLedgerStore, PublishingUsageRecorder
 from usage_recorder import PostgresUsageRecorder
 
 
@@ -73,7 +75,16 @@ class Worker:
         self.anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
         self.openai_key = os.environ.get("OPENAI_API_KEY", "")
         self.gemini_key = os.environ.get("GEMINI_API_KEY", "")
-        self.store = LedgerStore(database_url=self.database_url)
+        # Bare store and recorder talk to Postgres directly. We then wrap
+        # them in PublishingLedgerStore / PublishingUsageRecorder so every
+        # write also publishes to the event bus (Redis pub/sub). The
+        # FastAPI web service subscribes per-WebSocket-connection and
+        # forwards events to the frontend.
+        bare_store = LedgerStore(database_url=self.database_url)
+        bare_recorder = PostgresUsageRecorder(self.database_url)
+        self.event_bus = make_event_bus(self.redis_url)
+        self.store = PublishingLedgerStore(bare_store, self.event_bus)
+        self.recorder = PublishingUsageRecorder(bare_recorder, self.event_bus)
         self.queue: JobQueue = make_queue(self.redis_url)
         # Each AI client is optional; the handlers refuse cleanly when their
         # required client is missing and write a diagnostic ledger entry.
@@ -103,7 +114,7 @@ class Worker:
             openai=self.openai,
             gemini=self.gemini,
             queue=self.queue,
-            recorder=PostgresUsageRecorder(self.database_url),
+            recorder=self.recorder,
         )
         self.shutdown = asyncio.Event()
         self._last_reconcile_at: dict[str, float] = {}
