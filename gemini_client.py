@@ -56,19 +56,21 @@ DEFAULT_MAX_TOKENS = 8192
 
 DEFAULT_TIMEOUT_SECONDS = 90.0
 
-# Rate-limit retry configuration. Gemini's free tier is roughly 5–15 RPM
-# depending on the model, and the audit step fires N file calls in
-# parallel via asyncio.gather — easy to hit 429 from the burst alone.
-# We retry the request on 429 with exponential backoff. Other status
-# codes (4xx auth/bad-request, 5xx) bubble out unchanged — backoff won't
-# help those.
-MAX_RATE_LIMIT_RETRIES = 4
-# Base delay multiplied by 2^attempt, plus a small jitter. With 4 retries
-# the delays land roughly at 4s, 8s, 16s, 32s — total ~60s of patience
-# which usually crosses the per-minute window. A request that takes 60s
-# to land is still better than a verdict the audit pipeline can't write.
-RATE_LIMIT_BASE_DELAY_SECONDS = 4.0
-RATE_LIMIT_MAX_DELAY_SECONDS = 32.0
+# Transient-error retry configuration. We retry on 429 (rate limit) and
+# 5xx (server unavailable / internal error). Both are transient by
+# definition; everything else (4xx auth/bad-request) is permanent for
+# this request and bubbles out unchanged.
+#
+# Sizing: with 4 retries the delays land roughly at 4s, 8s, 16s, 32s —
+# total ~60s of patience. That comfortably crosses a per-minute rate
+# limit window and gives a typical 503 outage time to recover.
+MAX_TRANSIENT_RETRIES = 4
+TRANSIENT_BASE_DELAY_SECONDS = 4.0
+TRANSIENT_MAX_DELAY_SECONDS = 32.0
+# Status codes that are worth retrying. 429 = rate limit (per-minute or
+# per-day quota); 5xx = transient server-side issue. Anything else is
+# a permanent failure for this particular request.
+_RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
 
 API_BASE = "https://generativelanguage.googleapis.com"
 API_VERSION = "v1beta"
@@ -210,26 +212,29 @@ class GeminiClient:
         # Model is part of the URL, not the body.
         url = f"/{API_VERSION}/models/{model_id}:generateContent"
 
-        # 429 retries. Free tier RPM caps + parallel audit calls = easy to
-        # blow through. Retry the same request with exponential backoff;
-        # any other status (4xx/5xx) is raised immediately.
-        for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
+        # Retry loop for transient errors. 429 (rate limit) was the
+        # original motivator — Tier 1 makes 429s rare but doesn't
+        # eliminate them, and 5xx outages happen too (we saw a 503 in
+        # production). Backoff is the same for both.
+        for attempt in range(MAX_TRANSIENT_RETRIES + 1):
             response = await self._http.post(url, json=body)
-            if response.status_code != 429:
+            if response.status_code not in _RETRYABLE_STATUSES:
                 break
-            if attempt >= MAX_RATE_LIMIT_RETRIES:
-                # Exhausted retries. Treat as a real rate-limit failure.
-                raise _classify(429, response.text)
+            if attempt >= MAX_TRANSIENT_RETRIES:
+                # Exhausted retries. Treat as a real failure of whatever
+                # class the status code implies.
+                raise _classify(response.status_code, response.text)
             delay = min(
-                RATE_LIMIT_BASE_DELAY_SECONDS * (2 ** attempt),
-                RATE_LIMIT_MAX_DELAY_SECONDS,
+                TRANSIENT_BASE_DELAY_SECONDS * (2 ** attempt),
+                TRANSIENT_MAX_DELAY_SECONDS,
             )
             # Add jitter so concurrent retries don't all wake at the
             # same instant and stampede again. Up to 25% of the delay.
             jitter = delay * 0.25 * random.random()
             wait_s = delay + jitter
-            print(f"[gemini] 429 on {model_id} attempt {attempt + 1}; "
-                  f"sleeping {wait_s:.1f}s before retry", flush=True)
+            print(f"[gemini] {response.status_code} on {model_id} "
+                  f"attempt {attempt + 1}; sleeping {wait_s:.1f}s before retry",
+                  flush=True)
             await asyncio.sleep(wait_s)
 
         if response.status_code != 200:
