@@ -259,6 +259,140 @@ class TestRunBuildHappyPath(unittest.TestCase):
         self.assertEqual(set(outcome.files_written), {"a.py", "b.py"})
 
 
+class TestFileGenerationTruncationRetry(unittest.TestCase):
+    """Production audit showed Anthropic was truncating ~50% of files at the
+    original token caps. The pipeline now bumps caps AND retries once when
+    stop_reason=='max_tokens'. These tests pin both behaviors."""
+
+    def test_truncation_triggers_retry_with_larger_cap(self):
+        store = InMemoryLedgerStore()
+        pid = store.create_project("trunc", "truncation test")
+        client = FakeAnthropicClient([
+            # Spec call: one file.
+            make_spec_json({"path": "main.py", "size_hint": "small"}),
+            # First file call: truncated (stop_reason=max_tokens).
+            CompletionResult(
+                text="def truncated_func(",
+                model="claude-sonnet-4-6",
+                stop_reason="max_tokens",
+                input_tokens=300, output_tokens=2048,
+            ),
+            # Retry: completes normally.
+            CompletionResult(
+                text="def complete_func():\n    return 1\n",
+                model="claude-sonnet-4-6",
+                stop_reason="end_turn",
+                input_tokens=305, output_tokens=20,
+            ),
+        ])
+        outcome = _run(run_build(
+            project_id=pid, prompt="x", client=client, store=store,
+        ))
+        self.assertTrue(outcome.succeeded)
+        self.assertEqual(outcome.files_written, ["main.py"])
+        # 1 spec + 2 file calls (1 truncated + 1 retry).
+        self.assertEqual(len(client.calls), 3)
+        # Retry should have been called with a larger max_tokens than the
+        # initial call. Initial was "small" hint -> 2048; retry should be
+        # at least double.
+        initial_file_call = client.calls[1]
+        retry_call = client.calls[2]
+        self.assertEqual(initial_file_call["max_tokens"], 2048)
+        self.assertGreater(retry_call["max_tokens"], 2048)
+        # Tokens from BOTH calls should be counted toward the outcome.
+        # Spec: 100/200 (FakeAnthropic defaults? actually the spec call
+        # used make_spec_json which is a string, so default counts kick in)
+        # First file: 300 in, 2048 out
+        # Retry: 305 in, 20 out
+        # We only care that the totals exceed the spec call alone.
+        self.assertGreater(outcome.total_input_tokens, 300)
+        self.assertGreater(outcome.total_output_tokens, 2000)
+
+    def test_retry_also_truncates_still_succeeds(self):
+        """When the retry also truncates, we accept the result and let the
+        audit catch it. The build still 'succeeds' in the file-written
+        sense — the file is in the ledger — but the user-visible artifact
+        is truncated and the audit will flag it."""
+        store = InMemoryLedgerStore()
+        pid = store.create_project("trunc2", "retry truncation")
+        client = FakeAnthropicClient([
+            make_spec_json({"path": "huge.md", "size_hint": "large"}),
+            CompletionResult(
+                text="initial truncation",
+                model="claude-sonnet-4-6",
+                stop_reason="max_tokens",
+                input_tokens=400, output_tokens=8192,
+            ),
+            CompletionResult(
+                text="retry truncation but bigger",
+                model="claude-sonnet-4-6",
+                stop_reason="max_tokens",
+                input_tokens=410, output_tokens=16384,
+            ),
+        ])
+        outcome = _run(run_build(
+            project_id=pid, prompt="x", client=client, store=store,
+        ))
+        self.assertTrue(outcome.succeeded)
+        # File was written (it's in the ledger), even though both
+        # attempts truncated.
+        self.assertEqual(outcome.files_written, ["huge.md"])
+        # Three total calls: spec + initial + retry.
+        self.assertEqual(len(client.calls), 3)
+
+    def test_no_retry_when_stop_reason_is_normal(self):
+        """Sanity: normal completion should NOT trigger a retry."""
+        store = InMemoryLedgerStore()
+        pid = store.create_project("normal", "no truncation")
+        client = FakeAnthropicClient([
+            make_spec_json({"path": "ok.py", "size_hint": "small"}),
+            CompletionResult(
+                text="print(1)\n",
+                model="claude-sonnet-4-6",
+                stop_reason="end_turn",
+                input_tokens=100, output_tokens=10,
+            ),
+        ])
+        outcome = _run(run_build(
+            project_id=pid, prompt="x", client=client, store=store,
+        ))
+        self.assertTrue(outcome.succeeded)
+        # No retry should have happened: 1 spec + 1 file = 2 calls.
+        self.assertEqual(len(client.calls), 2)
+
+    def test_truncation_retry_recorded_in_usage(self):
+        """The retry costs real money. The recorder must capture both
+        the initial truncated call AND the retry — failing to do so would
+        understate the user's bill."""
+        from usage_recorder import InMemoryUsageRecorder
+        store = InMemoryLedgerStore()
+        pid = store.create_project("trec", "truncation recording")
+        rec = InMemoryUsageRecorder()
+        client = FakeAnthropicClient([
+            make_spec_json({"path": "main.py", "size_hint": "small"}),
+            CompletionResult(
+                text="trunc", model="claude-sonnet-4-6",
+                stop_reason="max_tokens",
+                input_tokens=300, output_tokens=2048,
+            ),
+            CompletionResult(
+                text="real content\n", model="claude-sonnet-4-6",
+                stop_reason="end_turn",
+                input_tokens=310, output_tokens=12,
+            ),
+        ])
+        _run(run_build(
+            project_id=pid, prompt="x", client=client, store=store, recorder=rec,
+        ))
+        rows = rec.list_for_project(pid)
+        # 1 spec + 2 file rows (the truncated one + its retry).
+        file_rows = [r for r in rows if r.stage == "file"]
+        self.assertEqual(len(file_rows), 2)
+        # Both should have been recorded as full cost — no "free retries".
+        total_out = sum(r.output_tokens for r in file_rows)
+        self.assertEqual(total_out, 2048 + 12)
+
+
 class TestRunBuildSpecFailures(unittest.TestCase):
     def test_invalid_json_retried_once_then_gives_up(self):
         store = InMemoryLedgerStore()

@@ -485,13 +485,21 @@ async def _generate_spec(
     return None, tokens_in, tokens_out
 
 
-# Output token caps tuned to file size hint. Small files don't need 4k tokens
-# and capping them tightly keeps costs proportional to expected output.
+# Output token caps tuned to file size hint. Capped tightly so a confused
+# model can't run up an unbounded bill, but generous enough that typical
+# generated files actually fit. Production audit found roughly half of
+# files were getting truncated at the old caps (1024/2048/4096), so the
+# defaults were doubled. If a file still truncates at the higher cap,
+# _generate_file retries once with the cap doubled again, up to
+# `_MAX_FILE_TOKENS_RETRY`. Past that, we accept the truncation as a
+# project shape problem (the file is genuinely too large for sensible
+# generation in one shot) and let the audit step flag it.
 _FILE_MAX_TOKENS = {
-    "small":  1024,
-    "medium": 2048,
-    "large":  4096,
+    "small":  2048,
+    "medium": 4096,
+    "large":  8192,
 }
+_MAX_FILE_TOKENS_RETRY = 16384
 
 
 async def _generate_file(
@@ -503,7 +511,22 @@ async def _generate_file(
 
     Returns (text, input_tokens, output_tokens). Raises AnthropicError on
     API failure (caller decides how to handle). Records one usage row
-    via `recorder` if provided."""
+    via `recorder` per API call (including retries — every call costs
+    real money).
+
+    Truncation handling
+    -------------------
+    Anthropic returns `stop_reason="max_tokens"` when the response hit
+    the output cap. That means the file was cut off — paste-and-run will
+    fail. Production audit showed this happens in ~50% of generations at
+    the original caps, primarily on READMEs and test files.
+
+    On detection we retry once with the cap doubled (up to
+    _MAX_FILE_TOKENS_RETRY). The retry's tokens are also recorded so the
+    cost ticker reflects what was actually spent. If the retry also
+    truncates, we accept the result — at that point the file's declared
+    size hint was simply wrong, and the audit step will flag it as a
+    critical truncation finding for the user to address."""
 
     # Tell the model what else is in the project, but don't include the
     # full file list every time — that bloats prompts. Just paths + purposes,
@@ -523,7 +546,7 @@ async def _generate_file(
         f"Output raw file contents only — no fences, no commentary."
     )
 
-    max_tokens = _FILE_MAX_TOKENS.get(target.size_hint, 2048)
+    max_tokens = _FILE_MAX_TOKENS.get(target.size_hint, 4096)
     result = await client.complete(
         prompt=user_prompt,
         system=system,
@@ -532,6 +555,8 @@ async def _generate_file(
         temperature=0.3,
         max_tokens=max_tokens,
     )
+    total_in = result.input_tokens
+    total_out = result.output_tokens
     if recorder is not None:
         recorder.record(
             project_id=project_id, provider=_PROVIDER,
@@ -540,8 +565,43 @@ async def _generate_file(
             input_tokens=result.input_tokens,
             output_tokens=result.output_tokens,
         )
+
+    # If the model hit the output cap, the file is truncated. Retry once
+    # with a larger cap. We retry the whole call rather than asking the
+    # model to "continue", because models are notoriously bad at resuming
+    # mid-output cleanly — fresh start with more headroom is more reliable.
+    if result.stop_reason == "max_tokens" and max_tokens < _MAX_FILE_TOKENS_RETRY:
+        bigger_cap = min(max_tokens * 2, _MAX_FILE_TOKENS_RETRY)
+        print(f"[build] truncation detected on {target.path} "
+              f"(stop_reason=max_tokens at {max_tokens} tokens); "
+              f"retrying with cap={bigger_cap}",
+              flush=True)
+        retry = await client.complete(
+            prompt=user_prompt,
+            system=system,
+            temperature=0.3,
+            max_tokens=bigger_cap,
+        )
+        total_in += retry.input_tokens
+        total_out += retry.output_tokens
+        if recorder is not None:
+            recorder.record(
+                project_id=project_id, provider=_PROVIDER,
+                model=retry.model, stage="file",
+                subject=f"{target.path} (truncation retry)",
+                input_tokens=retry.input_tokens,
+                output_tokens=retry.output_tokens,
+            )
+        if retry.stop_reason == "max_tokens":
+            # Even the retry truncated. Use the retry's text (it's at least
+            # bigger) and let the audit step catch the truncation downstream.
+            print(f"[build] {target.path} truncated again on retry "
+                  f"(cap={bigger_cap}); accepting and flagging via audit",
+                  flush=True)
+        result = retry
+
     text = _strip_code_fences(result.text)
-    return text, result.input_tokens, result.output_tokens
+    return text, total_in, total_out
 
 
 _FENCE_PATTERN = re.compile(
