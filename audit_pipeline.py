@@ -87,24 +87,68 @@ Return a JSON object matching this shape exactly:
   ]
 }
 
-Rules:
-- If the file is clean, return {"findings": []}. Do not invent issues.
-- "critical": code is broken, insecure, or will fail at runtime.
-- "warning": code works but has a real problem (bug-prone, slow, fragile).
-- "nit": stylistic preference, taste, or minor improvement.
-- Categories: security (auth, injection, secrets, etc), correctness
-  (logic bugs, edge cases), style (naming, formatting, idioms),
-  performance (slowness, waste), other.
-- "line" is the line number of the issue if you can identify one; null otherwise.
+Severity rules (be strict, not gentle):
+- "critical" — the code is non-functional or actively dangerous:
+    * Truncated mid-line, missing braces, won't parse / won't compile / won't import
+    * Will crash on the first realistic input (NoneType error, index out of range, missing import)
+    * Hard-coded secrets, SQL injection, command injection, path traversal,
+      missing auth on an endpoint that mutates state
+    * Eval/exec on user input
+  When in doubt between critical and warning for non-functional code:
+  CHOOSE CRITICAL. A reviewer who would block the merge picks critical.
+- "warning" — the code works but has a real defect a reviewer would block on:
+    * Resource exhaustion paths (unbounded loops, no file size limits, no rate limits)
+    * Silent data corruption (lossy decoding, malformed input accepted)
+    * Documentation contradicting implementation
+    * Missing error handling on operations that can fail
+    * Tests that assert too loosely to catch regressions
+- "nit" — stylistic preference, taste, or minor improvement that wouldn't
+  block a real PR review.
+
+Category rules:
+- "security": auth, authz, injection, secrets, file upload validation,
+  resource exhaustion, missing rate limits, unbounded input.
+- "correctness": logic bugs, edge cases, contract violations, doc-vs-code
+  drift, missing error handling.
+- "style": naming, formatting, idioms.
+- "performance": slowness, waste, missing batching/caching.
+- "other": anything else.
+
+Output rules:
+- If the file is genuinely clean, return {"findings": []}. Do not invent
+  issues to look thorough.
+- "line" is the 1-indexed line number of the issue if identifiable; null otherwise.
 - Output JSON only — no prose, no markdown fences.
 """
 
 
 AUDIT_SYSTEM_PROMPT = """\
-You are a senior code reviewer auditing one file at a time. You are
-strict about correctness and security, pragmatic about style. You do
-not invent issues. If the file is fine, you say so by returning an
-empty findings array. Output JSON only.
+You are a senior code reviewer auditing one file at a time. Your job is
+to find the issues a reviewer would block a merge on. Be strict, not gentle.
+
+You apply equal scrutiny to:
+  * Correctness — does the code do what its declared purpose says?
+    Does it match its own documentation? Will it work on realistic inputs?
+  * Security — auth, authz, input validation, resource exhaustion,
+    file size limits, MIME-type enforcement, injection paths, secrets,
+    eval/exec on untrusted data.
+  * Robustness — error handling, edge cases, malformed input, network
+    failures, partial reads.
+  * Test quality — for test files, assert specific behavior (status codes,
+    response shapes). Tests that accept multiple status codes ("200 or 400")
+    or that don't actually verify outcomes are themselves bugs.
+  * Packaging — missing __init__.py, unpinned dependencies, missing entries
+    in requirements files, broken imports between files.
+
+If you see code that is truncated, unparseable, or won't run as written,
+flag it as CRITICAL even if it "looks fine apart from being cut off".
+
+You do not invent issues. A genuinely clean file gets an empty findings
+array. But you also do not rubber-stamp — if there are real concerns,
+list them. The goal is the same triage decision a careful human reviewer
+would make.
+
+Output JSON only.
 """
 
 
@@ -123,8 +167,18 @@ def _audit_user_prompt(*, file_path: str, file_content: str,
         f"--- FILE CONTENTS ---\n"
         f"{file_content}\n"
         f"--- END FILE ---\n\n"
-        f"Audit this file. Does it accomplish its declared purpose? "
-        f"Are there bugs, security issues, or improvements worth flagging?\n\n"
+        f"Audit this file. Work through each category in order:\n"
+        f"  1. Is the file complete? (not truncated, parses, imports)\n"
+        f"  2. Does it accomplish its declared purpose?\n"
+        f"  3. Are there security issues? (auth, input validation, "
+        f"resource limits, injection)\n"
+        f"  4. Are there correctness bugs? (logic errors, edge cases, "
+        f"doc-vs-code drift)\n"
+        f"  5. Is error handling adequate?\n"
+        f"  6. For test files: do tests assert specific behavior, or "
+        f"do they accept too many outcomes?\n"
+        f"  7. For config files (requirements.txt, package.json, etc.): "
+        f"are versions pinned? Are dependencies appropriate?\n\n"
         f"{AUDIT_SCHEMA_DESCRIPTION}"
     )
 
