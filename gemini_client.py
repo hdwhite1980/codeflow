@@ -35,7 +35,9 @@ generation and broadly available.
 
 from __future__ import annotations
 
+import asyncio
 import os
+import random
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -53,6 +55,20 @@ DEFAULT_MODEL = "gemini-3-flash-preview"
 DEFAULT_MAX_TOKENS = 8192
 
 DEFAULT_TIMEOUT_SECONDS = 90.0
+
+# Rate-limit retry configuration. Gemini's free tier is roughly 5–15 RPM
+# depending on the model, and the audit step fires N file calls in
+# parallel via asyncio.gather — easy to hit 429 from the burst alone.
+# We retry the request on 429 with exponential backoff. Other status
+# codes (4xx auth/bad-request, 5xx) bubble out unchanged — backoff won't
+# help those.
+MAX_RATE_LIMIT_RETRIES = 4
+# Base delay multiplied by 2^attempt, plus a small jitter. With 4 retries
+# the delays land roughly at 4s, 8s, 16s, 32s — total ~60s of patience
+# which usually crosses the per-minute window. A request that takes 60s
+# to land is still better than a verdict the audit pipeline can't write.
+RATE_LIMIT_BASE_DELAY_SECONDS = 4.0
+RATE_LIMIT_MAX_DELAY_SECONDS = 32.0
 
 API_BASE = "https://generativelanguage.googleapis.com"
 API_VERSION = "v1beta"
@@ -193,7 +209,29 @@ class GeminiClient:
 
         # Model is part of the URL, not the body.
         url = f"/{API_VERSION}/models/{model_id}:generateContent"
-        response = await self._http.post(url, json=body)
+
+        # 429 retries. Free tier RPM caps + parallel audit calls = easy to
+        # blow through. Retry the same request with exponential backoff;
+        # any other status (4xx/5xx) is raised immediately.
+        for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
+            response = await self._http.post(url, json=body)
+            if response.status_code != 429:
+                break
+            if attempt >= MAX_RATE_LIMIT_RETRIES:
+                # Exhausted retries. Treat as a real rate-limit failure.
+                raise _classify(429, response.text)
+            delay = min(
+                RATE_LIMIT_BASE_DELAY_SECONDS * (2 ** attempt),
+                RATE_LIMIT_MAX_DELAY_SECONDS,
+            )
+            # Add jitter so concurrent retries don't all wake at the
+            # same instant and stampede again. Up to 25% of the delay.
+            jitter = delay * 0.25 * random.random()
+            wait_s = delay + jitter
+            print(f"[gemini] 429 on {model_id} attempt {attempt + 1}; "
+                  f"sleeping {wait_s:.1f}s before retry", flush=True)
+            await asyncio.sleep(wait_s)
+
         if response.status_code != 200:
             raise _classify(response.status_code, response.text)
 
