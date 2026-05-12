@@ -200,9 +200,17 @@ async def handle_audit_project(job: dict[str, Any], ctx: HandlerContext) -> None
 
     # Read file artifacts and spec entries from the ledger.
     file_entries = ctx.store.all_current(project_id, ArtifactKind.FILE)
+    # DIAGNOSTIC: surface exactly what the ledger returned. The audit
+    # handler was silently producing "0 files" outcomes despite the build
+    # writing files — turned out the entries had unexpected shapes. Keep
+    # this line until we have a stable production run; remove on cleanup.
+    print(f"[handlers] audit_project: ledger returned {len(file_entries)} "
+          f"file entries for {project_id}; keys: "
+          f"{[e.artifact_key for e in file_entries[:3]]}",
+          flush=True)
     if not file_entries:
         print(f"[handlers] audit_project: no file artifacts for {project_id}; "
-              f"nothing to audit")
+              f"nothing to audit", flush=True)
         return
 
     spec_entries = ctx.store.all_current(project_id, ArtifactKind.SPEC_ENTITY)
@@ -227,14 +235,23 @@ async def handle_audit_project(job: dict[str, Any], ctx: HandlerContext) -> None
         parts = fe.artifact_key.split(":", 2)
         if len(parts) < 3:
             print(f"[handlers] audit_project: malformed file key "
-                  f"{fe.artifact_key!r}; skipping")
+                  f"{fe.artifact_key!r}; skipping", flush=True)
             continue
         path = parts[2]
         try:
             blob, _ = ctx.store.get_blob(fe.blob_sha256)
         except KeyError:
             print(f"[handlers] audit_project: blob missing for {fe.artifact_key}; "
-                  f"skipping")
+                  f"skipping", flush=True)
+            continue
+        except Exception as exc:
+            # Catch-all so an unexpected exception (network glitch, weird
+            # type, anything) doesn't silently drop this file. The audit
+            # was previously producing "0 files" outcomes and we couldn't
+            # tell why; this print eliminates the silent path.
+            print(f"[handlers] audit_project: unexpected error fetching "
+                  f"blob for {fe.artifact_key}: {type(exc).__name__}: "
+                  f"{exc!r}; skipping", flush=True)
             continue
         spec = spec_by_path.get(path, {})
         file_artifacts.append({
@@ -243,6 +260,9 @@ async def handle_audit_project(job: dict[str, Any], ctx: HandlerContext) -> None
             "purpose": spec.get("purpose", "(unspecified)"),
             "language": spec.get("language", "(unspecified)"),
         })
+    print(f"[handlers] audit_project: assembled {len(file_artifacts)} "
+          f"file_artifacts for {project_id} (input was {len(file_entries)} "
+          f"ledger entries)", flush=True)
 
     # Started marker.
     ctx.store.write_entry(
