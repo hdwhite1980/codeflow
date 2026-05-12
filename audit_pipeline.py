@@ -277,14 +277,11 @@ async def run_audit(
           f"files={len(file_artifacts)} auditor={auditor_name}",
           flush=True)
 
-    for idx, fa in enumerate(file_artifacts[:MAX_FILES_PER_AUDIT]):
+    for fa in file_artifacts[:MAX_FILES_PER_AUDIT]:
         path = fa["path"]
         content = fa["content"]
         purpose = fa.get("purpose", "(unknown)")
         language = fa.get("language", "(unknown)")
-        print(f"[audit] iteration {idx+1}: file={path} "
-              f"content_len={len(content)} purpose={purpose!r}",
-              flush=True)
         try:
             findings, parse_failed, tin, tout = await _audit_one_file(
                 file_path=path, file_content=content,
@@ -293,9 +290,6 @@ async def run_audit(
                 project_id=project_id, auditor_name=auditor_name,
                 recorder=recorder,
             )
-            print(f"[audit] _audit_one_file returned for {path}: "
-                  f"findings={len(findings)} parse_failed={parse_failed} "
-                  f"tin={tin} tout={tout}", flush=True)
             total_in += tin
             total_out += tout
 

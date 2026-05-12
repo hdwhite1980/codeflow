@@ -200,14 +200,6 @@ async def handle_audit_project(job: dict[str, Any], ctx: HandlerContext) -> None
 
     # Read file artifacts and spec entries from the ledger.
     file_entries = ctx.store.all_current(project_id, ArtifactKind.FILE)
-    # DIAGNOSTIC: surface exactly what the ledger returned. The audit
-    # handler was silently producing "0 files" outcomes despite the build
-    # writing files — turned out the entries had unexpected shapes. Keep
-    # this line until we have a stable production run; remove on cleanup.
-    print(f"[handlers] audit_project: ledger returned {len(file_entries)} "
-          f"file entries for {project_id}; keys: "
-          f"{[e.artifact_key for e in file_entries[:3]]}",
-          flush=True)
     if not file_entries:
         print(f"[handlers] audit_project: no file artifacts for {project_id}; "
               f"nothing to audit", flush=True)
@@ -260,9 +252,6 @@ async def handle_audit_project(job: dict[str, Any], ctx: HandlerContext) -> None
             "purpose": spec.get("purpose", "(unspecified)"),
             "language": spec.get("language", "(unspecified)"),
         })
-    print(f"[handlers] audit_project: assembled {len(file_artifacts)} "
-          f"file_artifacts for {project_id} (input was {len(file_entries)} "
-          f"ledger entries)", flush=True)
 
     # Started marker.
     ctx.store.write_entry(
