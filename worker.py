@@ -44,6 +44,7 @@ import signal
 import time
 
 from anthropic_client import AnthropicClient
+from gemini_client import GeminiClient
 from jobqueue import JobQueue, make_queue
 from job_handlers import HandlerContext, dispatch
 from ledger import LedgerStore
@@ -71,6 +72,7 @@ class Worker:
         self.redis_url = os.environ.get("REDIS_URL", "")
         self.anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
         self.openai_key = os.environ.get("OPENAI_API_KEY", "")
+        self.gemini_key = os.environ.get("GEMINI_API_KEY", "")
         self.store = LedgerStore(database_url=self.database_url)
         self.queue: JobQueue = make_queue(self.redis_url)
         # Each AI client is optional; the handlers refuse cleanly when their
@@ -81,16 +83,25 @@ class Worker:
         self.openai: OpenAIClient | None = (
             OpenAIClient(self.openai_key) if self.openai_key else None
         )
+        self.gemini: GeminiClient | None = (
+            GeminiClient(self.gemini_key) if self.gemini_key else None
+        )
         if self.anthropic is None:
             print("[worker] ANTHROPIC_API_KEY not set; build_project jobs "
                   "will write skip-records instead of running the pipeline.")
-        if self.openai is None:
-            print("[worker] OPENAI_API_KEY not set; audit_project jobs "
-                  "will write skip-records instead of auditing.")
+        if self.openai is None and self.gemini is None:
+            print("[worker] no auditor keys set (OPENAI_API_KEY, GEMINI_API_KEY); "
+                  "audit_project jobs will write skip-records.")
+        else:
+            auditors = []
+            if self.openai: auditors.append("openai")
+            if self.gemini: auditors.append("gemini")
+            print(f"[worker] auditors configured: {', '.join(auditors)}")
         self.ctx = HandlerContext(
             store=self.store,
             anthropic=self.anthropic,
             openai=self.openai,
+            gemini=self.gemini,
             queue=self.queue,
             recorder=PostgresUsageRecorder(self.database_url),
         )

@@ -36,6 +36,7 @@ immediately; audit outcome lands shortly after.
 
 from __future__ import annotations
 
+import asyncio
 import traceback
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
@@ -43,6 +44,7 @@ from typing import Any, Awaitable, Callable, Optional
 from anthropic_client import AnthropicClient
 from audit_pipeline import AuditOutcome, run_audit
 from build_pipeline import BuildOutcome, run_build
+from gemini_client import GeminiClient
 from jobqueue import JobQueue, make_job
 from ledger import ArtifactKind, LedgerStore, Tier
 from openai_client import OpenAIClient
@@ -60,10 +62,16 @@ class HandlerContext:
 
     All optional fields default to None so tests can construct minimal
     contexts. Handlers that need a specific dependency check it and
-    refuse cleanly rather than crashing on missing config."""
+    refuse cleanly rather than crashing on missing config.
+
+    The audit step uses BOTH `openai` and `gemini` when both are present
+    — same prompt to each, parallel calls, two independent verdicts per
+    file. Either being None means that auditor sits out this run; the
+    handler still runs the other one."""
     store: LedgerStore
     anthropic: Optional[AnthropicClient] = None
     openai: Optional[OpenAIClient] = None
+    gemini: Optional[GeminiClient] = None
     queue: Optional[JobQueue] = None
     recorder: Optional[UsageRecorder] = None
 
@@ -170,19 +178,39 @@ async def handle_build_project(job: dict[str, Any], ctx: HandlerContext) -> None
 # ---------------------------------------------------------------------------
 
 async def handle_audit_project(job: dict[str, Any], ctx: HandlerContext) -> None:
-    """Audit the generated files for a project.
+    """Audit the generated files for a project — runs all configured auditors
+    in parallel against the same file set.
 
-    Reads all current file artifacts from the ledger, fetches the matching
-    spec entries for purpose/language context, then asks the OpenAI auditor
-    to review each file. Writes one audit_verdict per file."""
+    Reads file artifacts and spec entries from the ledger, then dispatches
+    one `run_audit` call per available auditor (OpenAI + Gemini today).
+    Both auditors see the same prompt and the same files; their verdicts
+    land under different artifact keys (`ref:...:audit:openai:<path>` vs
+    `ref:...:audit:gemini:<path>`), so they don't collide.
+
+    Parallel execution
+    ------------------
+    We use asyncio.gather so the wall-clock cost of the audit step is
+    max(openai, gemini) instead of openai + gemini. Both auditors hit
+    independent APIs and write to independent ledger keys, so there is
+    no resource contention. The recorder is thread-safe for our purposes
+    (it opens fresh DB connections per call), so concurrent writes are fine.
+
+    If neither auditor is configured, write a skip-record."""
 
     project_id = job.get("project_id")
     if not project_id:
         print(f"[handlers] audit_project: missing project_id in {job!r}, dropping")
         return
 
-    if ctx.openai is None:
-        print(f"[handlers] audit_project: OPENAI_API_KEY not configured; "
+    # Collect available auditors. Order doesn't matter — they run concurrently.
+    auditors: list[tuple[str, str, Any]] = []  # (auditor_name, provider, client)
+    if ctx.openai is not None:
+        auditors.append(("openai", "openai", ctx.openai))
+    if ctx.gemini is not None:
+        auditors.append(("gemini", "google", ctx.gemini))
+
+    if not auditors:
+        print(f"[handlers] audit_project: no auditor clients configured; "
               f"writing skip-record for {project_id}")
         ctx.store.write_entry(
             project_id=project_id,
@@ -191,9 +219,9 @@ async def handle_audit_project(job: dict[str, Any], ctx: HandlerContext) -> None
             artifact_key=f"ref:{project_id}:audit:skipped",
             body={
                 "stage": "skipped",
-                "reason": "OPENAI_API_KEY not configured on worker",
+                "reason": "No auditor API keys configured (OPENAI_API_KEY, GEMINI_API_KEY).",
             },
-            rationale="Cannot run audit pipeline: no OpenAI client available.",
+            rationale="Cannot run audit pipeline: no auditor clients available.",
             author="worker:handle_audit_project",
         )
         return
@@ -237,10 +265,6 @@ async def handle_audit_project(job: dict[str, Any], ctx: HandlerContext) -> None
                   f"skipping", flush=True)
             continue
         except Exception as exc:
-            # Catch-all so an unexpected exception (network glitch, weird
-            # type, anything) doesn't silently drop this file. The audit
-            # was previously producing "0 files" outcomes and we couldn't
-            # tell why; this print eliminates the silent path.
             print(f"[handlers] audit_project: unexpected error fetching "
                   f"blob for {fe.artifact_key}: {type(exc).__name__}: "
                   f"{exc!r}; skipping", flush=True)
@@ -253,58 +277,100 @@ async def handle_audit_project(job: dict[str, Any], ctx: HandlerContext) -> None
             "language": spec.get("language", "(unspecified)"),
         })
 
-    # Started marker.
+    # Started marker — note how many auditors are running.
+    auditor_names = [name for name, _, _ in auditors]
     ctx.store.write_entry(
         project_id=project_id,
         tier=Tier.AUDIT,
         artifact_kind=ArtifactKind.DECISION_RECORD,
         artifact_key=f"ref:{project_id}:audit:started",
-        body={"stage": "started", "file_count": len(file_artifacts)},
-        rationale=f"Audit pipeline started for {len(file_artifacts)} files.",
+        body={
+            "stage": "started",
+            "file_count": len(file_artifacts),
+            "auditors": auditor_names,
+        },
+        rationale=(
+            f"Audit pipeline started for {len(file_artifacts)} files with "
+            f"auditors: {', '.join(auditor_names)}."
+        ),
         author="worker:handle_audit_project",
     )
 
-    outcome: AuditOutcome = await run_audit(
-        project_id=project_id,
-        file_artifacts=file_artifacts,
-        client=ctx.openai,
-        store=ctx.store,
-        auditor_name="openai",
-        recorder=ctx.recorder,
-    )
+    # Kick off all auditors concurrently. asyncio.gather preserves order
+    # and returns all results in one go. Exceptions inside individual
+    # auditors are caught by run_audit itself and surfaced via the
+    # AuditOutcome.failed_files list — they won't propagate here.
+    audit_tasks = [
+        run_audit(
+            project_id=project_id,
+            file_artifacts=file_artifacts,
+            client=client,
+            store=ctx.store,
+            auditor_name=auditor_name,
+            provider=provider,
+            recorder=ctx.recorder,
+        )
+        for auditor_name, provider, client in auditors
+    ]
+    outcomes: list[AuditOutcome] = await asyncio.gather(*audit_tasks)
 
-    # Outcome record.
-    ctx.store.write_entry(
-        project_id=project_id,
-        tier=Tier.AUDIT,
-        artifact_kind=ArtifactKind.DECISION_RECORD,
-        artifact_key=f"ref:{project_id}:audit:outcome",
-        body={
-            "all_clean": outcome.all_clean,
+    # Aggregate across auditors. Each auditor produced its own set of
+    # verdicts and counts; the outcome record summarizes both.
+    per_auditor = {}
+    total_findings = 0
+    total_critical = 0
+    total_warning = 0
+    total_nit = 0
+    total_input_tokens = 0
+    total_output_tokens = 0
+    for (auditor_name, _, _), outcome in zip(auditors, outcomes):
+        per_auditor[auditor_name] = {
             "audited_files": outcome.audited_files,
-            "failed_files": [{"path": p, "error": err}
-                             for p, err in outcome.failed_files],
+            "failed_files": [
+                {"path": p, "error": err} for p, err in outcome.failed_files
+            ],
             "total_findings": outcome.total_findings,
             "critical_count": outcome.critical_count,
             "warning_count": outcome.warning_count,
             "nit_count": outcome.nit_count,
             "input_tokens": outcome.total_input_tokens,
             "output_tokens": outcome.total_output_tokens,
+        }
+        total_findings += outcome.total_findings
+        total_critical += outcome.critical_count
+        total_warning += outcome.warning_count
+        total_nit += outcome.nit_count
+        total_input_tokens += outcome.total_input_tokens
+        total_output_tokens += outcome.total_output_tokens
+
+    # Outcome record aggregates across all auditors.
+    ctx.store.write_entry(
+        project_id=project_id,
+        tier=Tier.AUDIT,
+        artifact_kind=ArtifactKind.DECISION_RECORD,
+        artifact_key=f"ref:{project_id}:audit:outcome",
+        body={
+            "auditors": auditor_names,
+            "per_auditor": per_auditor,
+            "total_findings": total_findings,
+            "critical_count": total_critical,
+            "warning_count": total_warning,
+            "nit_count": total_nit,
+            "input_tokens": total_input_tokens,
+            "output_tokens": total_output_tokens,
         },
         rationale=(
-            f"Audit complete: {len(outcome.audited_files)} files audited, "
-            f"{outcome.total_findings} findings "
-            f"({outcome.critical_count} critical, "
-            f"{outcome.warning_count} warning, "
-            f"{outcome.nit_count} nit). "
-            f"Tokens: {outcome.total_input_tokens} in / "
-            f"{outcome.total_output_tokens} out."
+            f"Audit complete across {len(auditors)} auditors "
+            f"({', '.join(auditor_names)}): {total_findings} total findings "
+            f"({total_critical} critical, {total_warning} warning, "
+            f"{total_nit} nit). "
+            f"Tokens: {total_input_tokens} in / {total_output_tokens} out."
         ),
         author="worker:handle_audit_project",
     )
     print(f"[handlers] audit_project: completed for {project_id} — "
-          f"{outcome.total_findings} findings across "
-          f"{len(outcome.audited_files)} files")
+          f"{total_findings} findings from {len(auditors)} auditors "
+          f"({', '.join(auditor_names)})")
 
 
 def _json_loads_or_none(blob: bytes):

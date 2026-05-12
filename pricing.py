@@ -58,6 +58,15 @@ PRICING_PER_MTOK: dict[str, tuple[float, float]] = {
     "gpt-5.4-nano":        (0.20,   1.25),
     "gpt-5":               (1.25,  10.00),
     "gpt-5-mini":          (0.25,   2.00),
+
+    # --- Google Gemini ---
+    # gemini-3-flash-preview is the council's second auditor.
+    "gemini-3-flash-preview":      (0.50,   3.00),
+    "gemini-3.1-pro-preview":      (2.00,  12.00),
+    "gemini-3.1-flash-lite-preview": (0.25, 1.50),
+    "gemini-2.5-flash":            (0.30,   2.50),
+    "gemini-2.5-pro":              (1.25,  10.00),
+    "gemini-2.5-flash-lite":       (0.10,   0.40),
 }
 
 

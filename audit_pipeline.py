@@ -51,12 +51,14 @@ from typing import Any, Optional
 
 from ledger import ArtifactKind, LedgerStore, Tier
 from openai_client import OpenAIClient, OpenAIError
+from gemini_client import GeminiClient, GeminiError
 from usage_recorder import UsageRecorder
 
 
-# Provider tag for the usage recorder. If we ever swap the auditor model
-# to a different vendor, this is the knob to flip.
-_PROVIDER = "openai"
+# Exceptions to treat as "this whole auditor is dead, stop calling" —
+# 401/403 from any provider means the API key is bad or model access is
+# revoked, and every subsequent call will fail the same way.
+_AUTH_ERROR_TYPES = (OpenAIError, GeminiError)
 
 
 # Max files to audit per project. Same cap as the build pipeline — if the
@@ -301,9 +303,10 @@ async def run_audit(
     *,
     project_id: str,
     file_artifacts: list[dict[str, Any]],
-    client: OpenAIClient,
+    client: Any,  # OpenAIClient | GeminiClient — share the .complete() shape
     store: LedgerStore,
     auditor_name: str = "openai",
+    provider: str = "openai",
     recorder: Optional[UsageRecorder] = None,
 ) -> AuditOutcome:
     """Audit each generated file in the project.
@@ -314,9 +317,21 @@ async def run_audit(
         `language`. The caller (job_handlers.handle_audit_project) reads
         these from the ledger and shapes them.
 
+    client : an OpenAIClient or GeminiClient. They share the same
+        `complete()` interface (one method, same kwargs, returns text +
+        tokens). We type as Any because Python doesn't have structural
+        typing without a Protocol, and adding one for two clients with
+        identical shape is overkill.
+
     auditor_name : free-form identifier baked into the verdict's
-        artifact_key and author fields. Lets us add gemini/o3/etc later
-        without colliding."""
+        artifact_key and author fields. Use "openai" or "gemini" today;
+        could become "openai-strict" or "gemini-security-focused" if we
+        specialize prompts per auditor in the future.
+
+    provider : the value written into token_usage.provider. Separate from
+        auditor_name because we might run two prompt variants through
+        the same provider — both rows want "openai" in the provider
+        column but different auditor names in the verdict key."""
 
     audited: list[str] = []
     failed: list[tuple[str, str]] = []
@@ -328,7 +343,7 @@ async def run_audit(
     total_findings = 0
 
     print(f"[audit] run_audit starting: project={project_id} "
-          f"files={len(file_artifacts)} auditor={auditor_name}",
+          f"files={len(file_artifacts)} auditor={auditor_name} provider={provider}",
           flush=True)
 
     for fa in file_artifacts[:MAX_FILES_PER_AUDIT]:
@@ -342,6 +357,7 @@ async def run_audit(
                 purpose=purpose, language=language,
                 client=client,
                 project_id=project_id, auditor_name=auditor_name,
+                provider=provider,
                 recorder=recorder,
             )
             total_in += tin
@@ -381,22 +397,26 @@ async def run_audit(
                 # verdicts back to files without traversing the graph.
             )
             audited.append(path)
-        except OpenAIError as exc:
-            print(f"[audit] OpenAIError on {path}: status={exc.status_code} "
+        except _AUTH_ERROR_TYPES as exc:
+            # Provider-specific error from either OpenAI or Gemini.
+            err_name = type(exc).__name__
+            print(f"[audit] {err_name} on {path}: status={exc.status_code} "
                   f"body={exc.body[:200]!r}", flush=True)
-            failed.append((path, f"OpenAIError {exc.status_code}: {exc.body[:200]}"))
+            failed.append((path, f"{err_name} {exc.status_code}: {exc.body[:200]}"))
             if exc.status_code in (401, 403):
-                # Auth error means every subsequent call will fail. Stop.
-                print(f"[audit] auth error: aborting remaining audits",
-                      flush=True)
+                # Auth error / model access revoked means every subsequent
+                # call will fail the same way. Stop.
+                print(f"[audit] auth error on {auditor_name}: aborting "
+                      f"remaining audits", flush=True)
                 break
         except Exception as exc:
             print(f"[audit] unexpected error on {path}: "
                   f"{type(exc).__name__}: {exc!r}", flush=True)
             failed.append((path, f"{type(exc).__name__}: {exc}"))
 
-    print(f"[audit] run_audit done: audited={len(audited)} "
-          f"failed={len(failed)} total_findings={total_findings}",
+    print(f"[audit] run_audit done: auditor={auditor_name} "
+          f"audited={len(audited)} failed={len(failed)} "
+          f"total_findings={total_findings}",
           flush=True)
 
     return AuditOutcome(
@@ -413,9 +433,10 @@ async def run_audit(
 
 async def _audit_one_file(
     *, file_path: str, file_content: str, purpose: str, language: str,
-    client: OpenAIClient,
+    client: Any,
     project_id: str,
     auditor_name: str,
+    provider: str,
     recorder: Optional[UsageRecorder],
 ) -> tuple[list[dict[str, Any]], bool, int, int]:
     """Run one audit. Returns (findings, parse_failed, tokens_in, tokens_out).
@@ -442,7 +463,7 @@ async def _audit_one_file(
         tokens_out += result.output_tokens
         if recorder is not None:
             recorder.record(
-                project_id=project_id, provider=_PROVIDER,
+                project_id=project_id, provider=provider,
                 model=result.model, stage="audit",
                 subject=file_path,
                 input_tokens=result.input_tokens,
