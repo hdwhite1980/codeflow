@@ -33,14 +33,62 @@ export interface ProjectListResponse {
 
 // -- POST /api/projects ---------------------------------------------
 
+/**
+ * One external service the user has wired their app to. These appear
+ * as nodes in the graph view (Postgres, Railway, Vercel, GitHub etc.)
+ * and let the frontend visualize the deploy/runtime topology.
+ *
+ * `kind` must be one of the values in ALLOWED_SERVICE_KINDS (backend
+ * rejects unknown kinds with a 422). `label` is the display name in
+ * the graph node. `config` is opaque metadata — connection string,
+ * service URL, repo URL — that the frontend shows in the side panel
+ * but doesn't otherwise interpret.
+ */
+export type ServiceKind =
+  | "postgres"
+  | "mysql"
+  | "redis"
+  | "railway"
+  | "vercel"
+  | "github"
+  | "stripe"
+  | "anthropic"
+  | "openai"
+  | "other";
+
+export const ALLOWED_SERVICE_KINDS: ServiceKind[] = [
+  "postgres",
+  "mysql",
+  "redis",
+  "railway",
+  "vercel",
+  "github",
+  "stripe",
+  "anthropic",
+  "openai",
+  "other",
+];
+
+export interface ServiceConfig {
+  kind: ServiceKind;
+  label: string;
+  config?: string | null;
+}
+
 export interface CreateProjectRequest {
   slug: string;
   prompt: string;
+  /**
+   * Mandatory: backend requires at least one service. The graph view
+   * uses these as anchor nodes for the visualization.
+   */
+  services: ServiceConfig[];
 }
 
 export interface CreateProjectResponse {
   project_id: string;
-  status: string;
+  status?: string;
+  slug?: string;
 }
 
 // -- /api/projects/<id>/artifacts -----------------------------------
@@ -185,3 +233,42 @@ export interface UsageRowEvent {
 }
 
 export type WSEvent = HelloEvent | LedgerEntryEvent | UsageRowEvent;
+
+// -- /api/projects/<id>/graph ---------------------------------------
+
+export type GraphNodeType =
+  | "file"
+  | "external_service"
+  | "spec_entity"
+  | "decision_record";
+
+export type GraphNodeStatus =
+  | "pending" // declared in spec but file not yet generated
+  | "writing" // worker is currently producing this file (set live by WS)
+  | "complete" // ledger has a current entry
+  | "failed";
+
+export interface GraphNode {
+  id: string; // artifact_key
+  type: GraphNodeType;
+  label: string;
+  group: string; // folder for files, "services" for external, etc.
+  status: GraphNodeStatus;
+  data: Record<string, unknown>;
+  seq: number;
+}
+
+export interface GraphEdge {
+  id: string;
+  source: string; // node id (= artifact_key)
+  target: string;
+  kind: string; // EdgeKind from the backend, e.g. "imports", "uses_service"
+}
+
+export interface GraphResponse {
+  project_id: string;
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+  node_count: number;
+  edge_count: number;
+}

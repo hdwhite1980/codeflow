@@ -17,6 +17,7 @@ import type {
   AuditResponse,
   CreateProjectRequest,
   CreateProjectResponse,
+  GraphResponse,
   ProjectListResponse,
   UsageSummary,
 } from "./types";
@@ -116,6 +117,12 @@ export async function getUsage(projectId: string): Promise<UsageSummary> {
 export async function getAudits(projectId: string): Promise<AuditResponse> {
   return getJSON<AuditResponse>(
     `/api/projects/${encodeURIComponent(projectId)}/audits`,
+  );
+}
+
+export async function getGraph(projectId: string): Promise<GraphResponse> {
+  return getJSON<GraphResponse>(
+    `/api/projects/${encodeURIComponent(projectId)}/graph`,
   );
 }
 
