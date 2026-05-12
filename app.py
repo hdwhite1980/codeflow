@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import os
 from contextlib import asynccontextmanager
 from typing import Any, Optional
@@ -232,6 +233,98 @@ async def project_usage(project_id: str) -> dict[str, Any]:
     rows = recorder.list_for_project(project_id)
     summary = summarize(project_id, rows)
     return summary.to_dict()
+
+
+@app.get("/api/projects/{project_id}/audits")
+async def project_audits(project_id: str) -> dict[str, Any]:
+    """Return the full audit verdict bodies for one project.
+
+    Different from /artifacts (which only returns metadata): this endpoint
+    materializes each verdict's blob so the caller sees the actual
+    `findings` arrays. Used by:
+
+      * The frontend, to display findings next to each file
+      * Operators looking at what an auditor is actually catching
+      * Future: the patch loop, to decide which files need re-generation
+
+    Verdicts are keyed by `ref:<project>:audit:<auditor>:<file_path>`.
+    We aggregate findings by severity for a quick summary, and include
+    raw bodies for clients that want the full detail."""
+    store: LedgerStore = app.state.store
+
+    # Pull the current verdict for each (auditor, file) combination. Audit
+    # verdicts are stored with artifact_kind=AUDIT_VERDICT, but in the
+    # current codebase we use a `ref:` key prefix (which the ledger maps
+    # to DECISION_RECORD). Either way, identify by key shape:
+    # `ref:<project_id>:audit:<auditor>:<file_path>`. We exclude the
+    # bookend decision records (`audit:started|outcome|skipped`).
+    BOOKEND_SUFFIXES = (":audit:started", ":audit:outcome", ":audit:skipped")
+    all_entries = store.all_current(project_id)
+    verdict_entries = [
+        e for e in all_entries
+        if f":audit:" in e.artifact_key
+        and not any(e.artifact_key.endswith(s) for s in BOOKEND_SUFFIXES)
+    ]
+
+    # Materialize each verdict's body.
+    verdicts: list[dict[str, Any]] = []
+    severity_totals = {"critical": 0, "warning": 0, "nit": 0}
+    by_auditor: dict[str, dict[str, int]] = {}
+    parse_errors = 0
+
+    for e in verdict_entries:
+        try:
+            blob, _ = store.get_blob(e.blob_sha256)
+            body = json.loads(blob.decode("utf-8"))
+        except Exception as exc:
+            verdicts.append({
+                "artifact_key": e.artifact_key,
+                "error": f"failed to read verdict body: {exc!r}",
+            })
+            continue
+
+        findings = body.get("findings", []) if isinstance(body, dict) else []
+        auditor = body.get("auditor", "unknown") if isinstance(body, dict) else "unknown"
+        file_path = body.get("file_path", "(unknown)") if isinstance(body, dict) else "(unknown)"
+        if isinstance(body, dict) and body.get("parse_error"):
+            parse_errors += 1
+
+        # Severity tallies.
+        per_aud = by_auditor.setdefault(
+            auditor, {"critical": 0, "warning": 0, "nit": 0, "files_audited": 0},
+        )
+        per_aud["files_audited"] += 1
+        for f in findings:
+            sev = f.get("severity")
+            if sev in severity_totals:
+                severity_totals[sev] += 1
+                per_aud[sev] += 1
+
+        verdicts.append({
+            "artifact_key": e.artifact_key,
+            "auditor": auditor,
+            "file_path": file_path,
+            "findings": findings,
+            "finding_count": len(findings),
+            "parse_error": bool(isinstance(body, dict) and body.get("parse_error")),
+            "rationale": e.rationale,
+            "seq": e.seq,
+        })
+
+    # Stable ordering: by auditor, then by file path. Frontend can re-sort.
+    verdicts.sort(key=lambda v: (v.get("auditor", ""), v.get("file_path", "")))
+
+    return {
+        "project_id": project_id,
+        "verdict_count": len(verdicts),
+        "total_findings": sum(severity_totals.values()),
+        "by_severity": severity_totals,
+        "by_auditor": [
+            {"auditor": name, **counts} for name, counts in by_auditor.items()
+        ],
+        "parse_errors": parse_errors,
+        "verdicts": verdicts,
+    }
 
 
 @app.get("/api/projects/{project_id}/manifest/gaps")
