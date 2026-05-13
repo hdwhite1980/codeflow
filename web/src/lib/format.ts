@@ -64,15 +64,25 @@ export function humanize(s: string): string {
 }
 
 /**
- * Provider display name. The backend uses "google" for Gemini calls
- * because that's the company; but in the UI users think of it as
- * "Gemini". Same for one or two others.
+ * Provider display name. The backend records the raw model vendor
+ * (anthropic, openai, google) because that's what we send the bill
+ * against, but the customer sees role-based labels instead. This
+ * keeps our model choices private and lets us swap vendors later
+ * without retraining the customer's vocabulary.
+ *
+ *   anthropic → "Builder"      (generates the files)
+ *   openai    → "Auditor A"    (first audit pass)
+ *   google    → "Auditor B"    (second audit pass)
+ *
+ * If we ever surface model names (e.g. on a "what ran this call?"
+ * detail view), use this function too — don't ship the raw provider
+ * string anywhere user-visible.
  */
 export function providerLabel(provider: string): string {
   const map: Record<string, string> = {
-    anthropic: "Claude",
-    openai: "GPT",
-    google: "Gemini",
+    anthropic: "Builder",
+    openai: "Auditor A",
+    google: "Auditor B",
   };
   return map[provider] ?? humanize(provider);
 }

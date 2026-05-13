@@ -26,7 +26,7 @@ interface SidePanelProps {
  * on desktop; on narrow screens it goes full-width.
  *
  * Renders different content per node type:
- *   - file: OpenAI verdict | Gemini verdict, stacked
+ *   - file: per-auditor verdicts, stacked
  *   - external_service: kind, label, config (with secret masking)
  *   - decision_record: rationale text
  *   - everything else: a generic key/value dump of `data`
@@ -116,7 +116,7 @@ function FileDetail({
     return (
       <div className="rounded-md border border-border bg-background/40 p-4 text-sm text-muted-foreground">
         Auditors haven&apos;t reviewed this file yet. Findings will appear
-        as OpenAI and Gemini complete their passes.
+        as each auditor completes its pass.
       </div>
     );
   }

@@ -151,8 +151,8 @@ export function NewProjectForm() {
       <CardHeader>
         <CardTitle className="text-xl">New build</CardTitle>
         <CardDescription>
-          Describe what you want built. Anthropic generates the files,
-          then OpenAI and Gemini audit them in parallel.
+          Describe what you want built. The builder generates the files,
+          then two independent auditors review them in parallel.
         </CardDescription>
       </CardHeader>
       <CardContent>

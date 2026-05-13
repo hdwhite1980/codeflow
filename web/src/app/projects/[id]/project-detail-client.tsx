@@ -117,22 +117,55 @@ export function ProjectDetailClient({
   }, [refetchDebounceTimer, refetchGraphAndAudits]);
 
   // WS event handler.
+  //
+  // Two layers of update:
+  //   1. Optimistic: immediately mutate local graph state when an event
+  //      tells us something specific (a usage_row for stage=file means
+  //      "the worker is generating this file right now" → mark writing;
+  //      a file: ledger_entry means "the file just landed" → mark
+  //      complete).
+  //   2. Background: schedule a debounced refetch of /graph and /audits
+  //      so any drift between local optimistic state and the source of
+  //      truth gets reconciled within ~250ms.
+  //
+  // The optimistic layer is what makes the build "light up" visually
+  // — file nodes pulse blue when the worker starts on them, then
+  // settle to solid green as the ledger entry lands.
   const onEvent = useCallback(
     (event: WSEvent) => {
       if (event.kind === "hello") return;
-      if (event.kind === "ledger_entry") {
-        // Any ledger write could have added/changed graph nodes or edges.
-        // Refetch.
-        scheduleRefetch();
-        return;
-      }
+
       if (event.kind === "usage_row") {
         const row = event.data;
         setUsageRows((prev) => mergeUsageRow(prev, row));
+        // If the worker is recording a per-file generation call,
+        // mark that file node as 'writing' so it pulses. The ledger
+        // entry will land shortly after and we'll flip it to 'complete'.
+        if (row.stage === "file" && row.subject) {
+          setGraph((prev) =>
+            prev ? applyWritingStatus(prev, projectId, row.subject!) : prev,
+          );
+        }
+        return;
+      }
+
+      if (event.kind === "ledger_entry") {
+        const entry = event.data;
+        // File entry means the file just landed in the ledger. Flip
+        // any matching node from pending/writing to complete and append
+        // if we don't have it yet.
+        if (entry.kind === "file") {
+          setGraph((prev) =>
+            prev ? applyFileLanded(prev, entry.artifact_key) : prev,
+          );
+        }
+        // Service entries can land at create time; refetch picks them
+        // up. Any entry type could mean new edges; defer to refetch.
+        scheduleRefetch();
         return;
       }
     },
-    [scheduleRefetch],
+    [projectId, scheduleRefetch],
   );
 
   const streamState = useProjectStream(projectId, { onEvent });
@@ -233,6 +266,108 @@ function BuildPhaseBadge({
   }
 
   return <Badge variant={variant}>{label}</Badge>;
+}
+
+// ---------------------------------------------------------------------------
+// Optimistic graph mutations driven by WS events. Each is a pure
+// (graph, event-data) -> graph transform; the caller wraps in setGraph.
+// ---------------------------------------------------------------------------
+
+/**
+ * Find a file node by its path and flip its status to 'writing'.
+ *
+ * The path comes from a usage_row.subject — we have to construct the
+ * artifact_key to match against the graph's node ids. If no matching
+ * node exists yet (the spec entry hasn't been seen), we insert a
+ * placeholder so the user sees the file appear immediately.
+ */
+function applyWritingStatus(
+  graph: GraphResponse,
+  projectId: string,
+  filePath: string,
+): GraphResponse {
+  const expectedKey = `file:${projectId}:${filePath}`;
+  const existing = graph.nodes.find((n) => n.id === expectedKey);
+  if (existing) {
+    if (existing.status === "complete") {
+      // Already done; don't downgrade. This handles out-of-order events
+      // (a usage_row arriving after its matching ledger_entry).
+      return graph;
+    }
+    return {
+      ...graph,
+      nodes: graph.nodes.map((n) =>
+        n.id === expectedKey ? { ...n, status: "writing" } : n,
+      ),
+    };
+  }
+  // Insert a new writing node. group is best-guess from the path.
+  return {
+    ...graph,
+    nodes: [
+      ...graph.nodes,
+      {
+        id: expectedKey,
+        type: "file",
+        label: filePath,
+        group: filePath.includes("/")
+          ? filePath.slice(0, filePath.lastIndexOf("/"))
+          : "root",
+        status: "writing",
+        data: { path: filePath, rationale: "Generation in progress." },
+        seq: -1,
+      },
+    ],
+    node_count: graph.node_count + 1,
+  };
+}
+
+/**
+ * A `file:` ledger entry just landed — flip the matching node to
+ * 'complete'. If no node exists yet (unusual but possible), append.
+ *
+ * Edges (imports, binds_env_var) come from the same ledger write so
+ * the background refetch will pick them up. We don't try to derive
+ * edges optimistically — the import extractor runs on the worker
+ * side and we don't have its output here.
+ */
+function applyFileLanded(
+  graph: GraphResponse,
+  artifactKey: string,
+): GraphResponse {
+  const existing = graph.nodes.find((n) => n.id === artifactKey);
+  if (existing) {
+    return {
+      ...graph,
+      nodes: graph.nodes.map((n) =>
+        n.id === artifactKey ? { ...n, status: "complete" } : n,
+      ),
+    };
+  }
+  // Derive path and group from the artifact key.
+  // Key shape: "file:<project_id>:<path>"
+  const parts = artifactKey.split(":");
+  if (parts.length < 3) return graph;
+  const path = parts.slice(2).join(":");
+  const group = path.includes("/")
+    ? path.slice(0, path.lastIndexOf("/"))
+    : "root";
+  return {
+    ...graph,
+    nodes: [
+      ...graph.nodes,
+      {
+        id: artifactKey,
+        type: "file",
+        label: path,
+        group,
+        status: "complete",
+        data: { path, rationale: "" },
+        seq: 0,
+      },
+    ],
+    node_count: graph.node_count + 1,
+  };
 }
 
 // ---------------------------------------------------------------------------
