@@ -1211,17 +1211,52 @@ def _make_risk_client() -> Any:
         from anthropic_client import AnthropicClient
         return AnthropicClient(api_key=api_key)
     # Default: local Ollama.
-    if not os.environ.get("OLLAMA_BASE_URL"):
+    base_url = os.environ.get("OLLAMA_BASE_URL", "")
+    if not base_url.strip():
+        # Diagnostic message reveals which env vars ARE seen at runtime
+        # so we can debug Railway env-var propagation issues.
+        seen_vars = sorted(
+            k for k in os.environ.keys()
+            if k.startswith(("OLLAMA_", "GUARDIAN_", "ANTHROPIC_"))
+        )
         raise HTTPException(
             status_code=503,
             detail=(
-                "Guardian risk analyzer is not configured. Either set "
-                "OLLAMA_BASE_URL (for local model) or "
-                "GUARDIAN_RISK_MODEL=claude (with ANTHROPIC_API_KEY)."
+                f"OLLAMA_BASE_URL is empty at runtime. "
+                f"GUARDIAN_RISK_MODEL={choice!r}. "
+                f"Seen env vars: {seen_vars}. "
+                f"Either set OLLAMA_BASE_URL on this service, or set "
+                f"GUARDIAN_RISK_MODEL=claude (with ANTHROPIC_API_KEY)."
             ),
         )
     from ollama_client import OllamaClient
     return OllamaClient()
+
+
+@app.get("/api/_debug/risk-env")
+async def risk_env_debug() -> dict[str, Any]:
+    """Debug endpoint: show which guardian-related env vars are visible
+    to the web service at runtime, WITHOUT leaking their values.
+
+    Returns just the presence/absence of each var. If OLLAMA_BASE_URL
+    is `false` here while the Railway UI shows it `true`, the variable
+    isn't propagating to the runtime — a Railway-side issue, not a
+    code issue.
+    """
+    keys = [
+        "OLLAMA_BASE_URL", "OLLAMA_API_TOKEN", "OLLAMA_VERIFY_TLS",
+        "OLLAMA_TIMEOUT", "OLLAMA_DEFAULT_MODEL",
+        "GUARDIAN_RISK_MODEL", "ANTHROPIC_API_KEY",
+        "DATABASE_URL", "REDIS_URL",  # control: these definitely should be set
+    ]
+    return {
+        "service": "web",
+        "env_present": {k: bool(os.environ.get(k, "").strip()) for k in keys},
+        "env_length": {k: len(os.environ.get(k, "")) for k in keys},
+        "guardian_risk_model_value": (
+            os.environ.get("GUARDIAN_RISK_MODEL", "(unset)") or "(empty)"
+        ),
+    }
 
 
 @app.post(
