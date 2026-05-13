@@ -105,6 +105,14 @@ class ArtifactKind(str, enum.Enum):
     GIT_PR = "git_pr"
     DEPLOY = "deploy"
     SERVICE = "service"
+    # --- guardian extensions (v3) ---
+    # Semantic summaries are the guardian's understanding of a code
+    # artifact: what it means, what it assumes, what its failure modes
+    # are. File-level summaries use key shape `semantic:<project>:<path>`;
+    # symbol-level use `semantic_symbol:<project>:<path>:<symbol_name>`.
+    # Not graph nodes — they ATTACH to existing nodes (file artifacts)
+    # rather than introducing their own.
+    SEMANTIC_SUMMARY = "semantic_summary"
 
 
 # Subset of ArtifactKinds that can be nodes in the dependency graph.

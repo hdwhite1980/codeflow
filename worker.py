@@ -50,6 +50,7 @@ from jobqueue import JobQueue, make_queue
 from job_handlers import HandlerContext, dispatch
 from ledger import LedgerStore
 from openai_client import OpenAIClient
+from ollama_client import OllamaClient, OllamaUnavailable
 from publishing_store import PublishingLedgerStore, PublishingUsageRecorder
 from usage_recorder import PostgresUsageRecorder
 
@@ -108,6 +109,21 @@ class Worker:
             if self.openai: auditors.append("openai")
             if self.gemini: auditors.append("gemini")
             print(f"[worker] auditors configured: {', '.join(auditors)}")
+        # Ollama is optional. The guardian subsystem reuses this client.
+        # If OLLAMA_BASE_URL is unset, we skip construction entirely and
+        # guardian_index jobs write disabled-records when they run.
+        self.ollama: OllamaClient | None = None
+        if os.environ.get("OLLAMA_BASE_URL") or os.environ.get("OLLAMA_ENABLED") == "true":
+            try:
+                self.ollama = OllamaClient()
+                print(f"[worker] guardian local AI configured "
+                      f"(model={self.ollama._default_model}, "
+                      f"base={self.ollama._base_url})")
+            except Exception as exc:
+                print(f"[worker] Ollama setup failed: "
+                      f"{type(exc).__name__}: {exc}; guardian disabled.")
+        else:
+            print("[worker] OLLAMA_BASE_URL not set; guardian disabled.")
         self.ctx = HandlerContext(
             store=self.store,
             anthropic=self.anthropic,
@@ -115,6 +131,7 @@ class Worker:
             gemini=self.gemini,
             queue=self.queue,
             recorder=self.recorder,
+            ollama=self.ollama,
         )
         self.shutdown = asyncio.Event()
         self._last_reconcile_at: dict[str, float] = {}

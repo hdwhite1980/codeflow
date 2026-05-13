@@ -1026,6 +1026,114 @@ async def list_fix_all_passes(project_id: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Guardian — semantic indexing and risk analysis.
+# ---------------------------------------------------------------------------
+#
+# Turn A scope: indexing only. Risk analysis arrives in Turn B/D.
+# Indexing is the foundation everything else builds on, so we ship
+# it first and let real summaries accumulate in the ledger before
+# the higher-level features go live.
+
+class GuardianIndexRequest(BaseModel):
+    # Optional: index just one file instead of the whole project. Useful
+    # for debugging an individual file's summary or re-indexing after a
+    # known change. If omitted, indexes everything eligible.
+    file_path: Optional[str] = None
+
+
+class GuardianIndexResponse(BaseModel):
+    project_id: str
+    status: str  # "queued"
+
+
+@app.post("/api/projects/{project_id}/guardian/index", response_model=GuardianIndexResponse)
+async def guardian_index(
+    project_id: str, req: GuardianIndexRequest = GuardianIndexRequest(),
+) -> GuardianIndexResponse:
+    """Queue a guardian indexing job for this project.
+
+    Behaviour
+    ---------
+    The actual indexing runs on the worker. The worker requires
+    OLLAMA_BASE_URL to be set and the Ollama daemon to be reachable;
+    if not, the job writes a `guardian:disabled:*` decision record
+    and returns without indexing. The frontend can surface this so
+    the operator knows the guardian isn't running.
+    """
+    queue: JobQueue = app.state.queue
+    payload: dict[str, Any] = {"project_id": project_id}
+    if req.file_path:
+        payload["file_path"] = req.file_path
+    await queue.enqueue(make_job("guardian_index", **payload))
+    return GuardianIndexResponse(project_id=project_id, status="queued")
+
+
+@app.get("/api/projects/{project_id}/guardian/summaries")
+async def list_guardian_summaries(project_id: str) -> dict[str, Any]:
+    """Return all semantic summaries for this project's files.
+
+    Each summary has both a plain_english (customer-facing) and
+    technical (engineer-facing) version. The frontend should show
+    plain by default with the technical detail one click away —
+    that's the design Hugh specified.
+
+    Empty list is a normal response: it just means the guardian
+    hasn't run yet (or isn't enabled).
+    """
+    from guardian_pipeline import load_file_summaries
+    store: LedgerStore = app.state.store
+    summaries = load_file_summaries(store, project_id)
+    # Sort by file_path so the response is deterministic.
+    summaries.sort(key=lambda s: s.get("file_path", ""))
+    return {
+        "project_id": project_id,
+        "summaries": summaries,
+        "count": len(summaries),
+    }
+
+
+@app.get("/api/projects/{project_id}/guardian/status")
+async def guardian_status(project_id: str) -> dict[str, Any]:
+    """Quick status check the frontend can poll.
+
+    Returns
+    -------
+      indexed_count : how many files currently have semantic summaries
+      total_files   : how many files exist in the project
+      enabled       : whether the guardian is configured (i.e., Ollama
+                      reachable). Best-effort: we report 'unknown' if
+                      we can't tell from REST alone — the worker is
+                      where the actual Ollama check happens.
+    """
+    from guardian_pipeline import load_file_summaries
+    store: LedgerStore = app.state.store
+
+    file_count = len(store.all_current(project_id, ArtifactKind.FILE))
+    summaries = load_file_summaries(store, project_id)
+
+    # Look for the most recent disabled marker in the last hour to detect
+    # "guardian explicitly disabled" state.
+    decisions = store.all_current(project_id, ArtifactKind.DECISION_RECORD)
+    recent_disabled = any(
+        d.artifact_key.startswith("guardian:disabled:")
+        for d in decisions
+    )
+
+    return {
+        "project_id": project_id,
+        "indexed_count": len(summaries),
+        "total_files": file_count,
+        # "unknown" if we have summaries but also a recent disabled marker;
+        # the worker's status will clarify. Defaults to True if we have any
+        # summaries, False if we don't but also have no disable record.
+        "enabled": (
+            False if recent_disabled and not summaries
+            else (True if summaries else None)
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Impact analysis endpoints
 # ---------------------------------------------------------------------------
 

@@ -37,6 +37,7 @@ immediately; audit outcome lands shortly after.
 from __future__ import annotations
 
 import asyncio
+import time
 import traceback
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
@@ -47,6 +48,7 @@ from build_pipeline import BuildOutcome, run_build
 from gemini_client import GeminiClient
 from jobqueue import JobQueue, make_job
 from ledger import ArtifactKind, LedgerStore, Tier
+from ollama_client import OllamaClient
 from openai_client import OpenAIClient
 from usage_recorder import UsageRecorder
 
@@ -74,6 +76,10 @@ class HandlerContext:
     gemini: Optional[GeminiClient] = None
     queue: Optional[JobQueue] = None
     recorder: Optional[UsageRecorder] = None
+    # Local AI client for the guardian. Optional: if absent, guardian
+    # job kinds skip rather than crash. The rest of the pipeline works
+    # without it.
+    ollama: Optional["OllamaClient"] = None
 
 
 # ---------------------------------------------------------------------------
@@ -865,6 +871,155 @@ async def handle_fix_all(job: dict[str, Any], ctx: HandlerContext) -> None:
 
 
 # ---------------------------------------------------------------------------
+# guardian_index — produce a semantic summary for one file.
+# ---------------------------------------------------------------------------
+
+async def handle_guardian_index(job: dict[str, Any], ctx: HandlerContext) -> None:
+    """Index one file or one whole project's worth of files.
+
+    Two job shapes:
+      - {"project_id": <id>, "file_path": "app/main.py"}  → index one file
+      - {"project_id": <id>}                              → index every file
+                                                            in the project that
+                                                            isn't already indexed
+                                                            or whose file artifact
+                                                            is newer than its
+                                                            semantic summary
+
+    The "index whole project" shape exists for two reasons:
+      1. Manually re-running the guardian after the operator turns it on
+         for the first time (backfill for existing projects).
+      2. Periodic sweeps to catch files whose summaries got missed.
+
+    Skip rules
+    ----------
+    Tombstones (files marked DELETED in iteration) are skipped — we don't
+    want a summary of a deletion marker. Files matching SKIP_PATH_PATTERNS
+    in guardian_pipeline are skipped. Files over MAX_INDEXABLE_BYTES are
+    skipped. All skips are logged but don't fail the job.
+    """
+    project_id = job.get("project_id")
+    if not project_id:
+        print(f"[handlers] guardian_index: missing project_id; dropping",
+              flush=True)
+        return
+
+    if ctx.ollama is None:
+        print(f"[handlers] guardian_index: no Ollama client configured; "
+              f"writing skip-record for {project_id}", flush=True)
+        ctx.store.write_entry(
+            project_id=project_id,
+            tier=Tier.SPEC,
+            artifact_kind=ArtifactKind.DECISION_RECORD,
+            artifact_key=f"guardian:disabled:{int(time.time())}",
+            body={"reason": "OLLAMA_BASE_URL not set or daemon unreachable"},
+            rationale="Guardian indexing skipped: no local AI configured.",
+            author="worker:handle_guardian_index",
+        )
+        return
+
+    # Lazy import: keeps the heavy pipeline module out of this file's
+    # top-level graph.
+    from guardian_pipeline import (
+        should_index, summarize_file, write_file_summary,
+    )
+
+    target_path = job.get("file_path")
+
+    # Build the work list.
+    file_entries = ctx.store.all_current(project_id, ArtifactKind.FILE)
+    targets: list[tuple[str, str]] = []  # (path, content)
+    for fe in file_entries:
+        parts = fe.artifact_key.split(":", 2)
+        if len(parts) < 3:
+            continue
+        path = parts[2]
+        if target_path and path != target_path:
+            continue
+        if "DELETED in iteration" in fe.rationale:
+            continue
+        try:
+            blob, _ = ctx.store.get_blob(fe.blob_sha256)
+        except Exception as exc:
+            print(f"[guardian] failed to load {path}: "
+                  f"{type(exc).__name__}: {exc}", flush=True)
+            continue
+        content = blob.decode("utf-8", errors="replace")
+        ok, reason = should_index(path, len(blob))
+        if not ok:
+            print(f"[guardian] skipping {path}: {reason}", flush=True)
+            continue
+        targets.append((path, content))
+
+    if not targets:
+        print(f"[handlers] guardian_index: no eligible files for "
+              f"{project_id}"
+              + (f" matching {target_path!r}" if target_path else ""),
+              flush=True)
+        return
+
+    # Index each file. We do these sequentially because Ollama is single-
+    # tenant on the box — parallelism would just serialize at the daemon
+    # and add overhead. If we later move to a multi-GPU setup we can
+    # parallelize, but for now sequential is simpler and equivalent.
+    indexed = 0
+    failed: list[tuple[str, str]] = []
+    for path, content in targets:
+        try:
+            language = _language_from_extension(path)
+            summary = await summarize_file(
+                file_path=path,
+                content=content,
+                language=language,
+                client=ctx.ollama,
+            )
+            write_file_summary(ctx.store, project_id, summary)
+            if ctx.recorder is not None:
+                # Record Ollama usage so the cost dashboard shows it,
+                # even though dollar cost is zero. Useful for capacity
+                # planning and proving the guardian ran.
+                ctx.recorder.record(
+                    project_id=project_id,
+                    provider="ollama",
+                    model=summary.indexer_model,
+                    stage="guardian:index",
+                    subject=path,
+                    input_tokens=summary.input_tokens,
+                    output_tokens=summary.output_tokens,
+                )
+            indexed += 1
+        except Exception as exc:
+            failed.append((path, f"{type(exc).__name__}: {exc}"))
+            print(f"[guardian] index failed for {path}: "
+                  f"{type(exc).__name__}: {exc}", flush=True)
+
+    print(f"[handlers] guardian_index: completed for {project_id} — "
+          f"{indexed} indexed, {len(failed)} failed",
+          flush=True)
+
+
+def _language_from_extension(path: str) -> str:
+    """Best-effort language tag for the guardian prompt. The model
+    handles unknown languages fine but a hint improves quality."""
+    if path.endswith(".py"): return "python"
+    if path.endswith((".ts", ".tsx")): return "typescript"
+    if path.endswith((".js", ".jsx")): return "javascript"
+    if path.endswith(".rs"): return "rust"
+    if path.endswith(".go"): return "go"
+    if path.endswith(".java"): return "java"
+    if path.endswith(".cs"): return "csharp"
+    if path.endswith(".rb"): return "ruby"
+    if path.endswith(".php"): return "php"
+    if path.endswith(".md"): return "markdown"
+    if path.endswith((".yml", ".yaml")): return "yaml"
+    if path.endswith(".json"): return "json"
+    if path.endswith(".sql"): return "sql"
+    if path.endswith(".sh"): return "bash"
+    if path.endswith(".dockerfile") or path.endswith("Dockerfile"): return "dockerfile"
+    return "text"
+
+
+# ---------------------------------------------------------------------------
 # Registry. Add new handlers here.
 # ---------------------------------------------------------------------------
 
@@ -875,6 +1030,7 @@ HANDLERS: dict[str, HandlerFn] = {
     "audit_project": handle_audit_project,
     "iterate_project": handle_iterate_project,
     "fix_all": handle_fix_all,
+    "guardian_index": handle_guardian_index,
 }
 
 
