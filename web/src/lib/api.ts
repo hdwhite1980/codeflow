@@ -18,6 +18,10 @@ import type {
   CreateProjectRequest,
   CreateProjectResponse,
   GraphResponse,
+  Iteration,
+  IterateRequest,
+  IterateResponse,
+  IterationListResponse,
   ProjectListResponse,
   UsageSummary,
 } from "./types";
@@ -123,6 +127,26 @@ export async function getAudits(projectId: string): Promise<AuditResponse> {
 export async function getGraph(projectId: string): Promise<GraphResponse> {
   return getJSON<GraphResponse>(
     `/api/projects/${encodeURIComponent(projectId)}/graph`,
+  );
+}
+
+// -- Iteration ------------------------------------------------------
+
+export async function iterateProject(
+  projectId: string,
+  body: IterateRequest,
+): Promise<IterateResponse> {
+  return postJSON<IterateRequest, IterateResponse>(
+    `/api/projects/${encodeURIComponent(projectId)}/iterate`,
+    body,
+  );
+}
+
+export async function getIterations(
+  projectId: string,
+): Promise<IterationListResponse> {
+  return getJSON<IterationListResponse>(
+    `/api/projects/${encodeURIComponent(projectId)}/iterations`,
   );
 }
 

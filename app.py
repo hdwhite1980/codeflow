@@ -706,6 +706,92 @@ async def iterate_project(
     )
 
 
+@app.get("/api/projects/{project_id}/iterations")
+async def list_iterations(project_id: str) -> dict[str, Any]:
+    """Return all iterations for a project, newest first.
+
+    Each iteration is reconstructed from up to three ledger artifacts:
+      - iteration:<N>:started   (always present; written first)
+      - iteration:<N>:plan      (present once planning succeeds)
+      - iteration:<N>:outcome   (present once iteration finishes — success or failure)
+
+    Status is derived from which artifacts exist:
+      - "started" only          → "running"   (rare; only visible mid-iteration)
+      - "started" + "plan" only → "running"   (regenerating files)
+      - all three               → "complete"  (look at outcome.failed to see if any
+                                              files failed; UI can color accordingly)
+
+    We don't have a separate "failed" state at the iteration level today —
+    failures inside an iteration show up in the outcome's `failed` list. A
+    catastrophic crash (e.g. the Tier.BUILD bug pre-fix) leaves orphan
+    started/plan entries with no outcome; we expose those as "running"
+    because we can't distinguish them from in-flight iterations from
+    ledger state alone. The UI can show "started X minutes ago" so users
+    can tell something is stuck.
+    """
+    store: LedgerStore = app.state.store
+    entries = store.all_current(project_id, ArtifactKind.DECISION_RECORD)
+
+    # Group by iteration sequence number.
+    by_seq: dict[int, dict[str, Any]] = {}
+    for e in entries:
+        if not e.artifact_key.startswith("iteration:"):
+            continue
+        parts = e.artifact_key.split(":")
+        if len(parts) != 3:
+            continue
+        try:
+            seq = int(parts[1])
+        except ValueError:
+            continue
+        phase = parts[2]  # "started" | "plan" | "outcome"
+        slot = by_seq.setdefault(seq, {})
+        try:
+            blob, _ = store.get_blob(e.blob_sha256)
+            body = json.loads(blob.decode("utf-8")) if blob else {}
+        except Exception:
+            body = {}
+        slot[phase] = {
+            "rationale": e.rationale,
+            "body": body,
+        }
+
+    iterations = []
+    for seq in sorted(by_seq.keys(), reverse=True):
+        slot = by_seq[seq]
+        status = "complete" if "outcome" in slot else "running"
+        # Derive a one-line summary: prefer the plan rationale (the
+        # Builder's own description), fall back to the started prompt,
+        # then to a generic message.
+        if "plan" in slot:
+            summary = slot["plan"]["body"].get("rationale") or "Plan in progress"
+        elif "started" in slot:
+            summary = slot["started"]["body"].get("prompt", "")[:200]
+        else:
+            summary = ""
+        outcome_body = slot.get("outcome", {}).get("body", {}) if "outcome" in slot else {}
+        iterations.append({
+            "seq": seq,
+            "status": status,
+            "prompt": slot.get("started", {}).get("body", {}).get("prompt", ""),
+            "started_at": slot.get("started", {}).get("body", {}).get("started_at"),
+            "completed_at": outcome_body.get("completed_at"),
+            "rationale": summary,
+            "changes_applied": outcome_body.get("changes_applied", []),
+            "new_files_created": outcome_body.get("new_files_created", []),
+            "files_deleted": outcome_body.get("files_deleted", []),
+            "failed": outcome_body.get("failed", []),
+            "input_tokens": outcome_body.get("input_tokens", 0),
+            "output_tokens": outcome_body.get("output_tokens", 0),
+        })
+
+    return {
+        "project_id": project_id,
+        "iterations": iterations,
+        "count": len(iterations),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Impact analysis endpoints
 # ---------------------------------------------------------------------------

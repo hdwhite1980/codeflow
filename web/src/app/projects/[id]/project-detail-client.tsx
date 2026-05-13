@@ -4,16 +4,20 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { CostSummary } from "@/components/cost-summary";
 import { GraphView } from "@/components/graph-view";
+import { IterationHistory } from "@/components/iteration-history";
+import { IterationInput } from "@/components/iteration-input";
 import { LiveIndicator } from "@/components/live-indicator";
 import { Badge } from "@/components/ui/badge";
 import {
   getAudits,
   getGraph,
+  getIterations,
 } from "@/lib/api";
 import type {
   AuditResponse,
   AuditVerdict,
   GraphResponse,
+  Iteration,
   UsageRow,
   UsageSummary,
   WSEvent,
@@ -63,6 +67,12 @@ export function ProjectDetailClient({
     initialUsage?.rows ?? [],
   );
   const [audits, setAudits] = useState<AuditResponse | null>(initialAudits);
+  const [iterations, setIterations] = useState<Iteration[]>([]);
+  // Iteration sequence numbers we've queued or know are running, but
+  // haven't yet seen complete in the iterations list. These let the
+  // UI show "running" state immediately on queue, before the next
+  // /api/projects/<id>/iterations poll lands.
+  const [inFlightSeqs, setInFlightSeqs] = useState<Set<number>>(new Set());
   const [refetchPending, setRefetchPending] = useState(false);
 
   // Initial graph fetch on mount.
@@ -80,20 +90,54 @@ export function ProjectDetailClient({
     };
   }, [projectId]);
 
-  // Refetch graph + audits. Called when WS events suggest the
-  // underlying ledger has changed in ways our local state can't fully
+  // Initial iterations fetch (separate from graph so each can fail
+  // independently — a missing /iterations endpoint shouldn't break the
+  // graph view).
+  useEffect(() => {
+    let cancelled = false;
+    getIterations(projectId)
+      .then((res) => {
+        if (!cancelled) setIterations(res.iterations);
+      })
+      .catch((err) => {
+        console.error("[detail] initial iterations fetch failed:", err);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId]);
+
+  // Refetch graph + audits + iterations. Called when WS events suggest
+  // the underlying ledger has changed in ways our local state can't fully
   // reconcile. Coalesced so a burst of events doesn't cause a refetch
   // per event.
   const refetchGraphAndAudits = useCallback(async () => {
     if (refetchPending) return;
     setRefetchPending(true);
     try {
-      const [g, au] = await Promise.allSettled([
+      const [g, au, it] = await Promise.allSettled([
         getGraph(projectId),
         getAudits(projectId),
+        getIterations(projectId),
       ]);
       if (g.status === "fulfilled") setGraph(g.value);
       if (au.status === "fulfilled") setAudits(au.value);
+      if (it.status === "fulfilled") {
+        setIterations(it.value.iterations);
+        // Drop any in-flight seqs that now appear as complete.
+        setInFlightSeqs((prev) => {
+          const completedSeqs = new Set(
+            it.value.iterations
+              .filter((x) => x.status === "complete")
+              .map((x) => x.seq),
+          );
+          const remaining = new Set<number>();
+          for (const seq of prev) {
+            if (!completedSeqs.has(seq)) remaining.add(seq);
+          }
+          return remaining;
+        });
+      }
     } finally {
       setRefetchPending(false);
     }
@@ -189,6 +233,50 @@ export function ProjectDetailClient({
     [projectId, usageRows],
   );
 
+  // Called by IterationInput when the user submits a new iteration.
+  // We seed two pieces of optimistic state:
+  //   1. inFlightSeqs gets the new seq so the history shows "running"
+  //   2. A placeholder Iteration row is prepended so the user sees it
+  //      immediately rather than waiting for the next refetch.
+  // The next /iterations refetch will overwrite our placeholder with
+  // the real entry once :started lands.
+  const onIterationQueued = useCallback(
+    (seq: number, prompt: string) => {
+      setInFlightSeqs((prev) => {
+        const next = new Set(prev);
+        next.add(seq);
+        return next;
+      });
+      const placeholder: Iteration = {
+        seq,
+        status: "running",
+        prompt,
+        started_at: Date.now() / 1000,
+        completed_at: null,
+        rationale: "Queued…",
+        changes_applied: [],
+        new_files_created: [],
+        files_deleted: [],
+        failed: [],
+        input_tokens: 0,
+        output_tokens: 0,
+      };
+      setIterations((prev) => {
+        // Replace if we already have a row for this seq (defensive), else prepend.
+        const idx = prev.findIndex((it) => it.seq === seq);
+        if (idx === -1) return [placeholder, ...prev];
+        const out = [...prev];
+        out[idx] = placeholder;
+        return out;
+      });
+      // Also schedule a refetch — the worker should write :started
+      // within a few seconds, and we want the rationale field to
+      // reflect that instead of staying "Queued…".
+      scheduleRefetch();
+    },
+    [scheduleRefetch],
+  );
+
   if (initialError && !graph) {
     return (
       <div className="rounded-md border border-red-900/40 bg-red-950/30 p-4 text-sm text-red-300">
@@ -196,6 +284,9 @@ export function ProjectDetailClient({
       </div>
     );
   }
+
+  const anyIterationRunning = inFlightSeqs.size > 0
+    || iterations.some((it) => it.status === "running");
 
   return (
     <div className="space-y-4">
@@ -216,14 +307,34 @@ export function ProjectDetailClient({
 
       <GraphView graph={graph} verdictsByPath={verdictsByPath} />
 
-      {/* Cost ticker pinned to the bottom-left of the viewport, sized
-          modestly so it doesn't compete with the graph for attention.
-          Bottom-left avoids collision with the side panel (which slides
-          in from the right). */}
+      {/* Iteration history pinned to the right edge above the side panel.
+          Sits to the left of the side panel's slide-in space so the two
+          don't fight for screen real estate. */}
+      <div className="pointer-events-none fixed right-6 top-20 z-20 w-72">
+        <div className="pointer-events-auto max-h-[60vh] overflow-y-auto">
+          <IterationHistory
+            iterations={iterations}
+            inFlightSeqs={inFlightSeqs}
+          />
+        </div>
+      </div>
+
+      {/* Cost ticker pinned to the bottom-left of the viewport. */}
       <div className="pointer-events-none fixed bottom-6 left-6 z-30 w-72">
         <div className="pointer-events-auto">
           <CostSummary usage={usageSummary} />
         </div>
+      </div>
+
+      {/* Iteration prompt input pinned to the bottom-center.
+          Width matches the graph canvas; the cost card on the left
+          and (eventually) side panel on the right give it room. */}
+      <div className="pointer-events-none fixed bottom-6 left-1/2 z-30 w-[480px] -translate-x-1/2">
+        <IterationInput
+          projectId={projectId}
+          onIterationQueued={onIterationQueued}
+          someIterationRunning={anyIterationRunning}
+        />
       </div>
     </div>
   );

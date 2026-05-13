@@ -272,3 +272,45 @@ export interface GraphResponse {
   node_count: number;
   edge_count: number;
 }
+
+// -- /api/projects/<id>/iterate (POST) ------------------------------
+
+export interface IterateRequest {
+  prompt: string;
+}
+
+export interface IterateResponse {
+  project_id: string;
+  iteration_seq: number;
+  status: string;
+}
+
+// -- /api/projects/<id>/iterations (GET) ----------------------------
+
+export type IterationStatus = "running" | "complete";
+
+export interface IterationFailure {
+  path: string;
+  reason: string;
+}
+
+export interface Iteration {
+  seq: number;
+  status: IterationStatus;
+  prompt: string;
+  started_at: number | null;
+  completed_at: number | null;
+  rationale: string;
+  changes_applied: string[];
+  new_files_created: string[];
+  files_deleted: string[];
+  failed: IterationFailure[];
+  input_tokens: number;
+  output_tokens: number;
+}
+
+export interface IterationListResponse {
+  project_id: string;
+  iterations: Iteration[];
+  count: number;
+}
