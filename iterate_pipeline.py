@@ -204,12 +204,59 @@ async def run_iteration(
         author=f"worker:iterate:{iteration_seq}",
     )
 
-    # Phase 1: plan. Wrap in try/except so a planning failure writes
-    # a clear outcome record instead of leaving the iteration stuck at
-    # status=started forever. Common failures:
-    #   - Anthropic API auth/rate limit
-    #   - Model returns invalid JSON (already handled by _parse_plan)
-    #   - Network blip
+    # Wrap the entire rest in a try/except so that no matter what blows
+    # up — a typo, a network glitch, a schema mismatch — we write an
+    # :outcome record with the error before returning. Without this,
+    # an unexpected exception leaves the iteration appearing to be
+    # "still running" forever from the UI's perspective. The outer
+    # dispatcher logs the traceback to worker logs but the user sees
+    # only :started in the artifacts list — same shape as a hang.
+    try:
+        return await _run_iteration_body(
+            project_id=project_id,
+            iteration_prompt=iteration_prompt,
+            iteration_seq=iteration_seq,
+            stage_tag=stage_tag,
+            store=store,
+            client=client,
+            recorder=recorder,
+        )
+    except Exception as exc:
+        print(f"[iterate] UNEXPECTED FAILURE in iteration {iteration_seq} "
+              f"for {project_id}: {type(exc).__name__}: {exc}", flush=True)
+        import traceback
+        traceback.print_exc()
+        outcome = IterationOutcome(
+            iteration_seq=iteration_seq,
+            changes_applied=[], new_files_created=[], files_deleted=[],
+            failed=[("(internal)", f"{type(exc).__name__}: {str(exc)[:300]}")],
+            input_tokens=0, output_tokens=0,
+            rationale=f"Iteration failed unexpectedly: {type(exc).__name__}",
+        )
+        _write_outcome(store, project_id, iteration_seq, outcome)
+        return outcome
+
+
+async def _run_iteration_body(
+    *,
+    project_id: str,
+    iteration_prompt: str,
+    iteration_seq: int,
+    stage_tag: str,
+    store: LedgerStore,
+    client: AnthropicClient,
+    recorder: Optional[UsageRecorder] = None,
+) -> IterationOutcome:
+    """The actual iteration logic, extracted so run_iteration can wrap
+    it in a single try/except that always writes an outcome record.
+
+    Common failure modes the inner try/except catches:
+      - Anthropic API auth/rate limit during the plan phase
+      - Model returns invalid JSON (already handled by _parse_plan)
+      - Network blip during the regen phase
+    Per-file failures (in the regen loop) are caught inside the loop
+    and recorded in the failed list — they don't abort the iteration.
+    """
     try:
         inventory = _current_inventory(store, project_id)
         plan, plan_in, plan_out = await _plan_iteration(
