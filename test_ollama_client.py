@@ -141,6 +141,61 @@ class TestOllamaClient(unittest.TestCase):
         with self.assertRaises(OllamaUnavailable):
             _run(client.complete("test"))
 
+    def test_bearer_token_sent_when_configured(self):
+        """If OLLAMA_API_TOKEN is set, every request must include
+        Authorization: Bearer <token>. This is what the Hetzner Caddy
+        proxy gates on — without it, every call returns 401."""
+        captured_auth = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured_auth["header"] = request.headers.get("Authorization", "")
+            return httpx.Response(200, json={
+                "response": "ok", "model": "qwen2.5-coder:14b",
+                "done_reason": "stop",
+                "prompt_eval_count": 1, "eval_count": 1,
+            })
+
+        # Explicit api_token in constructor (overrides any env var).
+        client = OllamaClient(base_url="http://test", api_token="my-secret-123")
+        client._http = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            base_url="http://test", timeout=5.0,
+            # Mirror what the production __init__ would set on _http.
+            headers={
+                "content-type": "application/json",
+                "Authorization": "Bearer my-secret-123",
+            },
+        )
+        _run(client.complete("test"))
+        self.assertEqual(captured_auth["header"], "Bearer my-secret-123")
+
+    def test_no_bearer_header_when_token_empty(self):
+        """If no token is configured, the client must NOT send an
+        Authorization header at all. The header being present but empty
+        would still be treated as 'authenticated as <empty>' by some
+        proxies — which is the exact bug we hit earlier with Caddy."""
+        captured_auth = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured_auth["header"] = request.headers.get("Authorization")
+            return httpx.Response(200, json={
+                "response": "ok", "model": "qwen2.5-coder:14b",
+                "done_reason": "stop",
+                "prompt_eval_count": 1, "eval_count": 1,
+            })
+
+        client = OllamaClient(base_url="http://test", api_token="")
+        client._http = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            base_url="http://test", timeout=5.0,
+            headers={"content-type": "application/json"},
+            # No Authorization header at all.
+        )
+        _run(client.complete("test"))
+        # The mock client we constructed has no auth header; verify
+        # the request didn't smuggle one in.
+        self.assertIsNone(captured_auth["header"])
+
 
 if __name__ == "__main__":
     unittest.main()

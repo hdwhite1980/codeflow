@@ -63,10 +63,25 @@ FALLBACK_MODELS = ["qwen2.5-coder:7b", "qwen2.5-coder:3b"]
 DEFAULT_TIMEOUT_SECONDS = 90.0
 
 # Base URL of the Ollama daemon. Default points at the Hetzner box's
-# internal address; override via OLLAMA_BASE_URL for local dev.
+# Caddy proxy (which terminates TLS and enforces bearer auth, then
+# reverse-proxies to Ollama on localhost). Override via OLLAMA_BASE_URL
+# for local dev (e.g. http://localhost:11434 against a dev Ollama).
 DEFAULT_BASE_URL = os.environ.get(
-    "OLLAMA_BASE_URL", "http://5.78.79.75:11434"
+    "OLLAMA_BASE_URL", "https://5.78.79.75/ollama"
 )
+
+# Bearer token for the Caddy proxy. The Hetzner box's Caddyfile gates
+# the /ollama/* path on a matching Authorization: Bearer <token> header
+# (see deploy/hetzner_sandbox.md). When unset, the client doesn't send
+# the header — useful for local dev against a bare Ollama daemon.
+DEFAULT_API_TOKEN = os.environ.get("OLLAMA_API_TOKEN", "")
+
+# Whether to verify TLS certificates. We default to true. The Hetzner
+# box currently uses a self-signed cert (issued for CN=5.78.79.75,
+# valid 10 years). Set OLLAMA_VERIFY_TLS=false to skip verification —
+# fine for now while the cert is self-signed. Eventually we move to
+# a Let's Encrypt cert against a real domain and flip this back on.
+DEFAULT_VERIFY_TLS = os.environ.get("OLLAMA_VERIFY_TLS", "true").lower() != "false"
 
 
 # ---------------------------------------------------------------------------
@@ -149,13 +164,24 @@ class OllamaClient:
         default_model: str = DEFAULT_MODEL,
         base_url: str = DEFAULT_BASE_URL,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+        api_token: Optional[str] = None,
+        verify_tls: Optional[bool] = None,
     ) -> None:
         self._default_model = default_model
         self._base_url = base_url.rstrip("/")
+        # Bearer token. None or "" means we don't send the Authorization
+        # header at all — useful for local dev against a bare daemon
+        # without the Caddy proxy.
+        self._api_token = api_token if api_token is not None else DEFAULT_API_TOKEN
+        verify = DEFAULT_VERIFY_TLS if verify_tls is None else verify_tls
+        headers = {"content-type": "application/json"}
+        if self._api_token:
+            headers["Authorization"] = f"Bearer {self._api_token}"
         self._http = httpx.AsyncClient(
             base_url=self._base_url,
             timeout=timeout_seconds,
-            headers={"content-type": "application/json"},
+            headers=headers,
+            verify=verify,
         )
         # Track which model we actually got working. Set after the first
         # successful call so subsequent calls don't repeat the fallback
