@@ -321,3 +321,46 @@ export interface IterationListResponse {
   iterations: Iteration[];
   count: number;
 }
+
+// -- Fix-all -------------------------------------------------------
+
+export interface FixAllEstimate {
+  issues_to_fix: number;
+  files_affected: number;
+  truncated: boolean;
+  by_severity?: {
+    critical: number;
+    warning: number;
+    nit: number;
+  };
+  estimated_cost_usd_low: number;
+  estimated_cost_usd_high: number;
+}
+
+export interface FixAllResponse {
+  project_id: string;
+  fix_all_seq: number;
+  status: string;
+}
+
+export type FixAllStatus = "running" | "complete";
+
+export interface FixAllPass {
+  seq: number;
+  status: FixAllStatus;
+  issue_count: number;
+  files_affected: number;
+  started_at: number | null;
+  completed_at: number | null;
+  pre_count: number | null;
+  post_count: number | null;
+  fixed: number | null;
+  regressions: number | null;
+  report: string | null;
+}
+
+export interface FixAllPassesResponse {
+  project_id: string;
+  passes: FixAllPass[];
+  count: number;
+}

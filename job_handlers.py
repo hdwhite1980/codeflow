@@ -653,6 +653,218 @@ async def handle_iterate_project(job: dict[str, Any], ctx: HandlerContext) -> No
 
 
 # ---------------------------------------------------------------------------
+# fix_all — user-triggered "fix everything" pass.
+# ---------------------------------------------------------------------------
+
+async def handle_fix_all(job: dict[str, Any], ctx: HandlerContext) -> None:
+    """Run one fix-all pass.
+
+    The pass is structured as:
+      1. Read current findings → build prompt → mark `fix_all:N:started`.
+      2. Run iteration via the existing iterate pipeline. The iteration's
+         own `iteration:K:started/plan/outcome` records track its progress.
+      3. Re-audit the project.
+      4. Read pre vs post findings, ask Builder to explain remaining
+         issues, write `fix_all:N:report`.
+
+    Why not chain via the queue
+    ----------------------------
+    handle_iterate_project enqueues an audit_project job and returns;
+    then handle_audit_project runs separately. If we did the same here,
+    the report step (which needs post-audit findings) would have to
+    live in handle_audit_project with a "did fix-all trigger me?" check.
+    That couples the two handlers awkwardly. Instead, we run the full
+    pipeline (iterate + audit + report) inline within this handler. It
+    takes longer per job but the control flow is straightforward.
+
+    Note that we call iterate_pipeline.run_iteration and the audit
+    pipeline directly, not via the queue. The queue's purpose is to
+    decouple HTTP from background work; for an in-handler workflow,
+    direct calls are fine and we don't fight asyncio."""
+
+    project_id = job.get("project_id")
+    if not project_id:
+        print(f"[handlers] fix_all: missing project_id in {job!r}; dropping",
+              flush=True)
+        return
+
+    if ctx.anthropic is None:
+        print(f"[handlers] fix_all: no Anthropic client; skipping",
+              flush=True)
+        return
+
+    # Lazy imports — keeps the heavy pipeline modules out of this file's
+    # top-level import graph.
+    from fix_all_pipeline import (
+        collect_all_findings, build_fix_all_prompt,
+        generate_fix_all_report, write_fix_all_started,
+        write_fix_all_report, next_fix_all_seq, FIX_ALL_MAX_FINDINGS,
+    )
+    from iterate_pipeline import run_iteration
+
+    # Phase 1: collect pre-fix findings.
+    pre_findings, truncated = collect_all_findings(
+        ctx.store, project_id, max_findings=FIX_ALL_MAX_FINDINGS,
+    )
+    if not pre_findings:
+        # Nothing to do. Still write a marker so the UI can show
+        # "fix-all ran, no issues to fix" rather than appearing to hang.
+        seq = next_fix_all_seq(ctx.store, project_id)
+        write_fix_all_started(ctx.store, project_id, seq, 0, 0)
+        write_fix_all_report(
+            ctx.store, project_id, seq,
+            report="Fix-all pass complete. No issues to fix — the audit was already clean.",
+            pre_count=0, post_count=0, fixed=0, regressions=0,
+        )
+        print(f"[handlers] fix_all: nothing to fix for {project_id}",
+              flush=True)
+        return
+
+    files_affected = len({f.file_path for f in pre_findings})
+    seq = next_fix_all_seq(ctx.store, project_id)
+    write_fix_all_started(
+        ctx.store, project_id, seq,
+        issue_count=len(pre_findings), files_affected=files_affected,
+    )
+
+    print(f"[handlers] fix_all: pass {seq} starting for {project_id} — "
+          f"{len(pre_findings)} issue(s) across {files_affected} file(s)",
+          flush=True)
+
+    # Phase 2: run a normal iteration. We use the existing iterate
+    # pipeline (not a fresh build) because the Builder is good at
+    # taking a list-of-issues prompt + current file contents and
+    # producing fixed versions.
+    iteration_prompt = build_fix_all_prompt(pre_findings, truncated)
+
+    # Compute the iteration_seq the same way the API does.
+    decisions = ctx.store.all_current(project_id, ArtifactKind.DECISION_RECORD)
+    iteration_seq = sum(
+        1 for e in decisions
+        if e.artifact_key.startswith("iteration:")
+        and e.artifact_key.endswith(":started")
+    ) + 1
+
+    try:
+        outcome = await run_iteration(
+            project_id=project_id,
+            iteration_prompt=iteration_prompt,
+            iteration_seq=iteration_seq,
+            store=ctx.store,
+            client=ctx.anthropic,
+            recorder=ctx.recorder,
+        )
+    except Exception as exc:
+        print(f"[handlers] fix_all: iteration failed: "
+              f"{type(exc).__name__}: {exc}", flush=True)
+        write_fix_all_report(
+            ctx.store, project_id, seq,
+            report=f"Fix-all pass {seq} failed during iteration: "
+                   f"{type(exc).__name__}: {exc}. "
+                   f"The original {len(pre_findings)} issue(s) remain.",
+            pre_count=len(pre_findings), post_count=len(pre_findings),
+            fixed=0, regressions=0,
+        )
+        return
+
+    # Phase 3: run the audit inline so we can compare pre vs post.
+    # Same logic as handle_audit_project, condensed.
+    from audit_pipeline import run_audit
+    file_entries = ctx.store.all_current(project_id, ArtifactKind.FILE)
+    if file_entries:
+        spec_entries = ctx.store.all_current(project_id, ArtifactKind.SPEC_ENTITY)
+        spec_by_path: dict[str, dict] = {}
+        for s in spec_entries:
+            try:
+                blob, _ = ctx.store.get_blob(s.blob_sha256)
+                data = _json_loads_or_none(blob)
+                if isinstance(data, dict) and "path" in data:
+                    spec_by_path[data["path"]] = data
+            except Exception:
+                continue
+
+        file_artifacts = []
+        for fe in file_entries:
+            parts = fe.artifact_key.split(":", 2)
+            if len(parts) < 3:
+                continue
+            path = parts[2]
+            if "DELETED in iteration" in fe.rationale:
+                continue
+            try:
+                blob, _ = ctx.store.get_blob(fe.blob_sha256)
+            except Exception:
+                continue
+            spec = spec_by_path.get(path, {})
+            file_artifacts.append({
+                "path": path,
+                "content": blob.decode("utf-8", errors="replace"),
+                "purpose": spec.get("purpose", "(unspecified)"),
+                "language": spec.get("language", "(unspecified)"),
+            })
+
+        auditors = []
+        if ctx.openai is not None:
+            auditors.append(("openai", "openai", ctx.openai))
+        if ctx.gemini is not None:
+            auditors.append(("gemini", "google", ctx.gemini))
+
+        if auditors and file_artifacts:
+            audit_tasks = [
+                run_audit(
+                    project_id=project_id, file_artifacts=file_artifacts,
+                    client=client, store=ctx.store,
+                    auditor_name=name, provider=provider,
+                    recorder=ctx.recorder,
+                )
+                for name, provider, client in auditors
+            ]
+            try:
+                await asyncio.gather(*audit_tasks)
+            except Exception as exc:
+                print(f"[handlers] fix_all: post-fix audit failed: "
+                      f"{type(exc).__name__}: {exc}", flush=True)
+
+    # Phase 4: compare findings, generate report.
+    post_findings, _ = collect_all_findings(
+        ctx.store, project_id, max_findings=FIX_ALL_MAX_FINDINGS,
+    )
+    pre_keys = {(f.file_path, f.severity, f.line or 0, (f.issue or "")[:80])
+                for f in pre_findings}
+    post_keys = {(f.file_path, f.severity, f.line or 0, (f.issue or "")[:80])
+                 for f in post_findings}
+    persisted = len(pre_keys & post_keys)
+    regressions = len(post_keys - pre_keys)
+    fixed = len(pre_findings) - persisted
+
+    try:
+        report = await generate_fix_all_report(
+            project_id=project_id, fix_all_seq=seq,
+            pre_findings=pre_findings, post_findings=post_findings,
+            client=ctx.anthropic, recorder=ctx.recorder,
+        )
+    except Exception as exc:
+        print(f"[handlers] fix_all: report generation crashed: "
+              f"{type(exc).__name__}: {exc}", flush=True)
+        report = (
+            f"Fix-all pass {seq} complete (report generation failed). "
+            f"Fixed {fixed} of {len(pre_findings)} issue(s); "
+            f"{len(post_findings)} remain"
+            + (f", {regressions} new" if regressions else "")
+            + "."
+        )
+
+    write_fix_all_report(
+        ctx.store, project_id, seq, report=report,
+        pre_count=len(pre_findings), post_count=len(post_findings),
+        fixed=fixed, regressions=regressions,
+    )
+    print(f"[handlers] fix_all: pass {seq} complete for {project_id} — "
+          f"fixed {fixed}, remaining {len(post_findings)}, "
+          f"regressions {regressions}", flush=True)
+
+
+# ---------------------------------------------------------------------------
 # Registry. Add new handlers here.
 # ---------------------------------------------------------------------------
 
@@ -662,6 +874,7 @@ HANDLERS: dict[str, HandlerFn] = {
     "build_project": handle_build_project,
     "audit_project": handle_audit_project,
     "iterate_project": handle_iterate_project,
+    "fix_all": handle_fix_all,
 }
 
 

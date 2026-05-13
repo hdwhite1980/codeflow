@@ -4,6 +4,8 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { Download } from "lucide-react";
 
 import { CostSummary } from "@/components/cost-summary";
+import { FixAllButton } from "@/components/fix-all-button";
+import { FixAllHistory } from "@/components/fix-all-history";
 import { GraphView } from "@/components/graph-view";
 import { IterationHistory } from "@/components/iteration-history";
 import { IterationInput } from "@/components/iteration-input";
@@ -11,12 +13,14 @@ import { LiveIndicator } from "@/components/live-indicator";
 import { Badge } from "@/components/ui/badge";
 import {
   getAudits,
+  getFixAllPasses,
   getGraph,
   getIterations,
 } from "@/lib/api";
 import type {
   AuditResponse,
   AuditVerdict,
+  FixAllPass,
   GraphResponse,
   Iteration,
   UsageRow,
@@ -74,6 +78,13 @@ export function ProjectDetailClient({
   // UI show "running" state immediately on queue, before the next
   // /api/projects/<id>/iterations poll lands.
   const [inFlightSeqs, setInFlightSeqs] = useState<Set<number>>(new Set());
+  const [fixAllPasses, setFixAllPasses] = useState<FixAllPass[]>([]);
+  // True if a fix-all pass is in flight (either queued just now or
+  // still running on the worker). Derived from the passes list plus
+  // the most recent triggered seq.
+  const [fixAllInFlightSeqs, setFixAllInFlightSeqs] = useState<Set<number>>(
+    new Set(),
+  );
   const [refetchPending, setRefetchPending] = useState(false);
 
   // Initial graph fetch on mount.
@@ -108,10 +119,25 @@ export function ProjectDetailClient({
     };
   }, [projectId]);
 
-  // Refetch graph + audits + iterations. Called when WS events suggest
-  // the underlying ledger has changed in ways our local state can't fully
-  // reconcile. Coalesced so a burst of events doesn't cause a refetch
-  // per event.
+  // Initial fix-all passes fetch.
+  useEffect(() => {
+    let cancelled = false;
+    getFixAllPasses(projectId)
+      .then((res) => {
+        if (!cancelled) setFixAllPasses(res.passes);
+      })
+      .catch((err) => {
+        console.error("[detail] initial fix-all passes fetch failed:", err);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId]);
+
+  // Refetch graph + audits + iterations + fix-all passes. Called when
+  // WS events suggest the underlying ledger has changed in ways our
+  // local state can't fully reconcile. Coalesced so a burst of events
+  // doesn't cause a refetch per event.
   //
   // Defensive merge: we never replace a populated graph with one that
   // has FEWER file nodes. This is a hedge against an apparent issue
@@ -125,10 +151,11 @@ export function ProjectDetailClient({
     if (refetchPending) return;
     setRefetchPending(true);
     try {
-      const [g, au, it] = await Promise.allSettled([
+      const [g, au, it, fa] = await Promise.allSettled([
         getGraph(projectId),
         getAudits(projectId),
         getIterations(projectId),
+        getFixAllPasses(projectId),
       ]);
       if (g.status === "fulfilled") {
         setGraph((prev) => mergeGraphPreservingNodes(prev, g.value));
@@ -146,6 +173,22 @@ export function ProjectDetailClient({
           const remaining = new Set<number>();
           for (const seq of prev) {
             if (!completedSeqs.has(seq)) remaining.add(seq);
+          }
+          return remaining;
+        });
+      }
+      if (fa.status === "fulfilled") {
+        setFixAllPasses(fa.value.passes);
+        // Drop fix-all in-flight seqs whose passes are now complete.
+        setFixAllInFlightSeqs((prev) => {
+          const completed = new Set(
+            fa.value.passes
+              .filter((x) => x.status === "complete")
+              .map((x) => x.seq),
+          );
+          const remaining = new Set<number>();
+          for (const seq of prev) {
+            if (!completed.has(seq)) remaining.add(seq);
           }
           return remaining;
         });
@@ -291,6 +334,40 @@ export function ProjectDetailClient({
     [scheduleRefetch],
   );
 
+  // Fix-all trigger handler. Mirrors onIterationQueued: optimistic
+  // marker + scheduled refetch so the user sees feedback immediately.
+  const onFixAllTriggered = useCallback(
+    (seq: number) => {
+      setFixAllInFlightSeqs((prev) => {
+        const next = new Set(prev);
+        next.add(seq);
+        return next;
+      });
+      const placeholder: FixAllPass = {
+        seq,
+        status: "running",
+        issue_count: 0,
+        files_affected: 0,
+        started_at: Date.now() / 1000,
+        completed_at: null,
+        pre_count: null,
+        post_count: null,
+        fixed: null,
+        regressions: null,
+        report: null,
+      };
+      setFixAllPasses((prev) => {
+        const idx = prev.findIndex((p) => p.seq === seq);
+        if (idx === -1) return [placeholder, ...prev];
+        const out = [...prev];
+        out[idx] = placeholder;
+        return out;
+      });
+      scheduleRefetch();
+    },
+    [scheduleRefetch],
+  );
+
   if (initialError && !graph) {
     return (
       <div className="rounded-md border border-red-900/40 bg-red-950/30 p-4 text-sm text-red-300">
@@ -301,6 +378,8 @@ export function ProjectDetailClient({
 
   const anyIterationRunning = inFlightSeqs.size > 0
     || iterations.some((it) => it.status === "running");
+  const fixAllRunning = fixAllInFlightSeqs.size > 0
+    || fixAllPasses.some((p) => p.status === "running");
 
   return (
     <div className="space-y-4">
@@ -316,6 +395,11 @@ export function ProjectDetailClient({
         <div className="flex items-center gap-3">
           <BuildPhaseBadge graph={graph} audits={audits} />
           <LiveIndicator state={streamState} />
+          <FixAllButton
+            projectId={projectId}
+            onTriggered={onFixAllTriggered}
+            inFlight={fixAllRunning}
+          />
           <a
             href={`${process.env.NEXT_PUBLIC_API_URL?.replace(/\/$/, "")}/api/projects/${encodeURIComponent(projectId)}/download`}
             download
@@ -331,10 +415,11 @@ export function ProjectDetailClient({
       <GraphView graph={graph} verdictsByPath={verdictsByPath} />
 
       {/* Iteration history pinned to the right edge above the side panel.
-          Sits to the left of the side panel's slide-in space so the two
-          don't fight for screen real estate. */}
-      <div className="pointer-events-none fixed right-6 top-20 z-20 w-72">
-        <div className="pointer-events-auto max-h-[60vh] overflow-y-auto">
+          Fix-all passes appear above iterations because they're "bigger"
+          events (more cost, more scope, more user attention warranted). */}
+      <div className="pointer-events-none fixed right-6 top-20 z-20 w-80">
+        <div className="pointer-events-auto max-h-[60vh] space-y-3 overflow-y-auto">
+          <FixAllHistory passes={fixAllPasses} />
           <IterationHistory
             iterations={iterations}
             inFlightSeqs={inFlightSeqs}

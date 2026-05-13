@@ -17,6 +17,9 @@ import type {
   AuditResponse,
   CreateProjectRequest,
   CreateProjectResponse,
+  FixAllEstimate,
+  FixAllPassesResponse,
+  FixAllResponse,
   GraphResponse,
   Iteration,
   IterateRequest,
@@ -147,6 +150,33 @@ export async function getIterations(
 ): Promise<IterationListResponse> {
   return getJSON<IterationListResponse>(
     `/api/projects/${encodeURIComponent(projectId)}/iterations`,
+  );
+}
+
+// -- Fix-all --------------------------------------------------------
+
+export async function getFixAllEstimate(
+  projectId: string,
+): Promise<FixAllEstimate> {
+  return getJSON<FixAllEstimate>(
+    `/api/projects/${encodeURIComponent(projectId)}/fix-all/estimate`,
+  );
+}
+
+export async function triggerFixAll(
+  projectId: string,
+): Promise<FixAllResponse> {
+  return postJSON<Record<string, never>, FixAllResponse>(
+    `/api/projects/${encodeURIComponent(projectId)}/fix-all`,
+    {},
+  );
+}
+
+export async function getFixAllPasses(
+  projectId: string,
+): Promise<FixAllPassesResponse> {
+  return getJSON<FixAllPassesResponse>(
+    `/api/projects/${encodeURIComponent(projectId)}/fix-all/passes`,
   );
 }
 

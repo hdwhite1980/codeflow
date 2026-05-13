@@ -917,6 +917,115 @@ async def download_project(project_id: str):
 
 
 # ---------------------------------------------------------------------------
+# Fix-all — user-triggered "fix everything the auditors flagged" pass.
+# ---------------------------------------------------------------------------
+
+@app.get("/api/projects/{project_id}/fix-all/estimate")
+async def fix_all_estimate(project_id: str) -> dict[str, Any]:
+    """Show the user what a fix-all pass will cost before they confirm.
+
+    Reads current audit_verdict entries, counts findings, returns an
+    estimate range. Cheap operation — no LLM calls — so safe to call
+    on button click without confirmation.
+    """
+    from fix_all_pipeline import estimate_fix_all_cost
+    store: LedgerStore = app.state.store
+    return estimate_fix_all_cost(store, project_id)
+
+
+class FixAllRequest(BaseModel):
+    """Empty for now; reserved for future severity filters."""
+    # Future fields: severities, max_findings, etc. Keeping the body
+    # explicit so adding new options doesn't break the API contract.
+    pass
+
+
+class FixAllResponse(BaseModel):
+    project_id: str
+    fix_all_seq: int
+    status: str
+
+
+@app.post("/api/projects/{project_id}/fix-all", response_model=FixAllResponse)
+async def trigger_fix_all(
+    project_id: str, _req: FixAllRequest = FixAllRequest(),
+) -> FixAllResponse:
+    """Queue a fix-all job.
+
+    Returns immediately with the assigned fix_all_seq. The actual work
+    (iteration + audit + report) runs on the worker. Frontend polls
+    /iterations and the project's artifacts to see progress.
+    """
+    from fix_all_pipeline import next_fix_all_seq
+    store: LedgerStore = app.state.store
+    queue: JobQueue = app.state.queue
+
+    seq = next_fix_all_seq(store, project_id)
+
+    await queue.enqueue(make_job(
+        "fix_all",
+        project_id=project_id,
+    ))
+
+    return FixAllResponse(
+        project_id=project_id, fix_all_seq=seq, status="queued",
+    )
+
+
+@app.get("/api/projects/{project_id}/fix-all/passes")
+async def list_fix_all_passes(project_id: str) -> dict[str, Any]:
+    """Return all fix-all passes for the project, newest first.
+
+    Each pass has up to two ledger artifacts:
+      - fix_all:<seq>:started  (always present once queued)
+      - fix_all:<seq>:report   (present once finished)
+    """
+    store: LedgerStore = app.state.store
+    entries = store.all_current(project_id, ArtifactKind.DECISION_RECORD)
+
+    by_seq: dict[int, dict[str, Any]] = {}
+    for e in entries:
+        if not e.artifact_key.startswith("fix_all:"):
+            continue
+        parts = e.artifact_key.split(":")
+        if len(parts) != 3:
+            continue
+        try:
+            seq = int(parts[1])
+        except ValueError:
+            continue
+        phase = parts[2]
+        slot = by_seq.setdefault(seq, {})
+        try:
+            blob, _ = store.get_blob(e.blob_sha256)
+            body = json.loads(blob.decode("utf-8")) if blob else {}
+        except Exception:
+            body = {}
+        slot[phase] = body
+
+    passes = []
+    for seq in sorted(by_seq.keys(), reverse=True):
+        slot = by_seq[seq]
+        started = slot.get("started", {})
+        report = slot.get("report")
+        passes.append({
+            "seq": seq,
+            "status": "complete" if report else "running",
+            "issue_count": started.get("issue_count", 0),
+            "files_affected": started.get("files_affected", 0),
+            "started_at": started.get("started_at"),
+            "completed_at": (report or {}).get("completed_at"),
+            "pre_count": (report or {}).get("pre_count"),
+            "post_count": (report or {}).get("post_count"),
+            "fixed": (report or {}).get("fixed"),
+            "regressions": (report or {}).get("regressions"),
+            "report": (report or {}).get("report"),
+        })
+
+    return {"project_id": project_id, "passes": passes, "count": len(passes)}
+
+
+# ---------------------------------------------------------------------------
 # Impact analysis endpoints
 # ---------------------------------------------------------------------------
 
