@@ -408,6 +408,392 @@ def build_pipeline_context(
 
 
 # ---------------------------------------------------------------------------
+# Risk analyzer — the customer-visible "what breaks if I change X?" feature.
+# ---------------------------------------------------------------------------
+#
+# This is the read-time intelligence that justifies the guardian to a
+# customer. The structural graph alone can answer "12 callers depend on
+# this column"; the risk analyzer combines that with semantic summaries
+# of those callers to produce an actual risk assessment that mentions
+# specific files and specific concerns.
+#
+# Pluggable model: defaults to local Ollama (privacy preserved), but
+# accepts any client implementing .complete(prompt, *, system, max_tokens,
+# temperature) — including AnthropicClient for customers who opt in to
+# frontier-quality answers.
+
+
+# Severity ladder used in risk assessments. Aligns with audit severities
+# (critical/warning/nit) but adds "low" because risk queries cover a
+# wider range than audit findings do — many changes are obviously safe.
+_RISK_SEVERITIES = ["low", "medium", "high", "critical"]
+
+
+@dataclass(frozen=True)
+class RiskConcern:
+    """One specific risk the analyzer flagged about a change.
+
+    `path` is the file (or other artifact) where the concern lives.
+    `reason` is one sentence explaining why this matters. Concerns are
+    enumerated separately from the narratives so the frontend can render
+    them as clickable chips that link back to specific files.
+    """
+    path: str
+    reason: str
+    severity: str  # one of _RISK_SEVERITIES
+
+
+@dataclass(frozen=True)
+class RiskAssessment:
+    """The structured answer to a 'what breaks if I change X?' question.
+
+    Has both plain_narrative (customer-facing, no jargon) and
+    technical_narrative (engineer-facing, dense) per Hugh's spec for
+    guardian outputs. The frontend renders plain by default with
+    technical one click away.
+
+    `confidence` reflects how confident the model says it is. Important
+    because:
+      - new projects have sparse graphs and shallow summaries
+      - some questions are inherently underspecified
+      - the model itself can be wrong
+    Customers see a low-confidence answer and know to verify manually.
+    """
+    target: str
+    change_description: str
+    severity: str                    # overall: highest concern severity
+    plain_narrative: str             # 2-3 sentences for non-engineers
+    technical_narrative: str         # paragraph for engineers
+    affected_paths: list[str]        # files in the structural impact set
+    concerns: list[RiskConcern]      # specific risks, each tied to a path
+    suggested_sequencing: list[str]  # ordered steps if applicable
+    confidence: float                # 0.0-1.0
+    analyzer_model: str              # which model produced this
+    input_tokens: int
+    output_tokens: int
+    indexed_summary_count: int       # how many summaries informed this
+
+
+_RISK_SYSTEM_PROMPT = """You are the guardian: a code-understanding AI that helps engineers reason about proposed changes to a codebase.
+
+A user is proposing a change and asking what could break. You receive:
+  - The target of the change (a file path, table name, function name, etc.)
+  - A description of what they want to do
+  - The structural impact set: every artifact that transitively depends on the target
+  - Semantic summaries of those artifacts (what each file does, what it touches, what it assumes, what its failure modes are)
+
+Your output must be STRICT JSON with this schema:
+
+{
+  "severity": "low|medium|high|critical",
+  "plain_narrative": "2-3 sentences a non-engineer leader could understand",
+  "technical_narrative": "1 paragraph with specifics — function names, types, sequencing concerns",
+  "affected_paths": ["paths most likely to need changes"],
+  "concerns": [
+    {"path": "<path>", "reason": "<one sentence>", "severity": "low|medium|high|critical"}
+  ],
+  "suggested_sequencing": ["ordered steps to do this change safely, OR empty array if no specific order matters"],
+  "confidence": 0.0
+}
+
+Rules:
+- plain_narrative: NO jargon. NO function names. Reads like an explanation to a non-coder.
+- technical_narrative: USE jargon. Mention specific function/class/column names from the summaries provided.
+- concerns: 0-10 items. Each one's path MUST come from the affected_paths list or be the target itself.
+- suggested_sequencing: include ONLY if there's a real ordering risk (migrations before code, schemas before queries, etc.). Otherwise empty array.
+- confidence: a real number between 0.0 and 1.0. Lower it when the graph is sparse, the summaries are shallow, or the question is ambiguous.
+- severity at the top is the SAME as the highest individual concern severity (or "low" if no concerns).
+- Output ONLY the JSON object. No markdown fences, no commentary, no preamble.
+"""
+
+
+def _build_risk_prompt(
+    *,
+    target: str,
+    change_description: str,
+    impact_set: list[str],
+    summaries: dict[str, dict[str, Any]],
+) -> str:
+    """Render the user prompt for a risk-analysis call.
+
+    We give the model:
+      1. The change in plain terms
+      2. The structural impact list — paths that depend on the target
+      3. Semantic summaries (purpose, touches, assumes, failure_modes,
+         risk_notes) for each affected file we have summaries for
+
+    Files in the impact set that we DON'T have summaries for are still
+    listed — the model should note that its assessment is partial.
+    """
+    lines = [
+        f"Target of the change: {target}",
+        f"Change description: {change_description}",
+        "",
+        f"Structural impact set ({len(impact_set)} artifacts depend on the target):",
+    ]
+    if not impact_set:
+        lines.append("  (none — nothing in the graph currently depends on this target)")
+    else:
+        for path in impact_set[:50]:  # cap so the prompt doesn't explode
+            lines.append(f"  - {path}")
+        if len(impact_set) > 50:
+            lines.append(f"  ... and {len(impact_set) - 50} more (truncated)")
+    lines.append("")
+    lines.append("Semantic context for affected artifacts:")
+    if not summaries:
+        lines.append("  (no semantic summaries available — assessment will be"
+                     " structural only; lower your confidence accordingly)")
+    else:
+        for path, summary in sorted(summaries.items()):
+            purpose = summary.get("purpose", "")
+            touches = summary.get("touches", []) or []
+            assumes = summary.get("assumes", []) or []
+            failure_modes = summary.get("failure_modes", []) or []
+            risk_notes = summary.get("risk_notes", []) or []
+            lines.append(f"\n  ## {path}")
+            if purpose:
+                lines.append(f"    Purpose: {purpose}")
+            if touches:
+                lines.append(f"    Touches: {'; '.join(touches[:6])}")
+            if assumes:
+                lines.append(f"    Assumes: {'; '.join(assumes[:6])}")
+            if failure_modes:
+                lines.append(f"    Failure modes: {'; '.join(failure_modes[:6])}")
+            if risk_notes:
+                lines.append(f"    Existing risk notes: {'; '.join(risk_notes[:4])}")
+    lines.append("")
+    lines.append("Produce the structured JSON risk assessment.")
+    return "\n".join(lines)
+
+
+async def analyze_change_risk(
+    *,
+    store: "LedgerStore",
+    project_id: str,
+    target: str,
+    change_description: str,
+    client: Any,  # OllamaClient or AnthropicClient — anything with .complete
+) -> RiskAssessment:
+    """Produce a structured risk assessment for a proposed change.
+
+    `target` is the artifact_key being changed. For files this is
+    "file:<project_id>:<path>"; the function also accepts a bare path
+    and adds the prefix. For database columns it's "db_column:<table>.<col>".
+    Any artifact_key the graph knows about works.
+
+    `client` is the LLM client. Local Ollama is the default; Claude can
+    be used for customers who opt in to frontier-quality answers via the
+    GUARDIAN_RISK_MODEL config flag. We don't care which one — both
+    implement the same .complete() interface.
+
+    Raises if the model returns unparseable output or the LLM call fails.
+    Callers should write a DECISION_RECORD ledger entry capturing both
+    the question and the answer for audit-trail purposes.
+    """
+    # Normalize target: accept bare paths and add the file: prefix.
+    if not target.startswith(("file:", "spec_entity:", "db_column:",
+                              "db_table:", "spec_route:", "spec_contract:",
+                              "function_symbol:", "feature:")):
+        target_key = f"file:{project_id}:{target}"
+    else:
+        target_key = target
+
+    # Step 1: structural impact walk.
+    try:
+        impact_keys = store.impact_set(project_id, target_key)
+    except Exception as exc:
+        # If the graph query fails, we can still produce an assessment
+        # from the target's own summary. Log and continue.
+        print(f"[guardian:risk] impact walk failed for {target_key}: "
+              f"{type(exc).__name__}: {exc}", flush=True)
+        impact_keys = set()
+
+    # Convert artifact_keys back to readable paths for the prompt and
+    # the response. For file artifacts the path is everything after
+    # `file:<project_id>:`; for others we use the artifact_key as-is.
+    impact_paths: list[str] = []
+    for k in sorted(impact_keys):
+        if k.startswith(f"file:{project_id}:"):
+            impact_paths.append(k[len(f"file:{project_id}:"):])
+        else:
+            impact_paths.append(k)
+
+    # Step 2: semantic context. We pull summaries for the target (if it's
+    # a file) AND every file in the impact set. Non-file artifacts won't
+    # have semantic summaries; that's expected.
+    all_summaries = load_file_summaries(store, project_id)
+    by_path: dict[str, dict[str, Any]] = {
+        s.get("file_path", ""): s for s in all_summaries if s.get("file_path")
+    }
+    # Resolve target back to a path for summary lookup
+    target_path = (
+        target_key[len(f"file:{project_id}:"):]
+        if target_key.startswith(f"file:{project_id}:")
+        else target_key
+    )
+
+    relevant_summaries: dict[str, dict[str, Any]] = {}
+    if target_path in by_path:
+        relevant_summaries[target_path] = by_path[target_path]
+    for p in impact_paths:
+        if p in by_path:
+            relevant_summaries[p] = by_path[p]
+
+    # Step 3: prompt the model.
+    prompt = _build_risk_prompt(
+        target=target_path,
+        change_description=change_description,
+        impact_set=impact_paths,
+        summaries=relevant_summaries,
+    )
+    result = await client.complete(
+        prompt,
+        system=_RISK_SYSTEM_PROMPT,
+        max_tokens=2000,
+        temperature=0.1,
+    )
+
+    parsed = _parse_summary_json(result.text)  # tolerant parser, same as file summaries
+    concerns_raw = parsed.get("concerns") or []
+    concerns: list[RiskConcern] = []
+    for c in concerns_raw[:10]:
+        if not isinstance(c, dict): continue
+        sev = str(c.get("severity", "medium")).lower()
+        if sev not in _RISK_SEVERITIES: sev = "medium"
+        concerns.append(RiskConcern(
+            path=str(c.get("path", ""))[:200],
+            reason=str(c.get("reason", ""))[:500],
+            severity=sev,
+        ))
+
+    severity = str(parsed.get("severity", "low")).lower()
+    if severity not in _RISK_SEVERITIES: severity = "low"
+
+    # Coerce confidence to a valid float in [0,1].
+    try:
+        confidence = float(parsed.get("confidence", 0.5))
+    except (TypeError, ValueError):
+        confidence = 0.5
+    confidence = max(0.0, min(1.0, confidence))
+
+    return RiskAssessment(
+        target=target_path,
+        change_description=change_description,
+        severity=severity,
+        plain_narrative=str(parsed.get("plain_narrative", ""))[:1500],
+        technical_narrative=str(parsed.get("technical_narrative", ""))[:4000],
+        affected_paths=impact_paths,
+        concerns=concerns,
+        suggested_sequencing=_coerce_string_list(
+            parsed.get("suggested_sequencing"), max_items=10,
+        ),
+        confidence=confidence,
+        analyzer_model=result.model,
+        input_tokens=result.input_tokens,
+        output_tokens=result.output_tokens,
+        indexed_summary_count=len(relevant_summaries),
+    )
+
+
+def write_risk_assessment(
+    store: "LedgerStore",
+    project_id: str,
+    assessment: RiskAssessment,
+    *,
+    seq: int,
+) -> None:
+    """Persist a RiskAssessment as a DECISION_RECORD ledger entry.
+
+    The audit trail records both the question (target + change_description)
+    and the answer (severity + narratives + concerns + confidence). This
+    is the compliance story for regulated customers: "the guardian
+    flagged this on date X; the team proceeded anyway because Y."
+
+    `seq` is the project-scoped risk query sequence number — each query
+    gets a fresh integer so the audit history reads chronologically.
+    """
+    body = {
+        "target": assessment.target,
+        "change_description": assessment.change_description,
+        "severity": assessment.severity,
+        "plain_narrative": assessment.plain_narrative,
+        "technical_narrative": assessment.technical_narrative,
+        "affected_paths": assessment.affected_paths,
+        "concerns": [
+            {"path": c.path, "reason": c.reason, "severity": c.severity}
+            for c in assessment.concerns
+        ],
+        "suggested_sequencing": assessment.suggested_sequencing,
+        "confidence": assessment.confidence,
+        "analyzer_model": assessment.analyzer_model,
+        "input_tokens": assessment.input_tokens,
+        "output_tokens": assessment.output_tokens,
+        "indexed_summary_count": assessment.indexed_summary_count,
+        "asked_at": time.time(),
+    }
+    store.write_entry(
+        project_id=project_id,
+        tier=Tier.SPEC,
+        artifact_kind=ArtifactKind.DECISION_RECORD,
+        artifact_key=f"guardian:risk:{seq}",
+        body=body,
+        rationale=(
+            f"Guardian risk query #{seq}: "
+            f"{assessment.target} — {assessment.change_description[:100]} "
+            f"[severity={assessment.severity}, "
+            f"confidence={assessment.confidence:.2f}]"
+        ),
+        author=f"guardian:risk:{assessment.analyzer_model}",
+    )
+
+
+def list_risk_assessments(
+    store: "LedgerStore", project_id: str,
+) -> list[dict[str, Any]]:
+    """Return all guardian risk-query history for a project, newest first.
+
+    Used by the frontend's risk-history panel — users can revisit prior
+    questions and see how their understanding of risk evolved over time.
+    """
+    decisions = store.all_current(project_id, ArtifactKind.DECISION_RECORD)
+    out: list[dict[str, Any]] = []
+    for d in decisions:
+        if not d.artifact_key.startswith("guardian:risk:"):
+            continue
+        try:
+            blob, _ = store.get_blob(d.blob_sha256)
+            body = json.loads(blob.decode("utf-8")) if blob else {}
+            body["seq"] = int(d.artifact_key.split(":")[-1])
+            out.append(body)
+        except Exception as exc:
+            print(f"[guardian:risk] failed to load {d.artifact_key}: "
+                  f"{type(exc).__name__}: {exc}", flush=True)
+            continue
+    # Newest first by `asked_at`; fall back to seq when missing.
+    out.sort(key=lambda b: (b.get("asked_at", 0), b.get("seq", 0)), reverse=True)
+    return out
+
+
+def next_risk_seq(store: "LedgerStore", project_id: str) -> int:
+    """Allocate the next risk query sequence number for a project.
+
+    Counts existing guardian:risk:* decision records. Not strictly
+    contention-safe — two simultaneous risk queries could allocate the
+    same seq. In practice risk queries are user-initiated and serialized
+    by the frontend, so this is fine. If it becomes a real problem we
+    add a SELECT FOR UPDATE pattern.
+    """
+    decisions = store.all_current(project_id, ArtifactKind.DECISION_RECORD)
+    existing = [
+        int(d.artifact_key.split(":")[-1])
+        for d in decisions
+        if d.artifact_key.startswith("guardian:risk:")
+        and d.artifact_key.split(":")[-1].isdigit()
+    ]
+    return (max(existing) + 1) if existing else 1
+
+
+# ---------------------------------------------------------------------------
 # Helpers.
 # ---------------------------------------------------------------------------
 

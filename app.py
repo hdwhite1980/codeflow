@@ -26,6 +26,7 @@ import hashlib
 import hmac
 import json
 import os
+import time
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
@@ -1131,6 +1132,191 @@ async def guardian_status(project_id: str) -> dict[str, Any]:
             else (True if summaries else None)
         ),
     }
+
+
+# ---------------------------------------------------------------------------
+# Guardian risk analyzer — "what breaks if I change X?"
+# ---------------------------------------------------------------------------
+#
+# Runs synchronously in the web request because:
+#   1. Customers expect an interactive feel — paste a question, get an
+#      answer in seconds (Claude) or under two minutes (local Ollama).
+#   2. The expected latency fits within our reverse proxy timeout (5 min).
+#   3. Queueing adds complexity (poll for completion) without enough
+#      benefit at the volumes we expect.
+#
+# Model choice
+# ------------
+# Default: local Ollama (privacy preserved, code stays in customer perimeter).
+# Opt-in: GUARDIAN_RISK_MODEL=claude env var routes to Anthropic instead.
+# We construct the chosen client per-request rather than holding it on
+# app.state so the choice can change without a restart, and so the
+# Ollama client we already build on app.state for guardian indexing
+# isn't reused with a different timeout/auth.
+
+class RiskQueryRequest(BaseModel):
+    # The artifact being changed. Accepts a bare file path
+    # ("app/models.py") OR a fully-qualified artifact_key
+    # ("file:<uuid>:app/models.py" or "db_column:users.email"). Bare paths
+    # get auto-prefixed with `file:<project_id>:`.
+    target: str = Field(..., min_length=1, max_length=500)
+    # Free-text description of the proposed change. Customers write
+    # things like "drop the legacy_username column" or "rename the
+    # convert_csv function to parse_csv".
+    change_description: str = Field(..., min_length=5, max_length=2000)
+
+
+class RiskConcernResponse(BaseModel):
+    path: str
+    reason: str
+    severity: str
+
+
+class RiskAssessmentResponse(BaseModel):
+    seq: int                                  # this query's audit-trail seq
+    project_id: str
+    target: str
+    change_description: str
+    severity: str
+    plain_narrative: str
+    technical_narrative: str
+    affected_paths: list[str]
+    concerns: list[RiskConcernResponse]
+    suggested_sequencing: list[str]
+    confidence: float
+    analyzer_model: str
+    indexed_summary_count: int
+    asked_at: float
+
+
+def _make_risk_client() -> Any:
+    """Construct the LLM client to use for this risk query.
+
+    Pluggable: defaults to Ollama (privacy-preserving local model);
+    GUARDIAN_RISK_MODEL=claude env routes to Anthropic frontier model
+    for faster, higher-quality answers when privacy isn't a concern.
+
+    Raised HTTPException is caught by FastAPI and returned as 503 to
+    the frontend, which renders a "guardian unavailable" message
+    rather than a generic 500.
+    """
+    choice = os.environ.get("GUARDIAN_RISK_MODEL", "ollama").lower()
+    if choice == "claude":
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if not api_key:
+            raise HTTPException(
+                status_code=503,
+                detail="GUARDIAN_RISK_MODEL=claude but ANTHROPIC_API_KEY not set",
+            )
+        from anthropic_client import AnthropicClient
+        return AnthropicClient(api_key=api_key)
+    # Default: local Ollama.
+    if not os.environ.get("OLLAMA_BASE_URL"):
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Guardian risk analyzer is not configured. Either set "
+                "OLLAMA_BASE_URL (for local model) or "
+                "GUARDIAN_RISK_MODEL=claude (with ANTHROPIC_API_KEY)."
+            ),
+        )
+    from ollama_client import OllamaClient
+    return OllamaClient()
+
+
+@app.post(
+    "/api/projects/{project_id}/risk",
+    response_model=RiskAssessmentResponse,
+)
+async def analyze_risk(
+    project_id: str, req: RiskQueryRequest,
+) -> RiskAssessmentResponse:
+    """Ask the guardian what breaks if a proposed change goes through.
+
+    Synchronous: returns the assessment in the response. Records the
+    full assessment as a DECISION_RECORD ledger entry for audit-trail
+    purposes — customers can revisit the question and answer later via
+    the history endpoint.
+
+    Latency depends on the model:
+      - Claude: 3-8 seconds typical
+      - Ollama 7b on GPU: 5-15 seconds
+      - Ollama 7b on CPU: 30-120 seconds
+      - Ollama 14b on CPU: 60-180 seconds
+
+    If the assessment fails (model unreachable, parsing error after
+    retries, etc.) we return 503. The frontend shows the failure
+    plainly so users can retry or escalate to a different model.
+    """
+    from guardian_pipeline import (
+        analyze_change_risk, write_risk_assessment, next_risk_seq,
+    )
+    store: LedgerStore = app.state.store
+
+    client = _make_risk_client()
+    try:
+        assessment = await analyze_change_risk(
+            store=store,
+            project_id=project_id,
+            target=req.target,
+            change_description=req.change_description,
+            client=client,
+        )
+    except Exception as exc:
+        # Make sure the client is closed even on failure paths.
+        close = getattr(client, "aclose", None)
+        if close is not None:
+            try: await close()
+            except Exception: pass
+        print(f"[risk] analysis failed for project {project_id}: "
+              f"{type(exc).__name__}: {exc}", flush=True)
+        raise HTTPException(
+            status_code=503,
+            detail=f"Risk analysis failed: {type(exc).__name__}: {exc}",
+        )
+    finally:
+        close = getattr(client, "aclose", None)
+        if close is not None:
+            try: await close()
+            except Exception: pass
+
+    seq = next_risk_seq(store, project_id)
+    write_risk_assessment(store, project_id, assessment, seq=seq)
+
+    return RiskAssessmentResponse(
+        seq=seq,
+        project_id=project_id,
+        target=assessment.target,
+        change_description=assessment.change_description,
+        severity=assessment.severity,
+        plain_narrative=assessment.plain_narrative,
+        technical_narrative=assessment.technical_narrative,
+        affected_paths=assessment.affected_paths,
+        concerns=[
+            RiskConcernResponse(
+                path=c.path, reason=c.reason, severity=c.severity,
+            ) for c in assessment.concerns
+        ],
+        suggested_sequencing=assessment.suggested_sequencing,
+        confidence=assessment.confidence,
+        analyzer_model=assessment.analyzer_model,
+        indexed_summary_count=assessment.indexed_summary_count,
+        asked_at=time.time(),
+    )
+
+
+@app.get("/api/projects/{project_id}/risks")
+async def list_risks(project_id: str) -> dict[str, Any]:
+    """Return prior risk-query history for a project, newest first.
+
+    Each entry is a full RiskAssessment body — the frontend can render
+    history as collapsible cards. Empty list when no risk queries have
+    been asked yet for this project.
+    """
+    from guardian_pipeline import list_risk_assessments
+    store: LedgerStore = app.state.store
+    risks = list_risk_assessments(store, project_id)
+    return {"project_id": project_id, "risks": risks, "count": len(risks)}
 
 
 # ---------------------------------------------------------------------------

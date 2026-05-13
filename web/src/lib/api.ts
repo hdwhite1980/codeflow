@@ -26,6 +26,9 @@ import type {
   IterateResponse,
   IterationListResponse,
   ProjectListResponse,
+  RiskAssessment,
+  RiskQueryRequest,
+  RiskListResponse,
   UsageSummary,
 } from "./types";
 
@@ -177,6 +180,30 @@ export async function getFixAllPasses(
 ): Promise<FixAllPassesResponse> {
   return getJSON<FixAllPassesResponse>(
     `/api/projects/${encodeURIComponent(projectId)}/fix-all/passes`,
+  );
+}
+
+// -- Guardian risk analyzer ----------------------------------------
+//
+// Risk queries run synchronously on the backend (response can take
+// 30s-2min depending on model). The frontend should show a loading
+// state and accept that the call can take a while. Failures come back
+// as 503 with detail; we surface them to the user without retry.
+
+export async function askRisk(
+  projectId: string, req: RiskQueryRequest,
+): Promise<RiskAssessment> {
+  return postJSON<RiskQueryRequest, RiskAssessment>(
+    `/api/projects/${encodeURIComponent(projectId)}/risk`,
+    req,
+  );
+}
+
+export async function getRiskHistory(
+  projectId: string,
+): Promise<RiskListResponse> {
+  return getJSON<RiskListResponse>(
+    `/api/projects/${encodeURIComponent(projectId)}/risks`,
   );
 }
 

@@ -10,6 +10,8 @@ import { GraphView } from "@/components/graph-view";
 import { IterationHistory } from "@/components/iteration-history";
 import { IterationInput } from "@/components/iteration-input";
 import { LiveIndicator } from "@/components/live-indicator";
+import { RiskAnalyzer } from "@/components/risk-analyzer";
+import { RiskHistory } from "@/components/risk-history";
 import { Badge } from "@/components/ui/badge";
 import {
   getAudits,
@@ -86,6 +88,10 @@ export function ProjectDetailClient({
     new Set(),
   );
   const [refetchPending, setRefetchPending] = useState(false);
+  // Bumped every time a new risk assessment lands so RiskHistory refetches.
+  // We can't use the WebSocket for this because risk queries are sync
+  // (no ledger_entry event flows through the event bus in time).
+  const [riskRefreshKey, setRiskRefreshKey] = useState(0);
 
   // Initial graph fetch on mount.
   useEffect(() => {
@@ -424,6 +430,21 @@ export function ProjectDetailClient({
             iterations={iterations}
             inFlightSeqs={inFlightSeqs}
           />
+        </div>
+      </div>
+
+      {/* Guardian risk panel — left-edge slide-out below the cost ticker.
+          Lives separately from iteration/fix-all because risk queries are
+          a different kind of action (read-only reasoning, not generation).
+          We collapse the analyzer when not in use so the cost ticker
+          stays prominent. */}
+      <div className="pointer-events-none fixed left-6 top-20 z-20 w-96">
+        <div className="pointer-events-auto max-h-[60vh] space-y-3 overflow-y-auto">
+          <RiskAnalyzer
+            projectId={projectId}
+            onAssessment={() => setRiskRefreshKey((k) => k + 1)}
+          />
+          <RiskHistory projectId={projectId} refreshKey={riskRefreshKey} />
         </div>
       </div>
 

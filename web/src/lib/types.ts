@@ -364,3 +364,41 @@ export interface FixAllPassesResponse {
   passes: FixAllPass[];
   count: number;
 }
+
+// -- Guardian risk analyzer ----------------------------------------
+
+export type RiskSeverity = "low" | "medium" | "high" | "critical";
+
+export interface RiskConcern {
+  path: string;
+  reason: string;
+  severity: RiskSeverity;
+}
+
+export interface RiskQueryRequest {
+  target: string;
+  change_description: string;
+}
+
+export interface RiskAssessment {
+  seq: number;
+  project_id: string;
+  target: string;
+  change_description: string;
+  severity: RiskSeverity;
+  plain_narrative: string;
+  technical_narrative: string;
+  affected_paths: string[];
+  concerns: RiskConcern[];
+  suggested_sequencing: string[];
+  confidence: number;
+  analyzer_model: string;
+  indexed_summary_count: number;
+  asked_at: number;
+}
+
+export interface RiskListResponse {
+  project_id: string;
+  risks: RiskAssessment[];
+  count: number;
+}
