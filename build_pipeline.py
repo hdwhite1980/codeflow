@@ -263,6 +263,37 @@ def file_artifact_key(project_id: str, path: str) -> str:
     return f"file:{project_id}:{path}"
 
 
+def _load_service_refs(store: LedgerStore, project_id: str) -> list:
+    """Read SERVICE artifacts from the ledger and shape them for the
+    import_extractor's matching.
+
+    Returns a list of ServiceRef objects. We deliberately import
+    import_extractor inside the function to keep build_pipeline.py
+    importable even if import_extractor is missing (degraded mode:
+    builds still work, just no service edges).
+    """
+    try:
+        from import_extractor import make_service_refs
+    except ImportError:
+        return []
+    try:
+        entries = store.all_current(project_id, ArtifactKind.SERVICE)
+    except Exception as exc:
+        print(f"[build] couldn't load services for {project_id}: "
+              f"{type(exc).__name__}: {exc}", flush=True)
+        return []
+    services: list[dict] = []
+    for e in entries:
+        try:
+            blob, _ = store.get_blob(e.blob_sha256)
+            body = json.loads(blob.decode("utf-8"))
+            if isinstance(body, dict):
+                services.append(body)
+        except Exception:
+            continue
+    return make_service_refs(services)
+
+
 # ---------------------------------------------------------------------------
 # Pipeline.
 # ---------------------------------------------------------------------------
@@ -373,6 +404,17 @@ async def run_build(
     total_in = spec_tokens_in
     total_out = spec_tokens_out
 
+    # Load the project's external services once so we can detect file
+    # references to them during the per-file extraction loop. Each
+    # service was written to the ledger as an ArtifactKind.SERVICE entry
+    # at project creation; we read them back and shape them into the
+    # extractor's needle format.
+    service_refs = _load_service_refs(store, project_id)
+    # The set of *known* file paths for resolving imports. We only know
+    # about files in the spec; truncated specs may miss files, but the
+    # spec is the source of truth at this point in the pipeline.
+    known_files = {f.path for f in spec.files}
+
     for f in spec.files:
         try:
             content, tin, tout = await _generate_file(
@@ -381,6 +423,42 @@ async def run_build(
             )
             total_in += tin
             total_out += tout
+
+            # Extract references BEFORE writing so we can include the
+            # edge list in the write_entry call (one transaction, no
+            # races). If extraction crashes for any reason, we log and
+            # write the file without edges rather than failing the
+            # whole file generation.
+            file_imports: list[str] = []
+            service_uses: list[str] = []
+            try:
+                from import_extractor import extract_references
+                result = extract_references(
+                    file_path=f.path,
+                    content=content,
+                    known_files=known_files,
+                    service_refs=service_refs,
+                )
+                # Translate import paths to artifact_keys so the edges
+                # land on the right nodes in graph_edges.
+                file_imports = [
+                    file_artifact_key(project_id, p)
+                    for p in result.file_imports
+                ]
+                service_uses = result.service_uses
+            except Exception as exc:
+                print(f"[build] import extraction failed for {f.path}: "
+                      f"{type(exc).__name__}: {exc}; "
+                      f"writing file without edges", flush=True)
+
+            # Build the explicit_edges list. imports= covers file-to-file;
+            # service uses get their own explicit edges with the
+            # BINDS_ENV_VAR kind (the most specific kind for "file
+            # references a service via env var or URL").
+            explicit_edges: list[tuple[EdgeKind, str]] = []
+            for svc_key in service_uses:
+                explicit_edges.append((EdgeKind.BINDS_ENV_VAR, svc_key))
+
             store.write_entry(
                 project_id=project_id,
                 tier=Tier.GENERATION,
@@ -390,6 +468,8 @@ async def run_build(
                 rationale=f"Generated {f.path} via Anthropic from spec.",
                 author="anthropic:file",
                 implements=[spec_file_item_key(project_id, f.path)],
+                imports=file_imports or None,
+                explicit_edges=explicit_edges or None,
             )
             written.append(f.path)
         except AnthropicError as exc:
