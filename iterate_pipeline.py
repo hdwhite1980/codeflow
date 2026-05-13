@@ -332,6 +332,20 @@ async def _run_iteration_body(
     total_in = plan_in
     total_out = plan_out
 
+    # Pre-compute guardian context once for the whole iteration. The
+    # Builder will see paths + purposes + risk notes for every file in
+    # the project, not just bare paths. Empty string if no summaries
+    # exist yet — falls back to inventory-only context downstream.
+    # We exclude files currently being regenerated; their summary would
+    # be stale by the time the Builder writes the new version.
+    from guardian_pipeline import build_pipeline_context
+    being_changed = {c.path for c in plan.changes}
+    guardian_context = build_pipeline_context(
+        store, project_id,
+        focus_paths=sorted(being_changed),
+        exclude_paths=sorted(being_changed),
+    )
+
     # Phase 3a: regenerate changed files. Each gets the iteration prompt
     # baked into its system message plus the current file content as the
     # initial assistant turn.
@@ -345,6 +359,7 @@ async def _run_iteration_body(
                 inventory=inventory,
                 related_blobs=file_blobs,
                 related_paths=change_paths - {change.path},
+                guardian_context=guardian_context,
                 recorder=recorder,
             )
             total_in += tin
@@ -375,6 +390,7 @@ async def _run_iteration_body(
             content, tin, tout = await _generate_file(
                 spec=pseudo_spec, target=new_file, client=client,
                 project_id=project_id, recorder=recorder,
+                guardian_context=guardian_context,
             )
             total_in += tin
             total_out += tout
@@ -607,8 +623,18 @@ async def _regenerate_file(
     related_blobs: dict[str, str],
     related_paths: set[str],
     recorder: Optional[UsageRecorder],
+    guardian_context: str = "",
 ) -> tuple[str, int, int]:
-    """Ask the Builder to rewrite one file. Returns (new_content, in_tokens, out_tokens)."""
+    """Ask the Builder to rewrite one file. Returns (new_content, in_tokens, out_tokens).
+
+    `guardian_context` is an optional pre-formatted block of project-wide
+    semantic summaries from the guardian indexer (see
+    guardian_pipeline.build_pipeline_context). When present it's injected
+    into the prompt right after the bare inventory so the Builder can
+    reason about cross-file consequences without us loading every peer
+    file's full content. Empty string when guardian indexing hasn't run
+    for this project yet — prompt falls back to inventory-only context.
+    """
     other_files = "\n".join(
         f"  - {p}: {s}" for p, s in sorted(inventory.items()) if p != target_path
     ) or "  (no other files)"
@@ -625,13 +651,23 @@ async def _regenerate_file(
         )
     related_section = "".join(related_blocks) or "(no related files)"
 
+    # Guardian context goes between the bare file list and the
+    # full-content related files. The bare list anchors the Builder
+    # in the project shape; guardian context tells it what each peer
+    # actually does; related files give full detail for the ones
+    # being co-edited. Each layer adds more depth on a narrower scope.
+    guardian_section = (
+        f"\n\n{guardian_context}\n" if guardian_context else ""
+    )
+
     user_prompt = (
         f"User iteration request: {iteration_prompt}\n\n"
         f"Reason this file is changing: {change_reason}\n\n"
         f"--- CURRENT CONTENTS OF {target_path} ---\n"
         f"{current_content}\n"
         f"--- END ---\n\n"
-        f"Other files in the project:\n{other_files}\n\n"
+        f"Other files in the project:\n{other_files}"
+        f"{guardian_section}\n"
         f"Other files also being changed in this iteration:\n{related_section}\n\n"
         f"Output the complete new contents of `{target_path}`. "
         f"No markdown fences, no commentary."
@@ -716,6 +752,3 @@ def _write_outcome(
         ),
         author=f"worker:iterate:{iteration_seq}",
     )
-
-# DEPLOY_TAG: 20260513144443
-

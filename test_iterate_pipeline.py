@@ -343,6 +343,152 @@ class TestFullIterationFlow(unittest.TestCase):
         self.assertIn("/health", blob.decode("utf-8"))
 
 
+class TestGuardianContextIntegration(unittest.TestCase):
+    """Iteration must include guardian semantic summaries in the
+    regenerate-file prompt when summaries exist for the project.
+    This is the Turn A.5 wiring — the entire point of writing summaries
+    is to make existing pipelines use them."""
+
+    def test_regen_prompt_includes_guardian_context_when_summaries_exist(self):
+        import asyncio
+        from iterate_pipeline import run_iteration
+        from guardian_pipeline import FileSummary, write_file_summary
+
+        captured_prompts: list[str] = []
+
+        class FakeClient:
+            def __init__(self):
+                self.calls = 0
+
+            async def complete(self, prompt, *, system=None, max_tokens=4096, **kw):
+                from dataclasses import dataclass
+                self.calls += 1
+                captured_prompts.append(prompt)
+
+                @dataclass
+                class R:
+                    text: str
+                    model: str = "test"
+                    input_tokens: int = 100
+                    output_tokens: int = 50
+                    stop_reason: str = "end_turn"
+
+                if self.calls == 1:
+                    return R(text=(
+                        '{"rationale":"add health","changes":'
+                        '[{"path":"app/main.py","reason":"add /health"}],'
+                        '"new_files":[],"delete":[]}'
+                    ))
+                return R(text="print('new')")
+
+        store = InMemoryLedgerStore()
+        pid = store.create_project("test", "test")
+        # Seed two files in the project (one of which we'll iterate on).
+        store.write_entry(
+            project_id=pid, tier=Tier.GENERATION,
+            artifact_kind=ArtifactKind.FILE,
+            artifact_key=f"file:{pid}:app/main.py",
+            body="print('original')", rationale="entrypoint", author="seed",
+        )
+        store.write_entry(
+            project_id=pid, tier=Tier.GENERATION,
+            artifact_kind=ArtifactKind.FILE,
+            artifact_key=f"file:{pid}:app/db.py",
+            body="def get_conn(): ...", rationale="db", author="seed",
+        )
+        # Seed guardian summaries for both files.
+        for path, plain, purpose, risk in [
+            ("app/main.py", "HTTP entry point",
+             "FastAPI app bootstrap",
+             "No /healthz endpoint"),
+            ("app/db.py", "DB connection pool",
+             "Postgres async session factory",
+             "No tenant scoping enforced"),
+        ]:
+            write_file_summary(store, pid, FileSummary(
+                file_path=path, plain_english=plain, technical="t",
+                purpose=purpose, touches=[], assumes=[], failure_modes=[],
+                risk_notes=[risk],
+                indexed_at=0.0, indexer_model="m",
+                input_tokens=0, output_tokens=0,
+            ))
+
+        asyncio.run(run_iteration(
+            project_id=pid, iteration_prompt="add /health",
+            iteration_seq=1, store=store,
+            client=FakeClient(), recorder=None,
+        ))
+
+        # The regen prompt (call index 1) should contain the guardian
+        # context block with the *other* file's summary visible.
+        # (app/main.py is excluded — it's the file being regenerated.)
+        regen_prompt = captured_prompts[1]
+        self.assertIn("Project context", regen_prompt)
+        self.assertIn("app/db.py", regen_prompt)
+        self.assertIn("Postgres async session factory", regen_prompt)
+        # Risk note included.
+        self.assertIn("No tenant scoping", regen_prompt)
+        # The file being regenerated should NOT appear in the guardian
+        # context block (we exclude it explicitly to avoid stale summaries).
+        # It WILL appear elsewhere in the prompt as CURRENT CONTENTS — we
+        # just don't want it in the Project context block.
+        project_context_section = regen_prompt[
+            regen_prompt.index("Project context"):
+            regen_prompt.index("Other files also being changed")
+        ]
+        self.assertNotIn("HTTP entry point", project_context_section,
+            "Guardian context should exclude the file currently being regenerated")
+
+    def test_regen_prompt_no_guardian_block_when_no_summaries(self):
+        """No summaries = no Project context block in the prompt. The
+        old bare-paths-only format is preserved for un-indexed projects."""
+        import asyncio
+        from iterate_pipeline import run_iteration
+
+        captured_prompts: list[str] = []
+
+        class FakeClient:
+            def __init__(self): self.calls = 0
+            async def complete(self, prompt, *, system=None, max_tokens=4096, **kw):
+                from dataclasses import dataclass
+                self.calls += 1
+                captured_prompts.append(prompt)
+
+                @dataclass
+                class R:
+                    text: str
+                    model: str = "test"
+                    input_tokens: int = 100
+                    output_tokens: int = 50
+                    stop_reason: str = "end_turn"
+
+                if self.calls == 1:
+                    return R(text=(
+                        '{"rationale":"x","changes":'
+                        '[{"path":"app/main.py","reason":"y"}],'
+                        '"new_files":[],"delete":[]}'
+                    ))
+                return R(text="print('new')")
+
+        store = InMemoryLedgerStore()
+        pid = store.create_project("test", "test")
+        store.write_entry(
+            project_id=pid, tier=Tier.GENERATION,
+            artifact_kind=ArtifactKind.FILE,
+            artifact_key=f"file:{pid}:app/main.py",
+            body="x", rationale="entrypoint", author="seed",
+        )
+        asyncio.run(run_iteration(
+            project_id=pid, iteration_prompt="change it",
+            iteration_seq=1, store=store,
+            client=FakeClient(), recorder=None,
+        ))
+
+        regen_prompt = captured_prompts[1]
+        # Old format preserved when no guardian data exists.
+        self.assertNotIn("Project context (from guardian", regen_prompt)
+
+
 class TestPlanIterationCall(unittest.TestCase):
     """Catches parameter-shape mismatches with AnthropicClient.complete.
 

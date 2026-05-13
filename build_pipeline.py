@@ -586,6 +586,7 @@ async def _generate_file(
     *, spec: ProjectSpec, target: SpecFile, client: AnthropicClient,
     project_id: str,
     recorder: Optional[UsageRecorder],
+    guardian_context: str = "",
 ) -> tuple[str, int, int]:
     """Ask Anthropic for the contents of one file.
 
@@ -593,6 +594,14 @@ async def _generate_file(
     API failure (caller decides how to handle). Records one usage row
     via `recorder` per API call (including retries — every call costs
     real money).
+
+    `guardian_context` is an optional pre-formatted block of project-wide
+    semantic summaries (see guardian_pipeline.build_pipeline_context).
+    First builds always pass an empty string — no summaries exist yet.
+    Iteration-time new-file generation can pass a populated block so
+    the Builder writes new files that fit the project's existing
+    patterns. Default empty preserves pre-guardian behavior for callers
+    that haven't been updated.
 
     Truncation handling
     -------------------
@@ -614,6 +623,12 @@ async def _generate_file(
     other_files = "\n".join(
         f"  - {f.path}: {f.purpose}" for f in spec.files if f.path != target.path
     ) or "  (this is the only file)"
+
+    # Inject guardian context after the spec's bare file list if available.
+    # On first builds it's empty (no summaries yet); on iteration-time
+    # new-file generation it's a real semantic context block.
+    if guardian_context:
+        other_files = other_files + "\n\n" + guardian_context
 
     system = FILE_SYSTEM_PROMPT_TEMPLATE.format(
         summary=spec.summary,

@@ -298,6 +298,116 @@ def load_file_summaries(
 
 
 # ---------------------------------------------------------------------------
+# Pipeline integration — formatting summaries as prompt context.
+# ---------------------------------------------------------------------------
+
+# Cap on how much guardian context we inject into any single prompt.
+# Each summary line is ~150 chars (path + one-sentence purpose +
+# one-line risk note). 25 summaries = ~4KB of context — meaningful
+# without dominating the prompt. Bigger projects get truncated to the
+# 25 most relevant; the "Project context" header makes the truncation
+# visible to the model.
+MAX_CONTEXT_SUMMARIES = 25
+
+
+def build_pipeline_context(
+    store: "LedgerStore",
+    project_id: str,
+    *,
+    focus_paths: Optional[list[str]] = None,
+    exclude_paths: Optional[list[str]] = None,
+    max_summaries: int = MAX_CONTEXT_SUMMARIES,
+) -> str:
+    """Build a "Project context" block for inclusion in builder/auditor
+    prompts. Returns the empty string if no summaries exist for the
+    project — every caller checks for this and falls back to the
+    pre-guardian behavior.
+
+    Parameters
+    ----------
+    focus_paths
+        Files most relevant to the current task (the file being built/
+        audited, or files mentioned in the iteration plan). These get
+        priority placement at the top.
+    exclude_paths
+        Files to leave out — typically the file currently being
+        regenerated, since the prompt already contains its purpose
+        and the summary would be stale by the end of the call.
+    max_summaries
+        Truncate to this many. Default 25 captures most projects
+        whole; larger projects get the most-recently-indexed
+        summaries first.
+
+    Output shape (single string, ready to interpolate):
+
+        Project context (from guardian semantic index):
+          - app/main.py — FastAPI entry point. Touches: routing, middleware. Risk: should add /healthz endpoint.
+          - app/db.py — Async SQLAlchemy connection pool. Assumes valid DATABASE_URL. Risk: manual disposal required.
+          ...
+
+    The format is intentionally terse. Each line is path + purpose +
+    the most actionable risk note. Full summaries (with `failure_modes`,
+    `assumes`, `touches`) live in the ledger and are accessible via
+    risk-analyzer queries; the Builder/Auditor doesn't need that depth
+    in every prompt.
+    """
+    summaries = load_file_summaries(store, project_id)
+    if not summaries:
+        # No guardian data for this project. Caller falls back to the
+        # pre-guardian prompt format (bare file paths).
+        return ""
+
+    excluded = set(exclude_paths or [])
+    relevant = [s for s in summaries if s.get("file_path") not in excluded]
+
+    # Order: focus_paths first (in the order given), then everything
+    # else by file_path. This way the Builder/Auditor sees the files
+    # most relevant to its task at the top of the context block.
+    if focus_paths:
+        focus_set = set(focus_paths)
+        focused = [s for s in relevant if s.get("file_path") in focus_set]
+        # Preserve the order the caller gave us in focus_paths.
+        focused.sort(key=lambda s: focus_paths.index(s["file_path"]))
+        rest = sorted(
+            [s for s in relevant if s.get("file_path") not in focus_set],
+            key=lambda s: s.get("file_path", ""),
+        )
+        ordered = focused + rest
+    else:
+        ordered = sorted(relevant, key=lambda s: s.get("file_path", ""))
+
+    ordered = ordered[:max_summaries]
+    if not ordered:
+        return ""
+
+    lines = ["Project context (from guardian semantic index):"]
+    for s in ordered:
+        path = s.get("file_path", "?")
+        purpose = (s.get("purpose") or "").strip()
+        risks = s.get("risk_notes") or []
+        # Pick the first risk note as the "headline" risk for this line.
+        # The Builder/Auditor can ask for more via the risk endpoint
+        # if it needs deeper context on a specific file.
+        risk = risks[0] if risks else ""
+        # Compact format. Truncation thresholds chosen so a 25-summary
+        # block lands around 3-5KB.
+        if risk:
+            lines.append(
+                f"  - {path} — {purpose[:160]} Risk: {risk[:120]}"
+            )
+        else:
+            lines.append(f"  - {path} — {purpose[:200]}")
+
+    # Trailing note so the Builder/Auditor knows the context is
+    # background, not instruction.
+    lines.append(
+        "  (These are background context for cross-file reasoning. "
+        "You are not editing or auditing these files unless explicitly told to.)"
+    )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Helpers.
 # ---------------------------------------------------------------------------
 

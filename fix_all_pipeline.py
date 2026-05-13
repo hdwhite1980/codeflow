@@ -251,6 +251,7 @@ async def generate_fix_all_report(
     post_findings: list[Finding],
     client: AnthropicClient,
     recorder: Optional[UsageRecorder],
+    store: Optional["LedgerStore"] = None,
 ) -> str:
     """Ask the Builder to explain remaining findings.
 
@@ -258,6 +259,13 @@ async def generate_fix_all_report(
     but are STILL present AFTER (i.e., issues the fix attempt didn't
     address) and the list of NEW findings (regressions). The Builder
     explains why each wasn't fixed or why it appeared.
+
+    When `store` is provided AND the project has guardian semantic
+    summaries, we include them as context so the Builder's
+    explanations can reference cross-file consequences — e.g. "this
+    can't be fixed in auth.py alone because the summary of db.py
+    shows tenant scoping isn't enforced there." Without the store
+    argument the function behaves exactly as before (back-compat).
 
     If everything is clean, we return a short success report without
     calling the Builder — saves a few cents and reads more naturally.
@@ -288,6 +296,27 @@ async def generate_fix_all_report(
             loc = f" line {f.line}" if f.line else ""
             sections.append(f"- [{f.severity}] {f.file_path}{loc}: {f.issue}")
 
+    # Pull guardian semantic context for the files involved if available.
+    # Focus on the files that have remaining or regressed issues — those
+    # are the ones the Builder is reasoning about. Empty string when
+    # guardian hasn't indexed this project (and on stores that don't
+    # support load_file_summaries, e.g. test doubles).
+    guardian_context = ""
+    if store is not None:
+        try:
+            from guardian_pipeline import build_pipeline_context
+            involved = sorted({f.file_path for f in (persisted + regressions)})
+            guardian_context = build_pipeline_context(
+                store, project_id, focus_paths=involved,
+            )
+        except Exception as exc:
+            # Guardian failure must not break fix-all report generation.
+            # Log and continue without semantic context.
+            print(f"[fix-all] guardian context unavailable: "
+                  f"{type(exc).__name__}: {exc}", flush=True)
+
+    guardian_block = f"\n\n{guardian_context}\n" if guardian_context else ""
+
     explain_prompt = (
         "You just attempted to fix a set of code-review findings. Some "
         "remain. For each remaining issue below, briefly explain WHY "
@@ -296,7 +325,8 @@ async def generate_fix_all_report(
         "the fix would break other code, or it's a false positive from "
         "the auditor.\n\n"
         "Keep each explanation to one sentence. Use the format:\n"
-        "  - `<file>` (line N): <one-sentence explanation>\n\n"
+        "  - `<file>` (line N): <one-sentence explanation>\n"
+        + guardian_block + "\n"
         + "\n".join(sections)
     )
 

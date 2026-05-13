@@ -225,5 +225,92 @@ class TestMarkerWriters(unittest.TestCase):
         self.assertEqual(next_fix_all_seq(store, pid), 3)
 
 
+class TestReportWithGuardianContext(unittest.TestCase):
+    """Fix-all report generation pulls guardian semantic summaries
+    when a store is provided. The Builder's explanations of why a
+    finding couldn't be fixed get sharper with cross-file context."""
+
+    def test_report_prompt_includes_guardian_when_store_passed(self):
+        import asyncio
+        from fix_all_pipeline import generate_fix_all_report, Finding
+        from guardian_pipeline import FileSummary, write_file_summary
+
+        captured = {"prompt": ""}
+
+        class FakeClient:
+            async def complete(self, prompt, *, system=None, max_tokens=2048, **kw):
+                from dataclasses import dataclass
+                captured["prompt"] = prompt
+
+                @dataclass
+                class R:
+                    text: str = "- app/auth.py (line 12): needs db.py changes too."
+                    model: str = "test"
+                    input_tokens: int = 50
+                    output_tokens: int = 25
+                    stop_reason: str = "end_turn"
+                return R()
+
+        store = InMemoryLedgerStore()
+        pid = store.create_project("test", "test")
+        write_file_summary(store, pid, FileSummary(
+            file_path="app/db.py",
+            plain_english="DB connection pool",
+            technical="t", purpose="Postgres async connection",
+            touches=[], assumes=[], failure_modes=[],
+            risk_notes=["No tenant scoping enforced"],
+            indexed_at=0.0, indexer_model="m",
+            input_tokens=0, output_tokens=0,
+        ))
+
+        pre = [Finding(file_path="app/auth.py", severity="critical",
+                       line=12, issue="missing tenant scope",
+                       suggestion="add filter", auditor="claude")]
+        post = list(pre)  # unchanged: the issue persists
+
+        asyncio.run(generate_fix_all_report(
+            project_id=pid, fix_all_seq=1,
+            pre_findings=pre, post_findings=post,
+            client=FakeClient(), recorder=None,
+            store=store,
+        ))
+
+        # The report-explain prompt should now reference guardian context.
+        self.assertIn("Project context", captured["prompt"])
+        self.assertIn("app/db.py", captured["prompt"])
+        self.assertIn("No tenant scoping", captured["prompt"])
+
+    def test_report_works_without_store(self):
+        """Back-compat: callers that don't pass `store` still work."""
+        import asyncio
+        from fix_all_pipeline import generate_fix_all_report, Finding
+
+        class FakeClient:
+            async def complete(self, prompt, *, system=None, max_tokens=2048, **kw):
+                from dataclasses import dataclass
+
+                @dataclass
+                class R:
+                    text: str = "no context."
+                    model: str = "test"
+                    input_tokens: int = 1
+                    output_tokens: int = 1
+                    stop_reason: str = "end_turn"
+                return R()
+
+        pre = [Finding(file_path="app/auth.py", severity="warning",
+                       line=1, issue="x", suggestion="", auditor="claude")]
+        post = list(pre)
+
+        # No store argument — should run cleanly with no guardian block.
+        report = asyncio.run(generate_fix_all_report(
+            project_id="some-pid", fix_all_seq=1,
+            pre_findings=pre, post_findings=post,
+            client=FakeClient(), recorder=None,
+        ))
+        # Returns a real report string.
+        self.assertIn("Fix-all pass complete", report)
+
+
 if __name__ == "__main__":
     unittest.main()

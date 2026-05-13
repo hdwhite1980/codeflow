@@ -321,5 +321,111 @@ class TestSummaryLedgerRoundtrip(unittest.TestCase):
         self.assertEqual(paths, {"app/a.py", "app/b.py", "app/c.py"})
 
 
+# ---------------------------------------------------------------------------
+# build_pipeline_context — pipeline integration helper.
+# ---------------------------------------------------------------------------
+
+class TestBuildPipelineContext(unittest.TestCase):
+    """The function that formats summaries for inclusion in builder/auditor
+    prompts. Critical because every pipeline relies on graceful fallback
+    when summaries don't exist for a project."""
+
+    def _seed(self, store, pid, files):
+        """Helper: write file summaries for the given list of (path, plain,
+        purpose, risk) tuples."""
+        from guardian_pipeline import write_file_summary
+        for path, plain, purpose, risk in files:
+            write_file_summary(store, pid, FileSummary(
+                file_path=path, plain_english=plain, technical="t",
+                purpose=purpose, touches=[], assumes=[], failure_modes=[],
+                risk_notes=[risk] if risk else [],
+                indexed_at=0.0, indexer_model="m",
+                input_tokens=0, output_tokens=0,
+            ))
+
+    def test_empty_when_no_summaries(self):
+        """No guardian data = empty string. Callers fall back to bare
+        file paths in their prompts without any branching."""
+        from guardian_pipeline import build_pipeline_context
+        store = InMemoryLedgerStore()
+        pid = store.create_project("test", "test")
+        self.assertEqual(build_pipeline_context(store, pid), "")
+
+    def test_includes_summaries_when_present(self):
+        from guardian_pipeline import build_pipeline_context
+        store = InMemoryLedgerStore()
+        pid = store.create_project("test", "test")
+        self._seed(store, pid, [
+            ("app/main.py", "Main file", "HTTP entry point", "Add /healthz"),
+            ("app/db.py", "DB connection", "Postgres setup", "No tenant scoping"),
+        ])
+        ctx = build_pipeline_context(store, pid)
+        self.assertIn("Project context", ctx)
+        self.assertIn("app/main.py", ctx)
+        self.assertIn("HTTP entry point", ctx)
+        self.assertIn("app/db.py", ctx)
+        self.assertIn("Postgres setup", ctx)
+        # Risk note included.
+        self.assertIn("No tenant scoping", ctx)
+
+    def test_focus_paths_appear_first(self):
+        from guardian_pipeline import build_pipeline_context
+        store = InMemoryLedgerStore()
+        pid = store.create_project("test", "test")
+        self._seed(store, pid, [
+            ("app/a.py", "A file", "First purpose", ""),
+            ("app/b.py", "B file", "Second purpose", ""),
+            ("app/c.py", "C file", "Third purpose", ""),
+        ])
+        ctx = build_pipeline_context(store, pid, focus_paths=["app/c.py"])
+        a_pos = ctx.index("app/a.py")
+        c_pos = ctx.index("app/c.py")
+        # Focus path appears before the rest.
+        self.assertLess(c_pos, a_pos)
+
+    def test_exclude_paths_omitted(self):
+        from guardian_pipeline import build_pipeline_context
+        store = InMemoryLedgerStore()
+        pid = store.create_project("test", "test")
+        self._seed(store, pid, [
+            ("app/a.py", "A file", "First purpose", ""),
+            ("app/b.py", "B file", "Second purpose", ""),
+        ])
+        ctx = build_pipeline_context(
+            store, pid, exclude_paths=["app/b.py"],
+        )
+        self.assertIn("app/a.py", ctx)
+        self.assertNotIn("app/b.py", ctx)
+
+    def test_truncation_at_max(self):
+        """A 50-file project should produce a block capped at the
+        configured max (25 by default)."""
+        from guardian_pipeline import build_pipeline_context, MAX_CONTEXT_SUMMARIES
+        store = InMemoryLedgerStore()
+        pid = store.create_project("test", "test")
+        files = [(f"file_{i:03d}.py", f"plain {i}", f"purpose {i}", "")
+                 for i in range(MAX_CONTEXT_SUMMARIES + 10)]
+        self._seed(store, pid, files)
+        ctx = build_pipeline_context(store, pid)
+        # Count the bullet lines (each starts with '  - ').
+        bullet_count = sum(1 for line in ctx.splitlines() if line.startswith("  - "))
+        self.assertEqual(bullet_count, MAX_CONTEXT_SUMMARIES)
+
+    def test_lines_are_terse(self):
+        """Each summary line must fit on a few hundred chars so a
+        25-summary block doesn't dominate a Builder prompt."""
+        from guardian_pipeline import build_pipeline_context
+        store = InMemoryLedgerStore()
+        pid = store.create_project("test", "test")
+        self._seed(store, pid, [
+            ("app/x.py", "x" * 5000, "x" * 5000, "x" * 5000),
+        ])
+        ctx = build_pipeline_context(store, pid)
+        # Each line of the context block stays under ~400 chars even
+        # when the model returned huge field values.
+        for line in ctx.splitlines():
+            self.assertLessEqual(len(line), 500, f"line too long: {line[:80]}...")
+
+
 if __name__ == "__main__":
     unittest.main()

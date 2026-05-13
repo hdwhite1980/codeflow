@@ -848,6 +848,7 @@ async def handle_fix_all(job: dict[str, Any], ctx: HandlerContext) -> None:
             project_id=project_id, fix_all_seq=seq,
             pre_findings=pre_findings, post_findings=post_findings,
             client=ctx.anthropic, recorder=ctx.recorder,
+            store=ctx.store,
         )
     except Exception as exc:
         print(f"[handlers] fix_all: report generation crashed: "
