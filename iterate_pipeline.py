@@ -204,13 +204,33 @@ async def run_iteration(
         author=f"worker:iterate:{iteration_seq}",
     )
 
-    # Phase 1: plan
-    inventory = _current_inventory(store, project_id)
-    plan, plan_in, plan_out = await _plan_iteration(
-        client=client, project_id=project_id, stage_tag=stage_tag,
-        inventory=inventory, iteration_prompt=iteration_prompt,
-        recorder=recorder,
-    )
+    # Phase 1: plan. Wrap in try/except so a planning failure writes
+    # a clear outcome record instead of leaving the iteration stuck at
+    # status=started forever. Common failures:
+    #   - Anthropic API auth/rate limit
+    #   - Model returns invalid JSON (already handled by _parse_plan)
+    #   - Network blip
+    try:
+        inventory = _current_inventory(store, project_id)
+        plan, plan_in, plan_out = await _plan_iteration(
+            client=client, project_id=project_id, stage_tag=stage_tag,
+            inventory=inventory, iteration_prompt=iteration_prompt,
+            recorder=recorder,
+        )
+    except Exception as exc:
+        print(f"[iterate] plan phase failed for {project_id} "
+              f"iter {iteration_seq}: {type(exc).__name__}: {exc}",
+              flush=True)
+        outcome = IterationOutcome(
+            iteration_seq=iteration_seq,
+            changes_applied=[], new_files_created=[], files_deleted=[],
+            failed=[("(plan)", f"{type(exc).__name__}: {str(exc)[:200]}")],
+            input_tokens=0, output_tokens=0,
+            rationale=f"Planning failed: {type(exc).__name__}",
+        )
+        _write_outcome(store, project_id, iteration_seq, outcome)
+        return outcome
+
     store.write_entry(
         project_id=project_id,
         tier=Tier.SPEC,
@@ -436,8 +456,8 @@ async def _plan_iteration(
     )
 
     result = await client.complete(
+        user_prompt,
         system=PLAN_SYSTEM_PROMPT,
-        user=user_prompt,
         max_tokens=_PLAN_MODEL_MAX_TOKENS,
     )
     if recorder is not None:
@@ -571,8 +591,8 @@ async def _regenerate_file(
     )
 
     result = await client.complete(
+        user_prompt,
         system=REGEN_SYSTEM_PROMPT,
-        user=user_prompt,
         max_tokens=8192,
     )
     if recorder is not None:

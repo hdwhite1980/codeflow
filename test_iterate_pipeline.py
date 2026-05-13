@@ -206,5 +206,57 @@ class TestLanguageDetection(unittest.TestCase):
         self.assertEqual(_language_of("something.weird"), "text")
 
 
+class TestPlanIterationCall(unittest.TestCase):
+    """Catches parameter-shape mismatches with AnthropicClient.complete.
+
+    We had a bug where the plan phase passed `user=` to .complete()
+    which actually takes the prompt as positional. The unit tests
+    didn't catch it because they only tested the parser, not the call.
+    This test fakes the client and asserts the call signature is right."""
+
+    def test_plan_uses_positional_prompt(self):
+        import asyncio
+        from iterate_pipeline import _plan_iteration
+
+        # Fake client that records how it was called.
+        class FakeClient:
+            def __init__(self):
+                self.call_args = None
+                self.call_kwargs = None
+
+            async def complete(self, *args, **kwargs):
+                self.call_args = args
+                self.call_kwargs = kwargs
+                # Return a minimal valid result.
+                from dataclasses import dataclass
+
+                @dataclass
+                class R:
+                    text: str = '{"rationale":"test","changes":[],"new_files":[],"delete":[]}'
+                    model: str = "test"
+                    input_tokens: int = 10
+                    output_tokens: int = 5
+                    stop_reason: str = "end_turn"
+                return R()
+
+        client = FakeClient()
+        asyncio.run(_plan_iteration(
+            client=client,
+            project_id="p1",
+            stage_tag="iteration:1",
+            inventory={"main.py": "test"},
+            iteration_prompt="do something",
+            recorder=None,
+        ))
+        # The prompt must be passed positionally (as the first arg),
+        # not as keyword "user" or "prompt".
+        self.assertEqual(len(client.call_args), 1)
+        self.assertIn("do something", client.call_args[0])
+        # System prompt is keyword.
+        self.assertIn("system", client.call_kwargs)
+        # And max_tokens.
+        self.assertIn("max_tokens", client.call_kwargs)
+
+
 if __name__ == "__main__":
     unittest.main()
