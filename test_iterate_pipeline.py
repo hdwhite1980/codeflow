@@ -206,6 +206,143 @@ class TestLanguageDetection(unittest.TestCase):
         self.assertEqual(_language_of("something.weird"), "text")
 
 
+class TestFullIterationFlow(unittest.TestCase):
+    """End-to-end run_iteration against InMemoryLedgerStore + a fake
+    Anthropic client. Catches bugs the unit tests miss — wrong Tier
+    enum values, wrong ArtifactKind, body serialization issues.
+
+    This test exists because we shipped an iteration pipeline that
+    silently failed at runtime (Tier.BUILD didn't exist), and the unit
+    tests didn't catch it because they only exercised the parser, not
+    the actual ledger writes. End-to-end coverage with fakes is cheap
+    and catches the class of bug we suffered.
+    """
+
+    def test_empty_plan_writes_started_plan_outcome(self):
+        """The 'nothing to do' path must still produce all three ledger
+        entries. This is the exact failure mode we saw in iteration 3."""
+        import asyncio
+        from iterate_pipeline import run_iteration
+
+        class FakeClient:
+            async def complete(self, prompt, *, system=None, max_tokens=4096, **kw):
+                from dataclasses import dataclass
+
+                @dataclass
+                class R:
+                    text: str = (
+                        '{"rationale":"already done","changes":[],'
+                        '"new_files":[],"delete":[]}'
+                    )
+                    model: str = "test"
+                    input_tokens: int = 100
+                    output_tokens: int = 20
+                    stop_reason: str = "end_turn"
+
+                return R()
+
+        store = InMemoryLedgerStore()
+        pid = store.create_project("test", "test")
+        # Seed an existing file so inventory is non-empty.
+        store.write_entry(
+            project_id=pid, tier=Tier.GENERATION,
+            artifact_kind=ArtifactKind.FILE,
+            artifact_key=f"file:{pid}:app/main.py",
+            body="print('hi')", rationale="entrypoint", author="seed",
+        )
+
+        outcome = asyncio.run(run_iteration(
+            project_id=pid,
+            iteration_prompt="add a thing",
+            iteration_seq=1,
+            store=store,
+            client=FakeClient(),
+            recorder=None,
+        ))
+
+        # All three iteration artifacts MUST exist after the call.
+        artifacts = store.all_current(pid, ArtifactKind.DECISION_RECORD)
+        keys = {a.artifact_key for a in artifacts}
+        self.assertIn("iteration:1:started", keys)
+        self.assertIn("iteration:1:plan", keys)
+        self.assertIn("iteration:1:outcome", keys,
+                      "Outcome record must always be written, even for "
+                      "empty plans. If this fails, _write_outcome is broken "
+                      "(e.g. wrong Tier or ArtifactKind).")
+        self.assertEqual(outcome.changes_applied, [])
+        self.assertEqual(outcome.new_files_created, [])
+
+    def test_plan_with_change_writes_all_records(self):
+        """Plan-with-changes path also writes :outcome and produces a
+        regenerated file ledger entry."""
+        import asyncio
+        from iterate_pipeline import run_iteration
+
+        class FakeClient:
+            def __init__(self):
+                self.calls = 0
+
+            async def complete(self, prompt, *, system=None, max_tokens=4096, **kw):
+                from dataclasses import dataclass
+                self.calls += 1
+
+                @dataclass
+                class R:
+                    text: str
+                    model: str = "test"
+                    input_tokens: int = 100
+                    output_tokens: int = 50
+                    stop_reason: str = "end_turn"
+
+                # First call is plan; subsequent are regenerations.
+                if self.calls == 1:
+                    return R(text=(
+                        '{"rationale":"adding health endpoint",'
+                        '"changes":[{"path":"app/main.py","reason":"add /health"}],'
+                        '"new_files":[],"delete":[]}'
+                    ))
+                # Regen response — return new file content.
+                return R(text="print('new content with /health')")
+
+        store = InMemoryLedgerStore()
+        pid = store.create_project("test", "test")
+        store.write_entry(
+            project_id=pid, tier=Tier.GENERATION,
+            artifact_kind=ArtifactKind.FILE,
+            artifact_key=f"file:{pid}:app/main.py",
+            body="print('original')", rationale="entrypoint", author="seed",
+        )
+
+        outcome = asyncio.run(run_iteration(
+            project_id=pid,
+            iteration_prompt="add /health",
+            iteration_seq=1,
+            store=store,
+            client=FakeClient(),
+            recorder=None,
+        ))
+
+        # All three iteration markers present.
+        decision_keys = {
+            a.artifact_key
+            for a in store.all_current(pid, ArtifactKind.DECISION_RECORD)
+        }
+        self.assertIn("iteration:1:started", decision_keys)
+        self.assertIn("iteration:1:plan", decision_keys)
+        self.assertIn("iteration:1:outcome", decision_keys)
+
+        # File got regenerated.
+        self.assertEqual(outcome.changes_applied, ["app/main.py"])
+        # And the latest file entry has the new content.
+        files = store.all_current(pid, ArtifactKind.FILE)
+        main_entry = next(
+            f for f in files
+            if f.artifact_key == f"file:{pid}:app/main.py"
+        )
+        blob, _ = store.get_blob(main_entry.blob_sha256)
+        self.assertIn("/health", blob.decode("utf-8"))
+
+
 class TestPlanIterationCall(unittest.TestCase):
     """Catches parameter-shape mismatches with AnthropicClient.complete.
 

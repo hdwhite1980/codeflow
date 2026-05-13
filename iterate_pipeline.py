@@ -689,7 +689,11 @@ def _write_outcome(
 ) -> None:
     store.write_entry(
         project_id=project_id,
-        tier=Tier.BUILD,
+        # Tier.GENERATION matches build_pipeline's outcome tier — the
+        # iteration outcome IS a generation-phase summary record.
+        # (Earlier draft used Tier.BUILD which doesn't exist; the valid
+        # values are SPEC, GENERATION, MERGE, AUDIT, PATCH.)
+        tier=Tier.GENERATION,
         artifact_kind=ArtifactKind.DECISION_RECORD,
         artifact_key=f"iteration:{iteration_seq}:outcome",
         body={
