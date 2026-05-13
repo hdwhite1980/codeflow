@@ -383,6 +383,85 @@ def _json_loads_or_none(blob: bytes):
 
 
 # ---------------------------------------------------------------------------
+# iterate_project — apply a follow-up prompt to an existing project.
+# ---------------------------------------------------------------------------
+
+async def handle_iterate_project(job: dict[str, Any], ctx: HandlerContext) -> None:
+    """Apply an iteration prompt to an existing project.
+
+    The iteration pipeline:
+      1. Plans which files change (Builder makes the call).
+      2. Regenerates those files with full cross-context.
+      3. Writes new ledger versions; old files supersede.
+      4. Enqueues an audit_project job for the SAME project (which will
+         audit the latest version of every file — including unchanged
+         ones, but that's fine, we get a fresh consistent set of findings
+         after each iteration).
+
+    Why we re-audit everything, not just changed files
+    --------------------------------------------------
+    The user asked for full audit on every iteration. The current
+    audit_project handler always audits all current files — we'd need
+    a more targeted handler to do subset audits. For now, the simplest
+    and most consistent behavior is: re-run the full audit. Each
+    iteration shows you a complete, consistent set of findings.
+    A future "audit_subset" handler could be cheaper but isn't worth
+    the added complexity yet."""
+
+    project_id = job.get("project_id")
+    iteration_prompt = job.get("prompt")
+    iteration_seq = job.get("iteration_seq")
+
+    if not project_id or not iteration_prompt or iteration_seq is None:
+        print(f"[handlers] iterate_project: missing fields in {job!r}; "
+              f"dropping", flush=True)
+        return
+
+    if ctx.anthropic is None:
+        print(f"[handlers] iterate_project: no Anthropic client configured; "
+              f"writing skip-record for {project_id}")
+        ctx.store.write_entry(
+            project_id=project_id,
+            tier=Tier.SPEC,
+            artifact_kind=ArtifactKind.DECISION_RECORD,
+            artifact_key=f"iteration:{iteration_seq}:skipped",
+            body={"reason": "ANTHROPIC_API_KEY not set"},
+            rationale="Cannot run iteration without builder client.",
+            author="worker:handle_iterate_project",
+        )
+        return
+
+    # Lazy import to keep build_pipeline as the heavy dep boundary.
+    from iterate_pipeline import run_iteration
+
+    print(f"[handlers] iterate_project: starting iteration "
+          f"{iteration_seq} for {project_id}", flush=True)
+
+    outcome = await run_iteration(
+        project_id=project_id,
+        iteration_prompt=iteration_prompt,
+        iteration_seq=int(iteration_seq),
+        store=ctx.store,
+        client=ctx.anthropic,
+        recorder=ctx.recorder,
+    )
+
+    print(f"[handlers] iterate_project: completed iteration "
+          f"{iteration_seq} for {project_id}: "
+          f"{len(outcome.changes_applied)} changed, "
+          f"{len(outcome.new_files_created)} new, "
+          f"{len(outcome.failed)} failed", flush=True)
+
+    # Trigger audit unless this iteration was a no-op (the planner
+    # might have said "nothing to do" — no point auditing).
+    if (outcome.changes_applied or outcome.new_files_created):
+        await ctx.queue.enqueue(make_job(
+            "audit_project",
+            project_id=project_id,
+        ))
+
+
+# ---------------------------------------------------------------------------
 # Registry. Add new handlers here.
 # ---------------------------------------------------------------------------
 
@@ -391,6 +470,7 @@ HandlerFn = Callable[[dict[str, Any], HandlerContext], Awaitable[None]]
 HANDLERS: dict[str, HandlerFn] = {
     "build_project": handle_build_project,
     "audit_project": handle_audit_project,
+    "iterate_project": handle_iterate_project,
 }
 
 

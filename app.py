@@ -638,6 +638,75 @@ async def manifest_gaps(project_id: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Iteration endpoint — apply a follow-up prompt to an existing build.
+# ---------------------------------------------------------------------------
+
+class IterateRequest(BaseModel):
+    prompt: str = Field(..., min_length=5, max_length=2000)
+
+
+class IterateResponse(BaseModel):
+    project_id: str
+    iteration_seq: int
+    status: str  # "queued"
+
+
+@app.post("/api/projects/{project_id}/iterate", response_model=IterateResponse)
+async def iterate_project(
+    project_id: str, req: IterateRequest,
+) -> IterateResponse:
+    """Queue an iteration job: take this project as-is and apply the
+    iteration prompt as a modification.
+
+    Iteration_seq derivation
+    ------------------------
+    We assign the next sequence number by counting existing iteration
+    decision records. This isn't strictly atomic — two simultaneous
+    iterate calls on the same project could collide on the same seq —
+    but in practice no user iterates twice in the same millisecond,
+    and the second iteration's ledger writes would simply supersede
+    the first one's via the standard seq mechanism. We accept this
+    rather than introducing a SELECT FOR UPDATE.
+
+    Why we don't block on the build/audit being complete
+    -----------------------------------------------------
+    A user might submit "actually add a dark mode" while the initial
+    build is still running. Their iteration will pick up the latest
+    snapshot of the ledger when it actually executes on the worker,
+    which is fine: by then either the build will have finished or it
+    won't, and the planner will work from whatever state exists. The
+    only failure mode is the user iterates against a partial spec
+    and gets weird results; their next iteration can correct.
+    """
+    store: LedgerStore = app.state.store
+    queue: JobQueue = app.state.queue
+
+    # Compute next iteration_seq from ledger. We count any decision
+    # record whose artifact_key starts with "iteration:" and ends with
+    # ":started" to avoid double-counting plan/outcome entries.
+    existing = store.all_current(project_id, ArtifactKind.DECISION_RECORD)
+    started_count = sum(
+        1 for e in existing
+        if e.artifact_key.startswith("iteration:")
+        and e.artifact_key.endswith(":started")
+    )
+    next_seq = started_count + 1
+
+    await queue.enqueue(make_job(
+        "iterate_project",
+        project_id=project_id,
+        prompt=req.prompt,
+        iteration_seq=next_seq,
+    ))
+
+    return IterateResponse(
+        project_id=project_id,
+        iteration_seq=next_seq,
+        status="queued",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Impact analysis endpoints
 # ---------------------------------------------------------------------------
 
