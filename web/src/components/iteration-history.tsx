@@ -60,6 +60,7 @@ function IterationRow({
 }) {
   const [expanded, setExpanded] = useState(false);
   const isRunning = running || iteration.status === "running";
+  const isAutopatch = iteration.autopatch_attempt != null;
 
   const changeCount =
     iteration.changes_applied.length +
@@ -74,7 +75,9 @@ function IterationRow({
           ? "border-blue-700/50"
           : iteration.failed.length > 0
             ? "border-amber-700/40"
-            : "border-border",
+            : isAutopatch
+              ? "border-violet-700/40"
+              : "border-border",
       )}
     >
       <button
@@ -92,6 +95,14 @@ function IterationRow({
             <span className="text-xs font-medium tabular-nums">
               #{iteration.seq}
             </span>
+            {isAutopatch && (
+              <span
+                className="rounded border border-violet-700/50 bg-violet-950/40 px-1 text-[9px] uppercase tracking-wide text-violet-300"
+                title={`Auto-patch attempt ${iteration.autopatch_attempt}`}
+              >
+                auto-patch
+              </span>
+            )}
             {isRunning && (
               <Badge variant="warning" className="h-4 px-1 text-[9px]">
                 running

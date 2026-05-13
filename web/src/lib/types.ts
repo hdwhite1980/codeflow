@@ -307,6 +307,13 @@ export interface Iteration {
   failed: IterationFailure[];
   input_tokens: number;
   output_tokens: number;
+  /**
+   * If this iteration was triggered by the auto-patch loop (Builder
+   * fixing critical findings the auditors flagged), this is the
+   * autopatch attempt number (1..AUTOPATCH_MAX_ATTEMPTS, currently 3).
+   * Null for user-triggered iterations.
+   */
+  autopatch_attempt: number | null;
 }
 
 export interface IterationListResponse {

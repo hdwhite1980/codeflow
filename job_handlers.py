@@ -372,6 +372,197 @@ async def handle_audit_project(job: dict[str, Any], ctx: HandlerContext) -> None
           f"{total_findings} findings from {len(auditors)} auditors "
           f"({', '.join(auditor_names)})")
 
+    # Auto-patch loop: if any critical findings exist AND we're under
+    # the per-project cap on auto-patch attempts, queue an iteration
+    # that asks the Builder to fix them.
+    #
+    # Why a cap: each auto-patch iteration is essentially a re-build
+    # of multiple files plus a full re-audit. Without a cap, a build
+    # that keeps surfacing criticals (genuine architectural issue, or
+    # the Builder genuinely can't fix it) would loop forever at $0.50+
+    # per pass. Three attempts is generous — most fixable criticals
+    # resolve on the first patch pass.
+    await _maybe_trigger_autopatch(
+        project_id=project_id,
+        ctx=ctx,
+        total_critical=total_critical,
+        outcomes=outcomes,
+        auditors=auditors,
+    )
+
+
+# Auto-patch tunable. Higher = more chances to fix issues, higher
+# cost per build. Three is the sweet spot from manual testing.
+AUTOPATCH_MAX_ATTEMPTS = 3
+
+
+async def _maybe_trigger_autopatch(
+    *,
+    project_id: str,
+    ctx: HandlerContext,
+    total_critical: int,
+    outcomes: list[AuditOutcome],
+    auditors: list[tuple[str, str, Any]],
+) -> None:
+    """If criticals were found and we're under the attempt cap, queue
+    an iteration job to fix them.
+
+    The prompt sent to the Builder is constructed from the actual
+    critical-finding bodies read back from the ledger. We deliberately
+    don't include warnings or nits — those aren't worth a regeneration
+    round (and dumping all findings would blow up the token budget).
+    The Builder gets concrete text like:
+
+        "Fix these critical issues found in audit:
+         - app/main.py line 21: The component will crash if entry.name is missing
+         - app/csv_parser.py line 14: SQL injection via raw f-string interpolation
+         ..."
+
+    Why read verdicts back from the ledger
+    ---------------------------------------
+    AuditOutcome carries only aggregate counts, not the individual
+    findings. The full verdict bodies are persisted to the ledger by
+    run_audit. We read them back here rather than threading the
+    findings list through the AuditOutcome dataclass because the
+    autopatch trigger is opt-in: most builds don't need this path,
+    and the extra ledger read is cheaper than enlarging the data
+    structure that every audit produces.
+    """
+    if total_critical == 0:
+        return
+
+    # Count existing autopatch attempts. We use a decision record kind
+    # with artifact_key prefix `autopatch:` so we can find them all.
+    decisions = ctx.store.all_current(project_id, ArtifactKind.DECISION_RECORD)
+    autopatch_seqs = [
+        d for d in decisions
+        if d.artifact_key.startswith("autopatch:")
+    ]
+    next_attempt = len(autopatch_seqs) + 1
+    if next_attempt > AUTOPATCH_MAX_ATTEMPTS:
+        print(f"[handlers] autopatch: skipping for {project_id} — "
+              f"already at {len(autopatch_seqs)}/{AUTOPATCH_MAX_ATTEMPTS} "
+              f"attempts. {total_critical} critical findings remain.",
+              flush=True)
+        ctx.store.write_entry(
+            project_id=project_id,
+            tier=Tier.AUDIT,
+            artifact_kind=ArtifactKind.DECISION_RECORD,
+            artifact_key=f"autopatch:{next_attempt}:capped",
+            body={
+                "attempt": next_attempt,
+                "cap": AUTOPATCH_MAX_ATTEMPTS,
+                "critical_remaining": total_critical,
+            },
+            rationale=(
+                f"Autopatch cap reached ({AUTOPATCH_MAX_ATTEMPTS} attempts). "
+                f"{total_critical} critical findings remain unaddressed."
+            ),
+            author="worker:autopatch",
+        )
+        return
+
+    # Read audit verdicts back from the ledger to extract critical findings.
+    # Each verdict's body has shape {"findings": [{"severity": ..., "line": ..., "issue": ..., ...}], "file_path": ...}
+    crit_lines = _collect_critical_findings(ctx.store, project_id, max_lines=20)
+
+    if not crit_lines:
+        # total_critical > 0 but we couldn't extract any — defensive
+        # bail-out rather than send the Builder an empty prompt.
+        print(f"[handlers] autopatch: total_critical={total_critical} "
+              f"but extracted 0 finding lines. Skipping.", flush=True)
+        return
+
+    iteration_prompt = (
+        "Fix these critical issues found in the audit. "
+        "Make the smallest change that resolves each issue. "
+        "Don't rewrite functionality that wasn't flagged.\n\n"
+        + "\n".join(crit_lines)
+    )
+
+    # Compute the iteration_seq the same way the API does.
+    started_count = sum(
+        1 for e in decisions
+        if e.artifact_key.startswith("iteration:")
+        and e.artifact_key.endswith(":started")
+    )
+    next_iter_seq = started_count + 1
+
+    # Record the autopatch attempt before queueing so we can count it
+    # even if the queue write fails. iteration_seq is recorded so the
+    # /iterations endpoint can label the resulting iteration as
+    # autopatch-originated when the frontend shows the history.
+    ctx.store.write_entry(
+        project_id=project_id,
+        tier=Tier.AUDIT,
+        artifact_kind=ArtifactKind.DECISION_RECORD,
+        artifact_key=f"autopatch:{next_attempt}:triggered",
+        body={
+            "attempt": next_attempt,
+            "iteration_seq": next_iter_seq,
+            "critical_count": total_critical,
+            "critical_lines": crit_lines,
+            "iteration_prompt_preview": iteration_prompt[:500],
+        },
+        rationale=(
+            f"Autopatch attempt {next_attempt}/{AUTOPATCH_MAX_ATTEMPTS}: "
+            f"queueing iteration {next_iter_seq} to fix "
+            f"{len(crit_lines)} critical findings."
+        ),
+        author="worker:autopatch",
+    )
+
+    await ctx.queue.enqueue(make_job(
+        "iterate_project",
+        project_id=project_id,
+        prompt=iteration_prompt,
+        iteration_seq=next_iter_seq,
+        # Mark this as autopatch-originated so the frontend can show it
+        # differently in the iteration history (badge, color, etc).
+        autopatch_attempt=next_attempt,
+    ))
+    print(f"[handlers] autopatch: queued iteration {next_iter_seq} "
+          f"to fix {len(crit_lines)} critical findings "
+          f"(attempt {next_attempt}/{AUTOPATCH_MAX_ATTEMPTS})",
+          flush=True)
+
+
+def _collect_critical_findings(
+    store: LedgerStore, project_id: str, max_lines: int = 20,
+) -> list[str]:
+    """Read audit_verdict ledger entries and return formatted lines for
+    every critical finding, capped at max_lines."""
+    import json as _json
+    out: list[str] = []
+    try:
+        verdicts = store.all_current(project_id, ArtifactKind.AUDIT_VERDICT)
+    except Exception as exc:
+        print(f"[autopatch] failed to load audit verdicts: "
+              f"{type(exc).__name__}: {exc}", flush=True)
+        return out
+
+    for v in verdicts:
+        try:
+            blob, _ = store.get_blob(v.blob_sha256)
+            body = _json.loads(blob.decode("utf-8")) if blob else {}
+        except Exception:
+            continue
+        file_path = body.get("file_path") or ""
+        findings = body.get("findings") or []
+        if not isinstance(findings, list):
+            continue
+        for f in findings:
+            if not isinstance(f, dict):
+                continue
+            if f.get("severity") != "critical":
+                continue
+            line_info = f" line {f['line']}" if f.get("line") else ""
+            issue = (f.get("issue") or "").replace("\n", " ").strip()
+            out.append(f"- {file_path}{line_info}: {issue}")
+            if len(out) >= max_lines:
+                return out
+    return out
+
 
 def _json_loads_or_none(blob: bytes):
     """Try to JSON-parse a blob; return None on any failure."""

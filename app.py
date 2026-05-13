@@ -757,6 +757,24 @@ async def list_iterations(project_id: str) -> dict[str, Any]:
         }
 
     iterations = []
+    # Build a map: iteration_seq → autopatch_attempt for any iterations
+    # that were spawned by the autopatch loop. We discover this by
+    # scanning autopatch:N:triggered records and reading their
+    # iteration_seq field.
+    autopatch_by_iter_seq: dict[int, int] = {}
+    for e in entries:
+        if not e.artifact_key.startswith("autopatch:") or not e.artifact_key.endswith(":triggered"):
+            continue
+        try:
+            blob, _ = store.get_blob(e.blob_sha256)
+            body = json.loads(blob.decode("utf-8")) if blob else {}
+            iter_seq = body.get("iteration_seq")
+            attempt = body.get("attempt")
+            if isinstance(iter_seq, int) and isinstance(attempt, int):
+                autopatch_by_iter_seq[iter_seq] = attempt
+        except Exception:
+            continue
+
     for seq in sorted(by_seq.keys(), reverse=True):
         slot = by_seq[seq]
         status = "complete" if "outcome" in slot else "running"
@@ -783,6 +801,9 @@ async def list_iterations(project_id: str) -> dict[str, Any]:
             "failed": outcome_body.get("failed", []),
             "input_tokens": outcome_body.get("input_tokens", 0),
             "output_tokens": outcome_body.get("output_tokens", 0),
+            # Non-None if this iteration was triggered by the autopatch
+            # loop; carries the attempt number (1, 2, 3...) for display.
+            "autopatch_attempt": autopatch_by_iter_seq.get(seq),
         })
 
     return {
@@ -790,6 +811,109 @@ async def list_iterations(project_id: str) -> dict[str, Any]:
         "iterations": iterations,
         "count": len(iterations),
     }
+
+
+# ---------------------------------------------------------------------------
+# Download — bundle the project's current files into a ZIP.
+# ---------------------------------------------------------------------------
+
+@app.get("/api/projects/{project_id}/download")
+async def download_project(project_id: str):
+    """Return all current files for the project as a ZIP archive.
+
+    Includes
+    --------
+    Only `FILE` artifacts in their current (latest, non-superseded)
+    state. Tombstoned files (those whose body starts with the deletion
+    marker) are excluded. Audit verdicts, decision records, and spec
+    entries are not included — the goal is to give the user a clean
+    working tree, not the entire build history.
+
+    Output shape
+    ------------
+    A standard ZIP with files placed at their original paths
+    (`app/main.py`, `requirements.txt`, etc.). Adding a `README.md`
+    note about the project's prompt at the top of the zip would be a
+    nice touch; not done in this pass.
+
+    Streaming
+    ---------
+    The zip is constructed entirely in memory because typical projects
+    are under 1MB compressed. If we ever generate apps with vendored
+    node_modules or large assets, switch to a streaming response with
+    a temp file on disk.
+    """
+    from fastapi.responses import StreamingResponse
+    import io
+    import zipfile
+
+    store: LedgerStore = app.state.store
+    entries = store.all_current(project_id, ArtifactKind.FILE)
+    if not entries:
+        raise HTTPException(
+            status_code=404,
+            detail="No files found for this project. Has the build completed?",
+        )
+
+    # Pull the slug for a nicer download filename. If the lookup fails
+    # we fall back to the project_id.
+    slug = project_id[:8]
+    try:
+        import psycopg
+        from psycopg.rows import dict_row
+        with psycopg.connect(
+            app.state.settings.database_url, row_factory=dict_row,
+        ) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT slug FROM projects WHERE id = %s", (project_id,),
+                )
+                row = cur.fetchone()
+                if row:
+                    slug = row["slug"]
+    except Exception:
+        pass  # nice-to-have, not worth failing the download
+
+    # Build the zip in-memory.
+    buf = io.BytesIO()
+    file_count = 0
+    with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for entry in entries:
+            # Extract path from artifact_key shape "file:<project_id>:<path>"
+            parts = entry.artifact_key.split(":", 2)
+            if len(parts) < 3:
+                continue
+            path = parts[2]
+            # Skip tombstones — these were "deleted" by iterations.
+            if "DELETED in iteration" in entry.rationale:
+                continue
+            try:
+                blob, content_type = store.get_blob(entry.blob_sha256)
+            except Exception as exc:
+                print(f"[download] failed to load {path}: "
+                      f"{type(exc).__name__}: {exc}", flush=True)
+                continue
+            zf.writestr(path, blob)
+            file_count += 1
+        # Add a small note at the root so the recipient knows what they
+        # have. We don't include the prompt because it could be sensitive.
+        zf.writestr(
+            "CODEFLOW_README.txt",
+            f"Generated by Code Flow.\n"
+            f"Project: {slug}\n"
+            f"Project ID: {project_id}\n"
+            f"Files: {file_count}\n"
+            f"This is a starter scaffold. Review before deploying.\n",
+        )
+
+    buf.seek(0)
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{slug}.zip"',
+        },
+    )
 
 
 # ---------------------------------------------------------------------------

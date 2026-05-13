@@ -80,9 +80,17 @@ export function humanize(s: string): string {
  */
 export function providerLabel(provider: string): string {
   const map: Record<string, string> = {
+    // Provider names (from token usage rows).
     anthropic: "Builder",
     openai: "Auditor A",
     google: "Auditor B",
+    // Auditor names (from audit verdict bodies). These are the model
+    // *names*, not the provider company — same generic mapping so the
+    // side panel and finding-list show consistent labels regardless
+    // of which key the backend wrote.
+    claude: "Builder",
+    gpt: "Auditor A",
+    gemini: "Auditor B",
   };
-  return map[provider] ?? humanize(provider);
+  return map[provider?.toLowerCase()] ?? "Auditor";
 }

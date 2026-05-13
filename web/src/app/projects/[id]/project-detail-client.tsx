@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { Download } from "lucide-react";
 
 import { CostSummary } from "@/components/cost-summary";
 import { GraphView } from "@/components/graph-view";
@@ -111,6 +112,15 @@ export function ProjectDetailClient({
   // the underlying ledger has changed in ways our local state can't fully
   // reconcile. Coalesced so a burst of events doesn't cause a refetch
   // per event.
+  //
+  // Defensive merge: we never replace a populated graph with one that
+  // has FEWER file nodes. This is a hedge against an apparent issue
+  // where /graph briefly returns sparse responses during heavy ledger
+  // writes (e.g. an active audit pass), which would otherwise blank
+  // the canvas. We prefer the union of what we knew before and what
+  // the server just told us — REST is authoritative for new nodes and
+  // status updates, but our local state isn't allowed to forget nodes
+  // that were there a moment ago.
   const refetchGraphAndAudits = useCallback(async () => {
     if (refetchPending) return;
     setRefetchPending(true);
@@ -120,7 +130,9 @@ export function ProjectDetailClient({
         getAudits(projectId),
         getIterations(projectId),
       ]);
-      if (g.status === "fulfilled") setGraph(g.value);
+      if (g.status === "fulfilled") {
+        setGraph((prev) => mergeGraphPreservingNodes(prev, g.value));
+      }
       if (au.status === "fulfilled") setAudits(au.value);
       if (it.status === "fulfilled") {
         setIterations(it.value.iterations);
@@ -260,6 +272,8 @@ export function ProjectDetailClient({
         failed: [],
         input_tokens: 0,
         output_tokens: 0,
+        // User-triggered iterations are not autopatch.
+        autopatch_attempt: null,
       };
       setIterations((prev) => {
         // Replace if we already have a row for this seq (defensive), else prepend.
@@ -302,6 +316,15 @@ export function ProjectDetailClient({
         <div className="flex items-center gap-3">
           <BuildPhaseBadge graph={graph} audits={audits} />
           <LiveIndicator state={streamState} />
+          <a
+            href={`${process.env.NEXT_PUBLIC_API_URL?.replace(/\/$/, "")}/api/projects/${encodeURIComponent(projectId)}/download`}
+            download
+            className="inline-flex items-center gap-1 rounded-md border border-border bg-card px-2.5 py-1 text-xs text-muted-foreground transition-colors hover:border-zinc-600 hover:text-foreground"
+            title="Download all files as a ZIP"
+          >
+            <Download className="h-3 w-3" />
+            Download
+          </a>
         </div>
       </header>
 
@@ -380,8 +403,47 @@ function BuildPhaseBadge({
 }
 
 // ---------------------------------------------------------------------------
-// Optimistic graph mutations driven by WS events. Each is a pure
-// (graph, event-data) -> graph transform; the caller wraps in setGraph.
+// Graph merge — preserves locally-known nodes when a refetch returns
+// a sparser response. Why we need this: the /graph endpoint reads
+// from `current_artifacts` and during heavy ledger write activity
+// (e.g. an audit pass writing dozens of verdict entries per second)
+// we've observed occasional sparse responses that would blank the
+// canvas. Treating each refetch as a "fill in what's new" instead of
+// a wholesale replace makes the UI robust to that.
+//
+// Rules:
+//   - Service nodes: server is authoritative (these don't change after
+//     project creation in normal use).
+//   - File nodes: union by id. New server status wins for known ids.
+//     Local-only ids (added optimistically via WS) survive even if
+//     the server doesn't know about them yet.
+//   - Edges: server is authoritative. Edges come from import extraction
+//     which is server-side; we can't reconstruct them locally anyway.
+//
+// This makes setGraph an upsert rather than a replace for nodes, but
+// keeps edges as a clean replace.
+// ---------------------------------------------------------------------------
+
+function mergeGraphPreservingNodes(
+  prev: GraphResponse | null,
+  next: GraphResponse,
+): GraphResponse {
+  if (!prev) return next;
+  const nextById = new Map(next.nodes.map((n) => [n.id, n]));
+  const mergedNodes = [...next.nodes];
+  // Append any prev nodes the server forgot about.
+  for (const p of prev.nodes) {
+    if (!nextById.has(p.id)) {
+      mergedNodes.push(p);
+    }
+  }
+  return {
+    ...next,
+    nodes: mergedNodes,
+    node_count: mergedNodes.length,
+  };
+}
+
 // ---------------------------------------------------------------------------
 
 /**
