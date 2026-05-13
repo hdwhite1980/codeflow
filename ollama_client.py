@@ -48,8 +48,10 @@ import httpx
 
 
 # Default model. Qwen 2.5 Coder 14B handles code summarization well and
-# fits in ~10GB VRAM at 4-bit quantization. Override via OLLAMA_MODEL.
-DEFAULT_MODEL = "qwen2.5-coder:14b"
+# fits in ~10GB VRAM at 4-bit quantization. On CPU-only boxes 14b is
+# slow (1-5 min per call); set OLLAMA_DEFAULT_MODEL=qwen2.5-coder:7b
+# for faster summarization at slightly lower quality.
+DEFAULT_MODEL = os.environ.get("OLLAMA_DEFAULT_MODEL", "qwen2.5-coder:14b")
 
 # Fallback chain if the primary model isn't available on the box.
 # We try the configured model first; if Ollama responds with model-not-found,
@@ -57,10 +59,12 @@ DEFAULT_MODEL = "qwen2.5-coder:14b"
 # than failing entirely.
 FALLBACK_MODELS = ["qwen2.5-coder:7b", "qwen2.5-coder:3b"]
 
-# Per-call timeout. Summarization prompts return in 5-15 seconds on 14b;
-# risk-analysis prompts can take 30+ if the model is unloaded from VRAM
-# and has to reload. We allow generous headroom.
-DEFAULT_TIMEOUT_SECONDS = 90.0
+# Per-call timeout. On a GPU box, summarization runs in 5-15s. On a
+# CPU-only box, the same call takes 1-5 minutes (model load + slow
+# eval). We default to 300s (5 min) to match Caddy's proxy timeout
+# and survive CPU-bound deployments. Override with OLLAMA_TIMEOUT
+# (seconds) — recommended values: 60 for GPU boxes, 300+ for CPU.
+DEFAULT_TIMEOUT_SECONDS = float(os.environ.get("OLLAMA_TIMEOUT", "300"))
 
 # Base URL of the Ollama daemon. Default points at the Hetzner box's
 # Caddy proxy (which terminates TLS and enforces bearer auth, then
