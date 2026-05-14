@@ -202,6 +202,18 @@ async def handle_build_project(job: dict[str, Any], ctx: HandlerContext) -> None
         ))
         print(f"[handlers] build_project: enqueued audit_project for {project_id}")
 
+        # Also queue guardian indexing — produces the semantic summaries
+        # every other guardian feature (Memory panel, risk analyzer,
+        # iteration context) depends on. Without this, fresh projects
+        # have empty memory and users see "0 files" in the panel until
+        # they manually click "Re-index".
+        await ctx.queue.enqueue(make_job(
+            "guardian_index",
+            project_id=project_id,
+        ))
+        print(f"[handlers] build_project: enqueued guardian_index for "
+              f"{project_id}")
+
 
 # ---------------------------------------------------------------------------
 # Handler: audit_project
@@ -694,6 +706,18 @@ async def handle_iterate_project(job: dict[str, Any], ctx: HandlerContext) -> No
     if (outcome.changes_applied or outcome.new_files_created):
         await ctx.queue.enqueue(make_job(
             "audit_project",
+            project_id=project_id,
+        ))
+
+        # Re-index the touched files so the guardian's semantic memory
+        # stays in sync with what the code now looks like. Without this,
+        # stale summaries would keep informing risk queries and future
+        # iterations. We re-index ALL touched files (changed + new) in
+        # a single guardian_index job; the worker handles them serially.
+        # For now we just queue a full re-index — it's not the cheapest
+        # but it's the simplest, and the per-file Ollama cost is ~free.
+        await ctx.queue.enqueue(make_job(
+            "guardian_index",
             project_id=project_id,
         ))
 
