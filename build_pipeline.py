@@ -104,6 +104,39 @@ description of what they want, return a structured project plan as JSON.
 Be concrete and pragmatic: list the actual files a working version of
 this project needs, not aspirational scaffolding. Prefer fewer well-chosen
 files over many small ones. Output JSON only, no commentary.
+
+You can plan projects in any language. Common project shapes:
+
+  * Python — app/, tests/, requirements.txt or pyproject.toml
+  * TypeScript / Node — src/, package.json, tsconfig.json
+  * Go — main.go, internal/, go.mod
+  * PowerShell modules — *.psm1 module, *.psd1 manifest, optional *.ps1
+    entry script, Pester tests in *.Tests.ps1. Common for MSP / Microsoft
+    365 / Azure automation: cmdlets that wrap Graph or Exchange APIs,
+    Conditional Access auditors, license reporters, Intune deployments.
+  * PowerShell standalone scripts — single *.ps1 with [CmdletBinding()]
+    and [Parameter(Mandatory)] declarations.
+  * KQL queries — *.kql or *.csl files, one named query per file, with
+    tenant scoping and time-range filters. Common for Microsoft Sentinel
+    detection rules, Defender hunting queries, Log Analytics workbooks.
+  * bash / zsh scripts — *.sh with `set -euo pipefail`, getopts arg
+    parsing, proper quoting. Common for CI helpers, deploy scripts,
+    macOS endpoint provisioning.
+  * AppleScript — *.applescript or *.scpt files, with `try`/`on error`
+    handlers, accessibility-permission documentation in comments.
+
+When generating PowerShell projects, ALWAYS include:
+  - A *.psm1 module file (or *.ps1 script if the user asked for a one-off)
+  - A *.psd1 manifest naming the module's exports
+  - At least one Pester *.Tests.ps1 test file
+  - A README.md with installation and example invocations
+
+When generating KQL projects, prefer one query per file with descriptive
+filenames (e.g. `failed-mfa-by-user.kql`). Include a README explaining
+what each query detects and which Sentinel/Defender workspace it targets.
+
+When generating bash projects, every script file must start with a
+shebang and `set -euo pipefail`.
 """
 
 

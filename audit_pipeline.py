@@ -162,6 +162,7 @@ def _audit_user_prompt(*, file_path: str, file_content: str,
     The auditor should audit each file on its own merits — does this
     file do what its declared purpose says? — rather than rubber-
     stamping based on shared context with the generator."""
+    lang_block = _language_audit_block(language, file_path)
     return (
         f"File: {file_path}\n"
         f"Language: {language}\n"
@@ -180,9 +181,250 @@ def _audit_user_prompt(*, file_path: str, file_content: str,
         f"  6. For test files: do tests assert specific behavior, or "
         f"do they accept too many outcomes?\n"
         f"  7. For config files (requirements.txt, package.json, etc.): "
-        f"are versions pinned? Are dependencies appropriate?\n\n"
-        f"{AUDIT_SCHEMA_DESCRIPTION}"
+        f"are versions pinned? Are dependencies appropriate?\n"
+        f"{lang_block}"
+        f"\n{AUDIT_SCHEMA_DESCRIPTION}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Per-language audit concerns (Turn G-language).
+# ---------------------------------------------------------------------------
+#
+# Generic auditor finds the obvious stuff. Each language has idiom-
+# specific risks the generic prompt misses unless we name them.
+#
+# These blocks slot into the user prompt right after the category
+# checklist. They're concrete enough that the auditor knows exactly
+# what to look for, without being so prescriptive that it generates
+# false positives on clean files.
+#
+# Notes on what each block targets:
+#   - PowerShell: enterprise MSP audit material. Conditional Access,
+#     Graph, Exchange, Intune scripts all share these failure modes.
+#   - bash: defensive script hygiene. set -euo pipefail is table stakes
+#     in any half-serious bash project.
+#   - KQL: tenant isolation + perf. Sentinel/Defender queries that lack
+#     tenant scoping are a critical security finding (data leak across
+#     customers in MSSP environments).
+#   - AppleScript: macOS-specific concerns around permission prompts and
+#     System Events fragility.
+
+def _language_audit_block(language: str, file_path: str) -> str:
+    """Return language-specific audit guidance to append to the prompt.
+
+    Returns an empty string for languages without specific concerns.
+    The block is freeform prose appended to the audit checklist;
+    severity recommendations are explicit so the auditor doesn't
+    promote idiomatic-style preferences to critical.
+    """
+    lang = language.lower()
+    if lang == "powershell":
+        return _POWERSHELL_AUDIT_BLOCK
+    if lang == "bash":
+        return _BASH_AUDIT_BLOCK
+    if lang == "kql":
+        return _KQL_AUDIT_BLOCK
+    if lang == "applescript":
+        return _APPLESCRIPT_AUDIT_BLOCK
+    return ""
+
+
+_POWERSHELL_AUDIT_BLOCK = """
+PowerShell-specific concerns (apply these in addition to the general checklist):
+
+  Module / manifest hygiene
+  -------------------------
+  * If this is a *.psm1 module, does it have Export-ModuleMember calls
+    or rely on the *.psd1 FunctionsToExport list? Implicit-export modules
+    leak helper functions into the caller's session — warning at minimum.
+  * If this is a *.psd1 manifest, does FunctionsToExport list specific
+    function names? Using `*` is a security risk because it exports
+    everything including helpers — warning.
+
+  Cmdlet quality
+  --------------
+  * Public functions should declare [CmdletBinding()] so they support
+    common parameters (-Verbose, -ErrorAction, -WhatIf when applicable).
+    Missing [CmdletBinding()] on a public-looking function — warning.
+  * Required parameters should be [Parameter(Mandatory)]. A function
+    that silently does nothing when called with no arguments is a
+    correctness bug — warning.
+  * Parameters that accept pipelined input must declare ValueFromPipeline
+    or ValueFromPipelineByPropertyName explicitly. Otherwise pipeline
+    invocation silently works on `$null` — warning if the function
+    looks pipeline-friendly.
+
+  Error handling
+  --------------
+  * Use Try/Catch/Finally around any call that can fail (Invoke-RestMethod,
+    Connect-MgGraph, file I/O, Remove-* cmdlets). Bare error-prone calls
+    without handling — warning.
+  * $ErrorActionPreference defaulting to 'Continue' lets non-terminating
+    errors propagate silently. Long scripts should set
+    `$ErrorActionPreference = 'Stop'` near the top or pass `-ErrorAction
+    Stop` on critical calls — warning if absent.
+  * Catch blocks that swallow $_ without logging or re-throwing —
+    warning. The user loses the failure reason.
+
+  Credentials and secrets
+  -----------------------
+  * Hard-coded credentials, API keys, tenant IDs, or client secrets in
+    the script body — CRITICAL.
+  * Plaintext credential parameters: a password parameter typed as
+    [string] instead of [SecureString] or [PSCredential] — critical.
+  * Use of `ConvertTo-SecureString -AsPlainText` for anything other
+    than test fixtures — warning.
+
+  Microsoft 365 / Graph specifics
+  --------------------------------
+  * Connect-MgGraph without explicit -Scopes argument — warning. The
+    script inherits whatever scopes the user previously consented to,
+    which is unpredictable and often over-privileged.
+  * Get-* / Invoke-MgGraph* calls without paging support for large
+    tenants (no -All, no -Top with handling, no @odata.nextLink loop) —
+    warning. The script silently returns the first page only.
+  * Disconnect-MgGraph missing at end of script — nit unless the script
+    is long-lived.
+
+  Output and pipeline correctness
+  --------------------------------
+  * Write-Host instead of Write-Output / Write-Information for non-UI
+    output — nit, but warning if it breaks pipeline composition.
+  * Functions returning $null implicitly by missing a return path —
+    warning.
+"""
+
+
+_BASH_AUDIT_BLOCK = """
+bash / shell-specific concerns (apply these in addition to the general checklist):
+
+  Script hygiene
+  --------------
+  * Missing shebang line at the top of an executable script — warning
+    (could be intentional for sourced libraries, in which case nit).
+  * Missing `set -euo pipefail` (or equivalent: `set -e`, `set -u`,
+    `set -o pipefail`) — warning. Scripts without these silently
+    continue past failed commands and accumulate broken state.
+
+  Variable expansion safety
+  --------------------------
+  * Unquoted `$variable` expansions in command arguments — warning.
+    `rm $files` where $files contains spaces or globs is a real bug;
+    `rm "$files"` is correct.
+  * `$@` instead of `"$@"` when forwarding arguments — warning.
+  * Unquoted command substitutions like `for f in $(ls)` — warning.
+    Should be `for f in *` or `while read -r f; do ... done < <(find ...)`.
+
+  Dangerous patterns
+  ------------------
+  * `rm -rf` with a variable in the path: `rm -rf "$DIR/*"` — CRITICAL
+    if $DIR could be empty (would `rm -rf /*`). The safe form sets
+    `: "${DIR:?must be set}"` first.
+  * `eval` on untrusted input — CRITICAL.
+  * Pipes to `bash` or `sh` from network sources (`curl | bash`) — warning
+    for build scripts, critical for anything user-facing.
+  * `cd "$dir"` without checking the cd succeeded — warning if subsequent
+    commands assume the cwd. Use `cd "$dir" || exit` or `pushd`/`popd`.
+
+  Argument parsing
+  ----------------
+  * Positional arguments only, no `getopts` or `--option` handling, for
+    scripts taking more than 2 inputs — warning. Hard to maintain and
+    error-prone.
+
+  Portability
+  -----------
+  * `bash`-specific syntax (arrays, `[[`, `<<<`) in a script with `#!/bin/sh`
+    shebang — warning. Either change the shebang to bash or use POSIX sh.
+"""
+
+
+_KQL_AUDIT_BLOCK = """
+KQL-specific concerns (apply these in addition to the general checklist):
+
+  Tenant scoping (CRITICAL for multi-tenant workspaces)
+  ------------------------------------------------------
+  * Sentinel / Log Analytics queries without tenant scoping in MSSP
+    environments — CRITICAL. The query must include `| where TenantId
+    == "<expected>"` or equivalent. Missing tenant scoping in a multi-
+    tenant Log Analytics workspace leaks data across customers.
+  * Hard-coded GUIDs for TenantId, SubscriptionId, etc. — warning. Use
+    `let` bindings at the top so a reviewer can find them all in one
+    place.
+
+  Query performance
+  -----------------
+  * `where` filters placed after `join` instead of before — warning.
+    Filters should run as early as possible to reduce scan volume.
+  * Missing time-range filter on tables with months of data
+    (SigninLogs, AuditLogs, SecurityEvent, etc.) — warning. Queries
+    without `ago(<window>)` scan everything; expensive and slow.
+  * `project` after `summarize` instead of before — warning. Projecting
+    before summarize reduces the intermediate set size.
+  * `union *` or wildcard table names in production queries — warning.
+    Expensive and brittle to schema changes.
+
+  Detection / hunting correctness
+  --------------------------------
+  * Detection queries that use `where AlertSeverity == "High"` without
+    also filtering on the date/time or correlating to a workspace —
+    warning. Returns historical alerts.
+  * Hunting queries that return raw rows without aggregation —
+    warning. Better as `summarize count() by ...` to surface patterns.
+  * Use of `regex` matches without anchors (^ or $) on user-controlled
+    fields — warning, can be exploited by attackers to evade detection
+    via padded input.
+
+  Output shape
+  ------------
+  * Final `project` or `summarize` step that drops fields needed by the
+    downstream workbook / alert template — correctness warning.
+  * Output column names that aren't snake_case or PascalCase consistent
+    with the workspace convention — nit.
+
+  Function-level
+  --------------
+  * `let` bindings used only once — nit (unless they document intent).
+  * `let` bindings shadowing built-in functions or column names — warning.
+"""
+
+
+_APPLESCRIPT_AUDIT_BLOCK = """
+AppleScript-specific concerns (apply these in addition to the general checklist):
+
+  Error handling
+  --------------
+  * Operations that interact with other apps (`tell application` blocks)
+    should be wrapped in `try` / `on error` — warning. Apps quit, refuse
+    AppleEvents, or change their dictionaries between OS versions;
+    bare blocks crash the whole script.
+  * `on error` handlers that swallow the error message without logging
+    — warning. The user has no idea what went wrong.
+
+  Permission requirements
+  -----------------------
+  * Scripts using `tell application "System Events"` need Accessibility
+    permission — warning if the script doesn't document this in a header
+    comment. Otherwise the user runs it once, sees a permission prompt
+    they don't understand, and the script appears broken.
+  * Scripts reading the filesystem outside the user's own folder need
+    Full Disk Access — warning if undocumented.
+  * Use of `do shell script` with elevated privileges (`with administrator
+    privileges`) prompting for the user's password — warning. Document
+    why elevation is needed; users should not be asked to type their
+    password into a script they don't understand.
+
+  Robustness
+  ----------
+  * UI scripting that hard-codes element indices (`click button 1 of
+    window 1`) — warning. Indices change between app versions; prefer
+    `button "OK" of window 1` or named UI elements.
+  * Long `delay` calls (`delay 5`) as synchronization with UI
+    operations — warning. Brittle; prefer `repeat until exists ...`.
+  * Hard-coded file paths using POSIX format mixed with HFS+ format
+    — warning. Pick one and stick to it.
+"""
 
 
 # ---------------------------------------------------------------------------

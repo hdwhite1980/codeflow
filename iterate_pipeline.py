@@ -860,14 +860,30 @@ def _strip_fences(text: str) -> str:
 def _language_of(path: str) -> str:
     """Best-guess language tag from file extension. Used when the
     Builder doesn't specify one for a new file."""
-    if path.endswith(".py"): return "python"
-    if path.endswith((".ts", ".tsx")): return "typescript"
-    if path.endswith((".js", ".jsx")): return "javascript"
-    if path.endswith(".md"): return "markdown"
-    if path.endswith((".yml", ".yaml")): return "yaml"
-    if path.endswith(".json"): return "json"
-    if path.endswith(".sql"): return "sql"
-    if path.endswith(".sh"): return "bash"
+    lower = path.lower()
+    if lower.endswith(".py"): return "python"
+    if lower.endswith((".ts", ".tsx")): return "typescript"
+    if lower.endswith((".js", ".jsx")): return "javascript"
+    if lower.endswith(".md"): return "markdown"
+    if lower.endswith((".yml", ".yaml")): return "yaml"
+    if lower.endswith(".json"): return "json"
+    if lower.endswith(".sql"): return "sql"
+    # PowerShell — .ps1 scripts, .psm1 modules, .psd1 manifests, .ps1xml
+    # views. The Builder treats them all as one language; the auditor
+    # has finer-grained rules (manifest vs script behave differently).
+    if lower.endswith((".ps1", ".psm1", ".psd1", ".ps1xml")):
+        return "powershell"
+    # KQL — Kusto Query Language. Two extensions used in the wild:
+    # .kql is the Microsoft convention; .csl is the legacy Azure
+    # Data Explorer convention. Either should be recognized.
+    if lower.endswith((".kql", ".csl")): return "kql"
+    # bash family. We use a single tag because the audit concerns are
+    # near-identical (set -euo pipefail applies to all POSIX shells).
+    if lower.endswith((".sh", ".bash", ".zsh")): return "bash"
+    # AppleScript — .applescript is source, .scpt is the compiled
+    # binary form. We only generate source; .scpt detection is here
+    # so the guardian indexer doesn't misclassify imported repos.
+    if lower.endswith((".applescript", ".scpt")): return "applescript"
     return "text"
 
 

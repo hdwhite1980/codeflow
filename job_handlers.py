@@ -1243,21 +1243,28 @@ async def handle_guardian_index(job: dict[str, Any], ctx: HandlerContext) -> Non
 def _language_from_extension(path: str) -> str:
     """Best-effort language tag for the guardian prompt. The model
     handles unknown languages fine but a hint improves quality."""
-    if path.endswith(".py"): return "python"
-    if path.endswith((".ts", ".tsx")): return "typescript"
-    if path.endswith((".js", ".jsx")): return "javascript"
-    if path.endswith(".rs"): return "rust"
-    if path.endswith(".go"): return "go"
-    if path.endswith(".java"): return "java"
-    if path.endswith(".cs"): return "csharp"
-    if path.endswith(".rb"): return "ruby"
-    if path.endswith(".php"): return "php"
-    if path.endswith(".md"): return "markdown"
-    if path.endswith((".yml", ".yaml")): return "yaml"
-    if path.endswith(".json"): return "json"
-    if path.endswith(".sql"): return "sql"
-    if path.endswith(".sh"): return "bash"
-    if path.endswith(".dockerfile") or path.endswith("Dockerfile"): return "dockerfile"
+    lower = path.lower()
+    if lower.endswith(".py"): return "python"
+    if lower.endswith((".ts", ".tsx")): return "typescript"
+    if lower.endswith((".js", ".jsx")): return "javascript"
+    if lower.endswith(".rs"): return "rust"
+    if lower.endswith(".go"): return "go"
+    if lower.endswith(".java"): return "java"
+    if lower.endswith(".cs"): return "csharp"
+    if lower.endswith(".rb"): return "ruby"
+    if lower.endswith(".php"): return "php"
+    if lower.endswith(".md"): return "markdown"
+    if lower.endswith((".yml", ".yaml")): return "yaml"
+    if lower.endswith(".json"): return "json"
+    if lower.endswith(".sql"): return "sql"
+    # MSP / DevOps languages (Turn G-language).
+    if lower.endswith((".ps1", ".psm1", ".psd1", ".ps1xml")):
+        return "powershell"
+    if lower.endswith((".kql", ".csl")): return "kql"
+    if lower.endswith((".sh", ".bash", ".zsh")): return "bash"
+    if lower.endswith((".applescript", ".scpt")): return "applescript"
+    if lower.endswith(".dockerfile") or lower.endswith("dockerfile"):
+        return "dockerfile"
     return "text"
 
 
