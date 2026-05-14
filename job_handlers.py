@@ -1310,6 +1310,23 @@ async def handle_guardian_index(job: dict[str, Any], ctx: HandlerContext) -> Non
     print(f"[handlers] guardian_index: completed for {project_id} — "
           f"{indexed} indexed, {len(failed)} failed",
           flush=True)
+
+    # Ambient review (Turn E). Scan all current summaries for high-
+    # signal risk patterns and write them as project-level findings.
+    # Cheap — no LLM call, just heuristic pattern matching over the
+    # data we just produced. Runs even if some files failed to index;
+    # whatever summaries we have are what we work with.
+    try:
+        from guardian_pipeline import run_ambient_review
+        ambient_findings = run_ambient_review(ctx.store, project_id)
+        if ambient_findings:
+            print(f"[handlers] guardian_index: ambient review wrote "
+                  f"{len(ambient_findings)} finding(s) for {project_id}",
+                  flush=True)
+    except Exception as exc:
+        print(f"[handlers] guardian_index: ambient review failed: "
+              f"{type(exc).__name__}: {exc}", flush=True)
+
     # Tell the continuous indexer it can re-evaluate this project on
     # the next tick. Without this call the daemon would treat the
     # project as permanently in-flight after one autonomous queue.

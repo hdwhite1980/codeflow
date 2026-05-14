@@ -13,6 +13,7 @@
  */
 
 import type {
+  AmbientFindingsResponse,
   ArtifactListResponse,
   AuditResponse,
   CreateProjectRequest,
@@ -268,6 +269,28 @@ export async function reindexFile(
   return postJSON<{ file_path: string }, { project_id: string; status: string }>(
     `/api/projects/${encodeURIComponent(projectId)}/guardian/index`,
     { file_path: filePath },
+  );
+}
+
+// -- Ambient findings (Turn E) ------------------------------------
+
+export async function getAmbientFindings(
+  projectId: string,
+): Promise<AmbientFindingsResponse> {
+  return getJSON<AmbientFindingsResponse>(
+    `/api/projects/${encodeURIComponent(projectId)}/findings`,
+  );
+}
+
+export async function dismissFinding(
+  projectId: string, digest: string, reason?: string,
+): Promise<{ project_id: string; digest: string; dismissed: boolean }> {
+  return postJSON<
+    { reason?: string },
+    { project_id: string; digest: string; dismissed: boolean }
+  >(
+    `/api/projects/${encodeURIComponent(projectId)}/findings/${encodeURIComponent(digest)}/dismiss`,
+    reason ? { reason } : {},
   );
 }
 

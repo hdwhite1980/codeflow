@@ -1563,3 +1563,201 @@ def _coerce_string_list(value: Any, max_items: int = 10) -> list[str]:
     if isinstance(value, str):
         return [value[:500]]
     return []
+
+
+# ---------------------------------------------------------------------------
+# Ambient findings (Turn E).
+# ---------------------------------------------------------------------------
+#
+# Proactive concerns generated from existing file summaries' risk_notes.
+# See ambient_review.py for the generation logic. This section handles
+# persistence, listing, and dismissal.
+#
+# Storage shape:
+#   artifact_key = `ambient_finding:<project_id>:<digest>`
+#   tier = SPEC, kind = DECISION_RECORD
+#   body = {
+#     digest, severity, score, title, description,
+#     file_paths: [...], evidence: [{path, note, score}, ...],
+#     detected_at, dismissed_at, dismissed_reason
+#   }
+#
+# Digests are stable hashes derived from topic + files involved. Re-runs
+# produce the same digest for the same concern, so the artifact-key-based
+# upsert dedups naturally. Severity/score may update on re-run; that's
+# desirable when new evidence arrives.
+
+def write_ambient_finding(
+    store: "LedgerStore",
+    project_id: str,
+    finding: "AmbientFinding",
+) -> None:
+    """Persist one ambient finding. If a finding with the same digest
+    already exists, this supersedes it (standard ledger versioning)."""
+    from ambient_review import AmbientFinding as _AF  # local import to
+    # avoid module-level circular dep; ambient_review imports nothing
+    # from guardian_pipeline so this is just defensive.
+    assert isinstance(finding, _AF), "expected AmbientFinding"
+    body: dict[str, Any] = {
+        "digest": finding.digest,
+        "severity": finding.severity,
+        "score": finding.score,
+        "title": finding.title,
+        "description": finding.description,
+        "file_paths": list(finding.file_paths),
+        "evidence": list(finding.evidence),
+        "detected_at": finding.detected_at,
+        "dismissed_at": finding.dismissed_at,
+        "dismissed_reason": finding.dismissed_reason,
+    }
+    store.write_entry(
+        project_id=project_id,
+        tier=Tier.SPEC,
+        artifact_kind=ArtifactKind.DECISION_RECORD,
+        artifact_key=f"ambient_finding:{project_id}:{finding.digest}",
+        body=body,
+        rationale=(
+            f"Ambient: [{finding.severity}] {finding.title} "
+            f"({len(finding.file_paths)} file"
+            f"{'s' if len(finding.file_paths) > 1 else ''})"
+        ),
+        author="guardian:ambient_review",
+    )
+
+
+def list_ambient_findings(
+    store: "LedgerStore", project_id: str, *, include_dismissed: bool = False,
+) -> list[dict[str, Any]]:
+    """Return all ambient findings for a project. Dismissed findings
+    are excluded by default — the UI uses include_dismissed=True for a
+    "history" view if we add one later.
+
+    Sorted critical-first, then by score desc within severity tier.
+    """
+    decisions = store.all_current(project_id, ArtifactKind.DECISION_RECORD)
+    out: list[dict[str, Any]] = []
+    for d in decisions:
+        if not d.artifact_key.startswith(f"ambient_finding:{project_id}:"):
+            continue
+        try:
+            blob, _ = store.get_blob(d.blob_sha256)
+            body = json.loads(blob.decode("utf-8")) if blob else {}
+        except Exception as exc:
+            print(f"[ambient] failed to load {d.artifact_key}: "
+                  f"{type(exc).__name__}: {exc}", flush=True)
+            continue
+        if not include_dismissed and body.get("dismissed_at"):
+            continue
+        out.append(body)
+
+    severity_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+    out.sort(key=lambda f: (
+        severity_rank.get(f.get("severity", "low"), 4),
+        -int(f.get("score", 0)),
+    ))
+    return out
+
+
+def dismiss_ambient_finding(
+    store: "LedgerStore",
+    project_id: str,
+    digest: str,
+    *,
+    reason: Optional[str] = None,
+) -> bool:
+    """Mark a finding as dismissed. Returns True on success, False
+    when the digest doesn't match any current finding.
+
+    Dismissal writes a new ledger entry with the same artifact_key,
+    superseding the previous one. The new entry has dismissed_at set;
+    list_ambient_findings filters it out by default.
+
+    Re-detection logic: if generate_findings later produces a finding
+    with the SAME digest, we re-write it with dismissed_at=None — the
+    user dismissed it once but the same evidence re-emerged. If new
+    evidence produces a DIFFERENT digest (different files, etc.) it's
+    a fresh finding and shows up undismissed.
+    """
+    target_key = f"ambient_finding:{project_id}:{digest}"
+    current = store.current_entry(project_id, target_key)
+    if current is None:
+        return False
+    try:
+        blob, _ = store.get_blob(current.blob_sha256)
+        body = json.loads(blob.decode("utf-8")) if blob else {}
+    except Exception as exc:
+        print(f"[ambient] dismiss failed to load {target_key}: "
+              f"{type(exc).__name__}: {exc}", flush=True)
+        return False
+
+    body["dismissed_at"] = time.time()
+    body["dismissed_reason"] = reason
+
+    store.write_entry(
+        project_id=project_id,
+        tier=Tier.SPEC,
+        artifact_kind=ArtifactKind.DECISION_RECORD,
+        artifact_key=target_key,
+        body=body,
+        rationale=f"Ambient finding dismissed by user. Reason: {reason or '(none)'}",
+        author="user:dismiss",
+    )
+    return True
+
+
+def run_ambient_review(
+    store: "LedgerStore", project_id: str,
+) -> list[dict[str, Any]]:
+    """Generate ambient findings from current summaries and persist them.
+
+    Returns the list of finding bodies that were written. Safe to call
+    repeatedly — same evidence produces the same digests, so re-runs
+    upsert in place.
+
+    A finding that was previously dismissed and re-emerges with the
+    SAME digest re-appears (dismissed_at gets cleared). This is the
+    explicit re-activation case: "user said no, but evidence persists
+    or grew, so we re-surface." If you don't want that behavior, give
+    the project an indexer break and clear dismissals manually.
+    """
+    from ambient_review import generate_findings
+    summaries = load_file_summaries(store, project_id)
+    findings = generate_findings(summaries)
+    written: list[dict[str, Any]] = []
+    for f in findings:
+        # Check existing entry for prior dismissal state. We preserve
+        # the dismissed flags only if the new score is <= old score
+        # (i.e. evidence didn't strengthen). If new score > old, treat
+        # as fresh and clear dismissal.
+        target_key = f"ambient_finding:{project_id}:{f.digest}"
+        previous = store.current_entry(project_id, target_key)
+        if previous is not None:
+            try:
+                blob, _ = store.get_blob(previous.blob_sha256)
+                prev_body = json.loads(blob.decode("utf-8")) if blob else {}
+            except Exception:
+                prev_body = {}
+            prev_dismissed = prev_body.get("dismissed_at")
+            prev_score = int(prev_body.get("score", 0))
+            if prev_dismissed and f.score <= prev_score:
+                # Same or weaker evidence — preserve dismissal.
+                from dataclasses import replace as _replace
+                f = _replace(
+                    f,
+                    dismissed_at=prev_dismissed,
+                    dismissed_reason=prev_body.get("dismissed_reason"),
+                )
+        write_ambient_finding(store, project_id, f)
+        written.append({
+            "digest": f.digest,
+            "severity": f.severity,
+            "score": f.score,
+            "title": f.title,
+            "description": f.description,
+            "file_paths": list(f.file_paths),
+            "evidence": list(f.evidence),
+            "detected_at": f.detected_at,
+            "dismissed_at": f.dismissed_at,
+            "dismissed_reason": f.dismissed_reason,
+        })
+    return written

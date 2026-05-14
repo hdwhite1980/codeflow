@@ -575,3 +575,35 @@ export interface ProjectMemorySymbolsResponse {
   symbols: SymbolSummary[];
   count: number;
 }
+
+// -- Ambient findings (Turn E) ------------------------------------
+//
+// Project-level concerns generated automatically from guardian
+// summaries' risk_notes. The backend runs ambient review after every
+// guardian_index pass and persists findings to the ledger; the
+// frontend renders them in the AmbientFindingsPanel.
+
+export interface AmbientFindingEvidence {
+  path: string;
+  note: string;
+  score: number;
+}
+
+export interface AmbientFinding {
+  digest: string;        // stable hash; used as the dismiss path id
+  severity: "low" | "medium" | "high" | "critical";
+  score: number;
+  title: string;
+  description: string;
+  file_paths: string[];
+  evidence: AmbientFindingEvidence[];
+  detected_at: number;
+  dismissed_at?: number | null;
+  dismissed_reason?: string | null;
+}
+
+export interface AmbientFindingsResponse {
+  project_id: string;
+  findings: AmbientFinding[];
+  count: number;
+}

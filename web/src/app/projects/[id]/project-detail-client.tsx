@@ -10,6 +10,7 @@ import { GraphView } from "@/components/graph-view";
 import { IterationHistory } from "@/components/iteration-history";
 import { IterationInput } from "@/components/iteration-input";
 import { LiveIndicator } from "@/components/live-indicator";
+import { AmbientFindingsPanel } from "@/components/ambient-findings-panel";
 import { ProjectMemoryPanel } from "@/components/project-memory-panel";
 import { RiskAnalyzer } from "@/components/risk-analyzer";
 import { RiskHistory } from "@/components/risk-history";
@@ -351,7 +352,11 @@ export function ProjectDetailClient({
           // symbol-level). Triggers a Memory panel refresh so users see
           // new summaries arrive without manual reload.
           entry.artifact_key?.startsWith(`semantic:`) ||
-          entry.artifact_key?.startsWith(`semantic_symbol:`)
+          entry.artifact_key?.startsWith(`semantic_symbol:`) ||
+          // Ambient findings (Turn E) — generated after every
+          // guardian_index pass. Bumping refreshKey makes the
+          // Concerns panel pull the new list.
+          entry.artifact_key?.startsWith(`ambient_finding:`)
         ) {
           setRiskRefreshKey((k) => k + 1);
         }
@@ -545,6 +550,15 @@ export function ProjectDetailClient({
             onAssessment={() => setRiskRefreshKey((k) => k + 1)}
           />
           <RiskHistory projectId={projectId} refreshKey={riskRefreshKey} />
+          {/* Project Concerns — ambient findings auto-generated from
+              guardian risk_notes. Lives between risk history and
+              memory because semantically it sits between the two:
+              risk is on-demand reasoning, concerns are proactive
+              reasoning, memory is the substrate both rely on. */}
+          <AmbientFindingsPanel
+            projectId={projectId}
+            refreshKey={riskRefreshKey}
+          />
           {/* Project Memory panel — the literal "Project Memory" UI.
               Lives in the same column as the risk panels because both
               are guardian-driven; risk is reasoning, memory is the

@@ -1526,6 +1526,72 @@ async def list_memory_references_endpoint(project_id: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Ambient findings (Turn E).
+# ---------------------------------------------------------------------------
+#
+# Project-level concerns generated automatically from guardian summaries.
+# See ambient_review.py for generation; guardian_pipeline.run_ambient_review
+# is invoked by handle_guardian_index after each indexing pass.
+#
+# Two endpoints: list (filtered by default to undismissed), dismiss
+# (records a user's decision to suppress the finding).
+
+@app.get("/api/projects/{project_id}/findings")
+async def list_findings_endpoint(
+    project_id: str, include_dismissed: bool = False,
+) -> dict[str, Any]:
+    """Return ambient findings for a project, sorted by severity desc.
+
+    ?include_dismissed=true also returns previously-dismissed findings
+    (useful for a future "audit log" view; default excludes them).
+    """
+    from guardian_pipeline import list_ambient_findings
+    store: LedgerStore = app.state.store
+    findings = list_ambient_findings(
+        store, project_id, include_dismissed=include_dismissed,
+    )
+    return {
+        "project_id": project_id,
+        "findings": findings,
+        "count": len(findings),
+    }
+
+
+class DismissFindingRequest(BaseModel):
+    reason: Optional[str] = Field(None, max_length=500)
+
+
+class DismissFindingResponse(BaseModel):
+    project_id: str
+    digest: str
+    dismissed: bool
+
+
+@app.post(
+    "/api/projects/{project_id}/findings/{digest}/dismiss",
+    response_model=DismissFindingResponse,
+)
+async def dismiss_finding_endpoint(
+    project_id: str, digest: str,
+    req: DismissFindingRequest = DismissFindingRequest(),
+) -> DismissFindingResponse:
+    """Mark a finding as dismissed by the user.
+
+    Dismissal is idempotent — dismissing twice is harmless. If the
+    same digest re-emerges with materially stronger evidence (higher
+    score), run_ambient_review clears the dismissal automatically.
+    """
+    from guardian_pipeline import dismiss_ambient_finding
+    store: LedgerStore = app.state.store
+    ok = dismiss_ambient_finding(
+        store, project_id, digest, reason=req.reason,
+    )
+    return DismissFindingResponse(
+        project_id=project_id, digest=digest, dismissed=ok,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Risk gate — proceed/cancel for paused iterations and fix-all passes.
 # ---------------------------------------------------------------------------
 #
