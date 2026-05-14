@@ -288,6 +288,60 @@ async def create_project(req: CreateProjectRequest) -> CreateProjectResponse:
     return CreateProjectResponse(project_id=project_id, slug=req.slug)
 
 
+# ---------------------------------------------------------------------------
+# Project import — clone a public GitHub repo as a new project.
+# ---------------------------------------------------------------------------
+
+class ImportProjectRequest(BaseModel):
+    url: str = Field(..., min_length=3, max_length=500)
+    slug: Optional[str] = None
+
+
+class ImportProjectResponse(BaseModel):
+    project_id: str
+    slug: str
+    status: str
+
+
+@app.post("/api/projects/import", response_model=ImportProjectResponse)
+async def import_project(req: ImportProjectRequest) -> ImportProjectResponse:
+    """Import a public GitHub repo as a new project.
+
+    Returns immediately with a project_id; the worker clones, walks,
+    writes file ledger entries, and queues guardian indexing in the
+    background. The frontend should redirect to /projects/<id> which
+    will show 'importing...' until the outcome record lands.
+    """
+    from import_pipeline import parse_github_url
+    store: LedgerStore = app.state.store
+    queue: JobQueue = app.state.queue
+
+    # Parse URL up front so a bad URL is a fast 4xx rather than a
+    # confusing 500 once the worker picks it up.
+    try:
+        owner, repo, _https = parse_github_url(req.url)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    slug = req.slug or f"{owner}-{repo}"
+    slug = "".join(
+        c if c.isalnum() or c == "-" else "-" for c in slug.lower()
+    )
+    slug = slug.strip("-")[:60] or "imported-repo"
+
+    project_id = store.create_project(slug, f"Imported from {req.url}")
+
+    await queue.enqueue(make_job(
+        "import_repo",
+        project_id=project_id,
+        url=req.url,
+    ))
+
+    return ImportProjectResponse(
+        project_id=project_id, slug=slug, status="queued",
+    )
+
+
 @app.get("/api/projects/{project_id}/artifacts")
 async def list_artifacts(
     project_id: str, kind: Optional[str] = None,

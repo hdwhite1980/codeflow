@@ -523,3 +523,16 @@ export interface ProjectMemoryResponse {
   summaries: ProjectMemoryEntry[];
   count: number;
 }
+
+// -- Import existing repo (Turn G-C) -------------------------------
+
+export interface ImportProjectRequest {
+  url: string;
+  slug?: string;
+}
+
+export interface ImportProjectResponse {
+  project_id: string;
+  slug: string;
+  status: string;
+}

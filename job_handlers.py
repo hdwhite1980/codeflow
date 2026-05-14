@@ -1238,6 +1238,79 @@ def _language_from_extension(path: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Handler: import_repo — clone a public GitHub repo, write its files to
+# the ledger, then queue a guardian indexing pass over the whole project.
+# ---------------------------------------------------------------------------
+
+async def handle_import_repo(
+    job: dict[str, Any], ctx: HandlerContext,
+) -> None:
+    """Import a public repo by URL into an existing project.
+
+    The project must already exist (created by the API endpoint that
+    enqueued this job). We then:
+      1. Mark import:started.
+      2. Run the import pipeline (clone, walk, write file entries).
+      3. Mark import:outcome with stats.
+      4. If any files imported AND guardian is enabled on this worker,
+         queue a guardian_index job. The import handler returns
+         immediately; indexing runs in the background.
+
+    Failure handling: any exception during import is captured in the
+    outcome record. The handler never raises — the worker dispatcher
+    would log the traceback but the project would be stuck in
+    "importing…" state with no visible outcome. Better to always
+    write an outcome row, even on failure.
+    """
+    project_id = job.get("project_id")
+    url = job.get("url", "")
+    if not project_id or not url:
+        print(f"[handlers] import_repo: missing project_id or url in "
+              f"{job!r}; dropping", flush=True)
+        return
+
+    from import_pipeline import (
+        import_repository, write_import_started, write_import_outcome,
+    )
+
+    write_import_started(ctx.store, project_id, url)
+    print(f"[handlers] import_repo: starting {url} -> {project_id}",
+          flush=True)
+
+    try:
+        outcome = await import_repository(
+            url=url, project_id=project_id, store=ctx.store,
+        )
+    except Exception as exc:
+        # Defensive: import_repository is supposed to catch its own
+        # errors and put them in the outcome. If something slips, log
+        # and synthesize a minimal outcome so the UI doesn't hang.
+        print(f"[handlers] import_repo: pipeline raised: "
+              f"{type(exc).__name__}: {exc}", flush=True)
+        from import_pipeline import ImportOutcome
+        outcome = ImportOutcome(
+            repo_url=url,
+            error=f"{type(exc).__name__}: {str(exc)[:300]}",
+        )
+
+    write_import_outcome(ctx.store, project_id, outcome)
+    print(f"[handlers] import_repo: outcome — {outcome.files_imported} "
+          f"files in {outcome.elapsed_seconds:.1f}s "
+          f"{'(ERROR: ' + outcome.error + ')' if outcome.error else ''}",
+          flush=True)
+
+    # If we got files, queue guardian indexing. The worker indexes
+    # asynchronously; users can start iterating before indexing finishes.
+    if outcome.files_imported > 0:
+        await ctx.queue.enqueue(make_job(
+            "guardian_index",
+            project_id=project_id,
+        ))
+        print(f"[handlers] import_repo: queued guardian_index for "
+              f"{project_id}", flush=True)
+
+
+# ---------------------------------------------------------------------------
 # Registry. Add new handlers here.
 # ---------------------------------------------------------------------------
 
@@ -1249,6 +1322,7 @@ HANDLERS: dict[str, HandlerFn] = {
     "iterate_project": handle_iterate_project,
     "fix_all": handle_fix_all,
     "guardian_index": handle_guardian_index,
+    "import_repo": handle_import_repo,
 }
 
 

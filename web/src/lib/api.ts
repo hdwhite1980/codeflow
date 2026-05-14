@@ -27,6 +27,8 @@ import type {
   IterateResponse,
   IterationListResponse,
   IterationRisksResponse,
+  ImportProjectRequest,
+  ImportProjectResponse,
   MemoryReferencesResponse,
   ProjectListResponse,
   ProjectMemoryResponse,
@@ -254,6 +256,17 @@ export async function reindexFile(
   return postJSON<{ file_path: string }, { project_id: string; status: string }>(
     `/api/projects/${encodeURIComponent(projectId)}/guardian/index`,
     { file_path: filePath },
+  );
+}
+
+// -- Import existing repo (Turn G-C) ------------------------------
+
+export async function importProject(
+  req: ImportProjectRequest,
+): Promise<ImportProjectResponse> {
+  return postJSON<ImportProjectRequest, ImportProjectResponse>(
+    `/api/projects/import`,
+    req,
   );
 }
 

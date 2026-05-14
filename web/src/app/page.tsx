@@ -1,3 +1,4 @@
+import { ImportProjectForm } from "@/components/import-project-form";
 import { NewProjectForm } from "@/components/new-project-form";
 import { ProjectCard } from "@/components/project-card";
 import { listProjects } from "@/lib/api";
@@ -24,8 +25,9 @@ export default async function HomePage() {
 
   return (
     <div className="grid gap-8 md:grid-cols-[2fr_3fr]">
-      <section>
+      <section className="space-y-4">
         <NewProjectForm />
+        <ImportProjectForm />
       </section>
       <section>
         <h2 className="mb-4 text-sm font-semibold uppercase tracking-wide text-muted-foreground">
