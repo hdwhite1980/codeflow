@@ -94,6 +94,31 @@ class InMemoryLedgerStore:
     def set_project_status(self, project_id: str, status: str) -> None:
         self._projects[project_id].status = status
 
+    def delete_project(self, project_id: str) -> bool:
+        """In-memory equivalent: drop the project and all of its
+        ledger entries / nodes / edges / etc."""
+        if project_id not in self._projects:
+            return False
+        del self._projects[project_id]
+        # Drop everything keyed by this project_id. Sweep each registry;
+        # registries that don't key by project_id (e.g. blobs) are
+        # intentionally left alone, matching the SQL impl.
+        self._entries = [
+            e for e in self._entries if e.project_id != project_id
+        ]
+        self._nodes = {
+            k: v for k, v in self._nodes.items()
+            if k[0] != project_id
+        }
+        self._edges = [
+            e for e in self._edges if e.project_id != project_id
+        ]
+        self._manifest = {
+            k: v for k, v in self._manifest.items()
+            if k[0] != project_id
+        }
+        return True
+
     # -- core write --------------------------------------------------------
 
     def write_entry(

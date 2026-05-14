@@ -777,6 +777,52 @@ async def handle_fix_all(job: dict[str, Any], ctx: HandlerContext) -> None:
           f"{len(pre_findings)} issue(s) across {files_affected} file(s)",
           flush=True)
 
+    # Stop-flag setup. We check at every stage boundary; if the user
+    # clicked stop, we write a :stopped marker and bail. Stop checks
+    # are cooperative — granularity is "between stages," not "mid-LLM-call."
+    from stop_flag import make_stop_flag, fix_all_stop_key
+    stop_flag = make_stop_flag()
+    stop_key = fix_all_stop_key(project_id, seq)
+
+    async def _check_stop(stage: str) -> bool:
+        """Returns True if we should bail. On bail, writes the :stopped
+        marker and a final report so the UI shows a clean cancellation."""
+        if not await stop_flag.is_set(stop_key):
+            return False
+        print(f"[handlers] fix_all: pass {seq} stop requested at {stage}; "
+              f"bailing", flush=True)
+        ctx.store.write_entry(
+            project_id=project_id,
+            tier=Tier.SPEC,
+            artifact_kind=ArtifactKind.DECISION_RECORD,
+            artifact_key=f"fix_all:{seq}:stopped",
+            body={
+                "fix_all_seq": seq,
+                "stopped_at_stage": stage,
+                "stopped_at": time.time(),
+            },
+            rationale=(
+                f"Fix-all pass {seq} stopped by user request at stage: {stage}."
+            ),
+            author=f"worker:fix_all:{seq}",
+        )
+        write_fix_all_report(
+            ctx.store, project_id, seq,
+            report=(
+                f"Fix-all pass {seq} stopped by user at the {stage} stage. "
+                f"Any files already changed during this pass remain as-is; "
+                f"no rollback is performed."
+            ),
+            pre_count=len(pre_findings),
+            post_count=len(pre_findings),
+            fixed=0, regressions=0,
+        )
+        await stop_flag.clear(stop_key)
+        return True
+
+    if await _check_stop("pre-flight"):
+        return
+
     # Phase 1.5: pre-flight risk for the fix-all. Same shape as
     # iteration pre-flight: assess the implied changes, pause on
     # critical pending user proceed/cancel.
@@ -852,6 +898,9 @@ async def handle_fix_all(job: dict[str, Any], ctx: HandlerContext) -> None:
             print(f"[handlers] fix_all: pre_risk failed: "
                   f"{type(exc).__name__}: {exc}; continuing", flush=True)
 
+    if await _check_stop("post-risk-pre-iteration"):
+        return
+
     # Phase 2: run a normal iteration. We use the existing iterate
     # pipeline (not a fresh build) because the Builder is good at
     # taking a list-of-issues prompt + current file contents and
@@ -901,6 +950,9 @@ async def handle_fix_all(job: dict[str, Any], ctx: HandlerContext) -> None:
             pre_count=len(pre_findings), post_count=len(pre_findings),
             fixed=0, regressions=0,
         )
+        return
+
+    if await _check_stop("post-iteration-pre-audit"):
         return
 
     # Phase 3: run the audit inline so we can compare pre vs post.
@@ -1027,6 +1079,10 @@ async def handle_fix_all(job: dict[str, Any], ctx: HandlerContext) -> None:
         pre_count=len(pre_findings), post_count=len(post_findings),
         fixed=fixed, regressions=regressions,
     )
+    # Clear any stop flag — pass completed normally. Without this, a
+    # stale request_stop call from before the pass started could leak
+    # to the next pass.
+    await stop_flag.clear(stop_key)
     print(f"[handlers] fix_all: pass {seq} complete for {project_id} — "
           f"fixed {fixed}, remaining {len(post_findings)}, "
           f"regressions {regressions}", flush=True)

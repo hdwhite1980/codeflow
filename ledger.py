@@ -275,6 +275,33 @@ class LedgerStore:
             )
             conn.commit()
 
+    def delete_project(self, project_id: str) -> bool:
+        """Delete a project and all its descendants.
+
+        The schema has ON DELETE CASCADE on every child table that
+        references projects(id), so this single DELETE removes:
+          - ledger_entries
+          - graph_nodes / graph_edges
+          - manifest_items
+          - token_usage rows
+          - everything else keyed off project_id
+
+        Artifact blobs are NOT deleted — they're keyed by content hash
+        and may be shared across projects. Orphan blobs accumulate and
+        would need a separate sweep eventually; for now the cost is
+        small enough we accept it.
+
+        Returns True if a row was deleted, False if no project matched.
+        """
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM projects WHERE id = %s",
+                (project_id,),
+            )
+            deleted = cur.rowcount > 0
+            conn.commit()
+            return deleted
+
     # -- artifact blobs ----------------------------------------------------
 
     @staticmethod

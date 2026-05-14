@@ -1473,6 +1473,89 @@ async def fix_all_cancel(
 
 
 # ---------------------------------------------------------------------------
+# Stop fix-all (mid-execution cancellation, not pre-flight pause)
+# ---------------------------------------------------------------------------
+#
+# Different from /cancel — that's for paused-at-pre-flight passes
+# awaiting a proceed/cancel decision. This /stop endpoint is for
+# passes that are actively running and need to be aborted between
+# stages. The worker checks the stop flag at every stage boundary
+# (pre-flight → iteration → audit → report) and bails gracefully
+# with a `fix_all:<seq>:stopped` ledger marker if set.
+
+class StopFixAllResponse(BaseModel):
+    project_id: str
+    seq: int
+    requested: bool
+
+
+@app.post(
+    "/api/projects/{project_id}/fix-all/{seq}/stop",
+    response_model=StopFixAllResponse,
+)
+async def fix_all_stop(
+    project_id: str, seq: int,
+) -> StopFixAllResponse:
+    """Request a fix-all pass to stop at the next stage boundary.
+
+    The worker checks this between stages. If it's already past the
+    last check (writing the final report), the stop has no effect.
+    Idempotent — calling twice is harmless.
+    """
+    from stop_flag import make_stop_flag, fix_all_stop_key
+    flag = make_stop_flag()
+    key = fix_all_stop_key(project_id, seq)
+    ok = await flag.request_stop(key)
+    return StopFixAllResponse(
+        project_id=project_id, seq=seq, requested=ok,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Project deletion
+# ---------------------------------------------------------------------------
+#
+# Hard delete. The schema cascades on ON DELETE CASCADE, so removing
+# the projects row removes ledger_entries, graph_nodes, graph_edges,
+# manifest_items, and token_usage rows for the project. Artifact blobs
+# are content-addressed and shared across projects; they're NOT
+# deleted here. Orphan blob cleanup is a separate concern.
+#
+# No "soft delete" or trash semantics. The user is responsible for
+# being sure before they click. We could add a 30-day undo later if
+# this becomes a real footgun.
+
+class DeleteProjectResponse(BaseModel):
+    project_id: str
+    deleted: bool
+
+
+@app.delete(
+    "/api/projects/{project_id}",
+    response_model=DeleteProjectResponse,
+)
+async def delete_project(project_id: str) -> DeleteProjectResponse:
+    """Permanently delete a project and all its artifacts.
+
+    Returns deleted=true on success, deleted=false if the project_id
+    didn't match a row. Either response is HTTP 200; we don't 404 a
+    missing project because the client's goal ("make this not exist")
+    is satisfied either way.
+    """
+    store: LedgerStore = app.state.store
+    try:
+        deleted = store.delete_project(project_id)
+    except Exception as exc:
+        print(f"[delete] project {project_id} failed: "
+              f"{type(exc).__name__}: {exc}", flush=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Delete failed: {type(exc).__name__}",
+        )
+    return DeleteProjectResponse(project_id=project_id, deleted=deleted)
+
+
+# ---------------------------------------------------------------------------
 # Impact analysis endpoints
 # ---------------------------------------------------------------------------
 

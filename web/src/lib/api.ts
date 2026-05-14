@@ -237,6 +237,55 @@ export async function getMemoryReferences(
   );
 }
 
+// -- Stop a running fix-all pass -----------------------------------
+//
+// Different from `cancelFixAll` (which is for paused-at-pre-flight
+// passes awaiting a proceed/cancel decision). This /stop endpoint
+// requests cooperative cancellation of a pass that is actively
+// running through its stages. The worker checks the stop flag at
+// stage boundaries and bails gracefully.
+
+export interface StopFixAllResponse {
+  project_id: string;
+  seq: number;
+  requested: boolean;
+}
+
+export async function stopFixAll(
+  projectId: string, seq: number,
+): Promise<StopFixAllResponse> {
+  return postJSON<Record<string, never>, StopFixAllResponse>(
+    `/api/projects/${encodeURIComponent(projectId)}/fix-all/${seq}/stop`,
+    {},
+  );
+}
+
+// -- Delete project -----------------------------------------------
+//
+// Hard delete. Cascades to all ledger entries, graph nodes, edges,
+// manifest items, and usage rows for the project. Artifact blobs
+// remain (they're content-addressed and may be shared). No undo.
+
+export interface DeleteProjectResponse {
+  project_id: string;
+  deleted: boolean;
+}
+
+export async function deleteProject(
+  projectId: string,
+): Promise<DeleteProjectResponse> {
+  const url = `${apiBase()}/api/projects/${encodeURIComponent(projectId)}`;
+  const res = await fetch(url, {
+    method: "DELETE",
+    cache: "no-store",
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new ApiError(res.status, body, `DELETE /api/projects/${projectId}`);
+  }
+  return (await res.json()) as DeleteProjectResponse;
+}
+
 // Proceed / cancel a paused iteration after critical pre-flight risk.
 // The backend pushes the decision onto the risk gate; the worker
 // wakes up and either proceeds with regen or writes a cancellation
