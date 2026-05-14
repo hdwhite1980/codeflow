@@ -281,3 +281,92 @@ class TestListFixAllRisks(unittest.TestCase):
         self.assertEqual(set(result.keys()), {3})
         self.assertIn("pre_risk", result[3])
         self.assertIn("post_risk", result[3])
+
+
+# ---------------------------------------------------------------------------
+# Memory visibility (Turn G-A) — build_pipeline_context_with_paths +
+# list_memory_references.
+# ---------------------------------------------------------------------------
+
+class TestBuildPipelineContextWithPaths(unittest.TestCase):
+    def test_no_summaries_returns_empty_pair(self):
+        from guardian_pipeline import build_pipeline_context_with_paths
+        store = InMemoryLedgerStore()
+        pid = store.create_project("t", "t")
+        ctx, paths = build_pipeline_context_with_paths(store, pid)
+        self.assertEqual(ctx, "")
+        self.assertEqual(paths, [])
+
+    def test_returns_paths_matching_block(self):
+        from guardian_pipeline import (
+            FileSummary, build_pipeline_context_with_paths,
+            write_file_summary,
+        )
+        store = InMemoryLedgerStore()
+        pid = store.create_project("t", "t")
+        for p in ("a.py", "b.py", "c.py"):
+            write_file_summary(store, pid, FileSummary(
+                file_path=p, plain_english="x", technical="y",
+                purpose=f"purpose of {p}", touches=[], assumes=[],
+                failure_modes=[], risk_notes=[], indexed_at=0.0,
+                indexer_model="m", input_tokens=10, output_tokens=20,
+            ))
+        ctx, paths = build_pipeline_context_with_paths(store, pid)
+        self.assertEqual(sorted(paths), ["a.py", "b.py", "c.py"])
+        # Each path appears in the context string too.
+        for p in paths:
+            self.assertIn(p, ctx)
+
+    def test_excludes_paths(self):
+        from guardian_pipeline import (
+            FileSummary, build_pipeline_context_with_paths,
+            write_file_summary,
+        )
+        store = InMemoryLedgerStore()
+        pid = store.create_project("t", "t")
+        for p in ("a.py", "b.py"):
+            write_file_summary(store, pid, FileSummary(
+                file_path=p, plain_english="", technical="",
+                purpose="", touches=[], assumes=[], failure_modes=[],
+                risk_notes=[], indexed_at=0.0, indexer_model="m",
+                input_tokens=0, output_tokens=0,
+            ))
+        ctx, paths = build_pipeline_context_with_paths(
+            store, pid, exclude_paths=["a.py"],
+        )
+        self.assertEqual(paths, ["b.py"])
+
+
+class TestListMemoryReferences(unittest.TestCase):
+    def test_empty_when_no_iterations(self):
+        from guardian_pipeline import list_memory_references
+        store = InMemoryLedgerStore()
+        pid = store.create_project("t", "t")
+        self.assertEqual(list_memory_references(store, pid), {})
+
+    def test_reads_back_stored_references(self):
+        from guardian_pipeline import list_memory_references
+        from ledger import ArtifactKind, Tier
+        store = InMemoryLedgerStore()
+        pid = store.create_project("t", "t")
+        # Write a memory_references record manually (the iterate
+        # pipeline does this in production).
+        store.write_entry(
+            project_id=pid, tier=Tier.SPEC,
+            artifact_kind=ArtifactKind.DECISION_RECORD,
+            artifact_key="iteration:5:memory_references",
+            body={
+                "iteration_seq": 5,
+                "referenced_paths": ["app/main.py", "app/db.py"],
+                "reference_count": 2,
+                "context_chars": 234,
+            },
+            rationale="test", author="test",
+        )
+        result = list_memory_references(store, pid)
+        self.assertIn(5, result)
+        self.assertEqual(result[5]["reference_count"], 2)
+        self.assertEqual(
+            sorted(result[5]["referenced_paths"]),
+            ["app/db.py", "app/main.py"],
+        )

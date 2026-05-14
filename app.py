@@ -1360,6 +1360,21 @@ async def list_fix_all_risk_records(project_id: str) -> dict[str, Any]:
     return {"project_id": project_id, "by_seq": by_seq}
 
 
+@app.get("/api/projects/{project_id}/memory-references")
+async def list_memory_references_endpoint(project_id: str) -> dict[str, Any]:
+    """Return per-iteration memory reference records.
+
+    Each entry tells the frontend which guardian-indexed files were
+    pulled into context for that iteration. Used to render
+    "Guardian referenced N files" UI on iteration cards — making
+    the memory work visible to users.
+    """
+    from guardian_pipeline import list_memory_references
+    store: LedgerStore = app.state.store
+    by_seq = list_memory_references(store, project_id)
+    return {"project_id": project_id, "by_seq": by_seq}
+
+
 # ---------------------------------------------------------------------------
 # Risk gate — proceed/cancel for paused iterations and fix-all passes.
 # ---------------------------------------------------------------------------

@@ -20,6 +20,7 @@ import {
   getGraph,
   getIterationRisks,
   getIterations,
+  getMemoryReferences,
 } from "@/lib/api";
 import type {
   AuditResponse,
@@ -29,6 +30,7 @@ import type {
   GraphResponse,
   Iteration,
   IterationRisks,
+  MemoryReferences,
   UsageRow,
   UsageSummary,
   WSEvent,
@@ -107,6 +109,13 @@ export function ProjectDetailClient({
   const [fixAllRisks, setFixAllRisks] = useState<
     Record<number, FixAllRisks>
   >({});
+  // Memory references keyed by iteration seq — which guardian files
+  // were pulled into context for each iteration. Surfaced in the
+  // iteration history cards as a clickable "Guardian referenced N
+  // files" badge.
+  const [memoryReferences, setMemoryReferences] = useState<
+    Record<number, MemoryReferences>
+  >({});
 
   // Initial graph fetch on mount.
   useEffect(() => {
@@ -155,7 +164,8 @@ export function ProjectDetailClient({
     };
   }, [projectId]);
 
-  // Initial fetch of iteration + fix-all risk records (Turn D.2).
+  // Initial fetch of iteration + fix-all risk records (Turn D.2)
+  // plus per-iteration memory references (Turn G-A).
   // These are independent of the iterations/passes fetches above because
   // they live in DECISION_RECORD entries. We fetch them once on mount;
   // subsequent updates come through the refetch path.
@@ -164,13 +174,17 @@ export function ProjectDetailClient({
     Promise.allSettled([
       getIterationRisks(projectId),
       getFixAllRisks(projectId),
-    ]).then(([ir, fr]) => {
+      getMemoryReferences(projectId),
+    ]).then(([ir, fr, mr]) => {
       if (cancelled) return;
       if (ir.status === "fulfilled") {
         setIterationRisks(ir.value.by_seq ?? {});
       }
       if (fr.status === "fulfilled") {
         setFixAllRisks(fr.value.by_seq ?? {});
+      }
+      if (mr.status === "fulfilled") {
+        setMemoryReferences(mr.value.by_seq ?? {});
       }
     });
     return () => {
@@ -195,13 +209,14 @@ export function ProjectDetailClient({
     if (refetchPending) return;
     setRefetchPending(true);
     try {
-      const [g, au, it, fa, ir, fr] = await Promise.allSettled([
+      const [g, au, it, fa, ir, fr, mr] = await Promise.allSettled([
         getGraph(projectId),
         getAudits(projectId),
         getIterations(projectId),
         getFixAllPasses(projectId),
         getIterationRisks(projectId),
         getFixAllRisks(projectId),
+        getMemoryReferences(projectId),
       ]);
       if (g.status === "fulfilled") {
         setGraph((prev) => mergeGraphPreservingNodes(prev, g.value));
@@ -246,6 +261,9 @@ export function ProjectDetailClient({
       }
       if (fr.status === "fulfilled") {
         setFixAllRisks(fr.value.by_seq ?? {});
+      }
+      if (mr.status === "fulfilled") {
+        setMemoryReferences(mr.value.by_seq ?? {});
       }
     } finally {
       setRefetchPending(false);
@@ -502,6 +520,7 @@ export function ProjectDetailClient({
             iterations={iterations}
             inFlightSeqs={inFlightSeqs}
             risksBySeq={iterationRisks}
+            memoryBySeq={memoryReferences}
             projectId={projectId}
             onDecisionMade={() => scheduleRefetch()}
           />

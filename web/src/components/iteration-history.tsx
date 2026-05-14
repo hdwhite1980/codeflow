@@ -9,9 +9,14 @@ import {
   RiskPauseBanner,
   RiskCancellationBanner,
 } from "@/components/inline-risk-panel";
+import { MemoryReferenceBadge } from "@/components/memory-reference-badge";
 import { cancelIteration, proceedIteration } from "@/lib/api";
 import { cn } from "@/lib/utils";
-import type { Iteration, IterationRisks } from "@/lib/types";
+import type {
+  Iteration,
+  IterationRisks,
+  MemoryReferences,
+} from "@/lib/types";
 
 interface IterationHistoryProps {
   iterations: Iteration[];
@@ -28,6 +33,12 @@ interface IterationHistoryProps {
    * still in flight).
    */
   risksBySeq: Record<number, IterationRisks>;
+  /**
+   * Memory reference records keyed by iteration seq. Tells the UI
+   * which guardian-indexed files were pulled into context for each
+   * iteration. Absent for older iterations (pre-Turn-G-A).
+   */
+  memoryBySeq: Record<number, MemoryReferences>;
   /**
    * Project ID — needed to wire proceed/cancel buttons.
    */
@@ -63,6 +74,7 @@ export function IterationHistory({
   iterations,
   inFlightSeqs,
   risksBySeq,
+  memoryBySeq,
   projectId,
   onDecisionMade,
 }: IterationHistoryProps) {
@@ -82,6 +94,7 @@ export function IterationHistory({
             iteration={it}
             running={inFlightSeqs.has(it.seq)}
             risks={risksBySeq[it.seq]}
+            memory={memoryBySeq[it.seq]}
             projectId={projectId}
             onDecisionMade={onDecisionMade}
           />
@@ -95,12 +108,14 @@ function IterationRow({
   iteration,
   running,
   risks,
+  memory,
   projectId,
   onDecisionMade,
 }: {
   iteration: Iteration;
   running: boolean;
   risks?: IterationRisks;
+  memory?: MemoryReferences;
   projectId: string;
   onDecisionMade?: () => void;
 }) {
@@ -250,6 +265,18 @@ function IterationRow({
                 )}
               />
             )}
+            {/* Memory-used indicator: small brain glyph + count.
+                Shows the guardian's memory layer is working without
+                needing to expand the card. */}
+            {memory && memory.reference_count > 0 && (
+              <span
+                title={`Guardian referenced ${memory.reference_count} file(s) for context`}
+                className="inline-flex items-center gap-0.5 text-[9px] text-violet-300/80 tabular-nums"
+              >
+                <BrainIcon />
+                {memory.reference_count}
+              </span>
+            )}
           </div>
           <div className="mt-0.5 truncate text-xs text-muted-foreground">
             {iteration.rationale || iteration.prompt}
@@ -266,6 +293,16 @@ function IterationRow({
               </div>
               <div className="mt-0.5 break-words">{iteration.prompt}</div>
             </div>
+          )}
+
+          {/* Memory references — show which files the guardian pulled
+              into context. Click to expand the list. */}
+          {memory && memory.reference_count > 0 && (
+            <MemoryReferenceBadge
+              count={memory.reference_count}
+              paths={memory.referenced_paths}
+              variant="inline"
+            />
           )}
 
           {/* Pre-flight risk panel — shown if available. */}
@@ -410,4 +447,26 @@ function dotForSeverity(severity: string): string {
     default:
       return "bg-muted-foreground";
   }
+}
+
+// Tiny inline brain glyph — smaller than lucide's Brain. Used in the
+// collapsed-card severity row to indicate "memory was used here."
+function BrainIcon() {
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      width="9"
+      height="9"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96.44 2.5 2.5 0 0 1-2.96-3.08 3 3 0 0 1-.34-5.58 2.5 2.5 0 0 1 1.32-4.24 2.5 2.5 0 0 1 1.98-3A2.5 2.5 0 0 1 9.5 2Z" />
+      <path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96.44 2.5 2.5 0 0 0 2.96-3.08 3 3 0 0 0 .34-5.58 2.5 2.5 0 0 0-1.32-4.24 2.5 2.5 0 0 0-1.98-3A2.5 2.5 0 0 0 14.5 2Z" />
+    </svg>
+  );
 }

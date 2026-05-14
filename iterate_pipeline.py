@@ -438,13 +438,36 @@ async def _run_iteration_body(
     # exist yet — falls back to inventory-only context downstream.
     # We exclude files currently being regenerated; their summary would
     # be stale by the time the Builder writes the new version.
-    from guardian_pipeline import build_pipeline_context
+    from guardian_pipeline import build_pipeline_context_with_paths
     being_changed = {c.path for c in plan.changes}
-    guardian_context = build_pipeline_context(
+    guardian_context, referenced_paths = build_pipeline_context_with_paths(
         store, project_id,
         focus_paths=sorted(being_changed),
         exclude_paths=sorted(being_changed),
     )
+
+    # Memory visibility (Turn G-A): persist the file list the guardian
+    # pulled into context so the frontend can show "Guardian referenced
+    # N files for this iteration" with the list one click away.
+    # Skipped silently when there's no context (no summaries yet).
+    if referenced_paths:
+        store.write_entry(
+            project_id=project_id,
+            tier=Tier.SPEC,
+            artifact_kind=ArtifactKind.DECISION_RECORD,
+            artifact_key=f"iteration:{iteration_seq}:memory_references",
+            body={
+                "iteration_seq": iteration_seq,
+                "referenced_paths": referenced_paths,
+                "reference_count": len(referenced_paths),
+                "context_chars": len(guardian_context),
+            },
+            rationale=(
+                f"Iteration {iteration_seq} referenced "
+                f"{len(referenced_paths)} guardian summaries for context."
+            ),
+            author=f"worker:iterate:{iteration_seq}",
+        )
 
     # Phase 3a: regenerate changed files. Each gets the iteration prompt
     # baked into its system message plus the current file content as the

@@ -407,6 +407,70 @@ def build_pipeline_context(
     return "\n".join(lines)
 
 
+def build_pipeline_context_with_paths(
+    store: "LedgerStore",
+    project_id: str,
+    *,
+    focus_paths: Optional[list[str]] = None,
+    exclude_paths: Optional[list[str]] = None,
+    max_summaries: int = MAX_CONTEXT_SUMMARIES,
+) -> tuple[str, list[str]]:
+    """Same as build_pipeline_context, but also returns the list of
+    file paths that were included in the context block.
+
+    Used by the iteration pipeline (Turn G "memory visibility") so
+    we can persist a memory_references record in the ledger — letting
+    the frontend show "Guardian referenced 12 files: ..." per
+    iteration. The string is suitable for prompt interpolation;
+    the path list is for UI surfacing.
+
+    Returns (context_string, referenced_paths). Both are empty when
+    no summaries exist.
+    """
+    summaries = load_file_summaries(store, project_id)
+    if not summaries:
+        return "", []
+
+    excluded = set(exclude_paths or [])
+    relevant = [s for s in summaries if s.get("file_path") not in excluded]
+
+    if focus_paths:
+        focus_set = set(focus_paths)
+        focused = [s for s in relevant if s.get("file_path") in focus_set]
+        focused.sort(key=lambda s: focus_paths.index(s["file_path"]))
+        rest = sorted(
+            [s for s in relevant if s.get("file_path") not in focus_set],
+            key=lambda s: s.get("file_path", ""),
+        )
+        ordered = focused + rest
+    else:
+        ordered = sorted(relevant, key=lambda s: s.get("file_path", ""))
+
+    ordered = ordered[:max_summaries]
+    if not ordered:
+        return "", []
+
+    lines = ["Project context (from guardian semantic index):"]
+    referenced_paths: list[str] = []
+    for s in ordered:
+        path = s.get("file_path", "?")
+        referenced_paths.append(path)
+        purpose = (s.get("purpose") or "").strip()
+        risks = s.get("risk_notes") or []
+        risk = risks[0] if risks else ""
+        if risk:
+            lines.append(
+                f"  - {path} — {purpose[:160]} Risk: {risk[:120]}"
+            )
+        else:
+            lines.append(f"  - {path} — {purpose[:200]}")
+    lines.append(
+        "  (These are background context for cross-file reasoning. "
+        "You are not editing or auditing these files unless explicitly told to.)"
+    )
+    return "\n".join(lines), referenced_paths
+
+
 # ---------------------------------------------------------------------------
 # Risk analyzer — the customer-visible "what breaks if I change X?" feature.
 # ---------------------------------------------------------------------------
@@ -847,6 +911,43 @@ def list_fix_all_risks(
                   f"{type(exc).__name__}: {exc}", flush=True)
             continue
         by_seq.setdefault(seq, {})[phase] = body
+    return by_seq
+
+
+def list_memory_references(
+    store: "LedgerStore", project_id: str,
+) -> dict[int, dict[str, Any]]:
+    """Return per-iteration memory reference records.
+
+    Result shape:
+      {7: {"referenced_paths": [...], "reference_count": 12, "context_chars": 3421},
+       6: {...}}
+
+    Used by the iteration history UI to show "Guardian referenced N
+    files" badge with the file list one click away. Iterations that
+    ran before guardian had any indexed summaries simply won't appear
+    in the result (no reference record was written).
+    """
+    decisions = store.all_current(project_id, ArtifactKind.DECISION_RECORD)
+    by_seq: dict[int, dict[str, Any]] = {}
+    for d in decisions:
+        if not d.artifact_key.startswith("iteration:"):
+            continue
+        parts = d.artifact_key.split(":")
+        if len(parts) < 3 or parts[2] != "memory_references":
+            continue
+        try:
+            seq = int(parts[1])
+        except ValueError:
+            continue
+        try:
+            blob, _ = store.get_blob(d.blob_sha256)
+            body = json.loads(blob.decode("utf-8")) if blob else {}
+        except Exception as exc:
+            print(f"[guardian:memory] failed to load {d.artifact_key}: "
+                  f"{type(exc).__name__}: {exc}", flush=True)
+            continue
+        by_seq[seq] = body
     return by_seq
 
 

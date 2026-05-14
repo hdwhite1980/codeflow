@@ -170,13 +170,46 @@ export function RiskResult({
         <SeverityBadge severity={assessment.severity} />
         <ConfidenceIndicator confidence={assessment.confidence} />
         <span className="text-xs text-muted-foreground">
-          {assessment.affected_paths.length} affected ·{" "}
-          {assessment.indexed_summary_count} indexed
+          {assessment.affected_paths.length} affected
         </span>
         <span className="ml-auto text-xs text-muted-foreground">
           {assessment.analyzer_model}
         </span>
       </div>
+
+      {/* Memory visibility — the headline feature. Bragging right at
+          the top of every assessment that this answer was informed by
+          N indexed file summaries. */}
+      {assessment.indexed_summary_count > 0 && (
+        <div className="flex items-center gap-2 rounded border border-violet-900/40 bg-violet-950/20 px-3 py-2 text-xs">
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            width="14"
+            height="14"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            className="text-violet-400 flex-shrink-0"
+            aria-hidden="true"
+          >
+            <path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96.44 2.5 2.5 0 0 1-2.96-3.08 3 3 0 0 1-.34-5.58 2.5 2.5 0 0 1 1.32-4.24 2.5 2.5 0 0 1 1.98-3A2.5 2.5 0 0 1 9.5 2Z" />
+            <path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96.44 2.5 2.5 0 0 0 2.96-3.08 3 3 0 0 0 .34-5.58 2.5 2.5 0 0 0-1.32-4.24 2.5 2.5 0 0 0-1.98-3A2.5 2.5 0 0 0 14.5 2Z" />
+          </svg>
+          <span className="text-violet-200">
+            Guardian reasoned over{" "}
+            <strong className="font-semibold">
+              {assessment.indexed_summary_count} file{" "}
+              {assessment.indexed_summary_count === 1
+                ? "summary"
+                : "summaries"}
+            </strong>{" "}
+            to produce this assessment.
+          </span>
+        </div>
+      )}
 
       {/* Plain-English narrative — shown by default per Hugh's spec. */}
       <div className="text-sm leading-relaxed">

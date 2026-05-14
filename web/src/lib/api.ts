@@ -27,6 +27,7 @@ import type {
   IterateResponse,
   IterationListResponse,
   IterationRisksResponse,
+  MemoryReferencesResponse,
   ProjectListResponse,
   RiskAssessment,
   RiskDecisionResponse,
@@ -225,6 +226,14 @@ export async function getFixAllRisks(
 ): Promise<FixAllRisksResponse> {
   return getJSON<FixAllRisksResponse>(
     `/api/projects/${encodeURIComponent(projectId)}/risks/fix-all`,
+  );
+}
+
+export async function getMemoryReferences(
+  projectId: string,
+): Promise<MemoryReferencesResponse> {
+  return getJSON<MemoryReferencesResponse>(
+    `/api/projects/${encodeURIComponent(projectId)}/memory-references`,
   );
 }
 

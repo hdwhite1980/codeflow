@@ -474,3 +474,22 @@ export interface RiskDecisionResponse {
   decision: "proceed" | "cancel";
   notified: boolean;
 }
+
+// -- Memory visibility (Turn G-A) ---------------------------------
+//
+// Each iteration that ran with guardian summaries available writes a
+// memory_references record listing which files were pulled into context.
+// The frontend uses this to surface "guardian referenced N files" on
+// every iteration card, with the file list one click away.
+
+export interface MemoryReferences {
+  iteration_seq: number;
+  referenced_paths: string[];
+  reference_count: number;
+  context_chars: number;
+}
+
+export interface MemoryReferencesResponse {
+  project_id: string;
+  by_seq: Record<number, MemoryReferences>;
+}
