@@ -1192,45 +1192,24 @@ class RiskAssessmentResponse(BaseModel):
 def _make_risk_client() -> Any:
     """Construct the LLM client to use for this risk query.
 
-    Pluggable: defaults to Ollama (privacy-preserving local model);
-    GUARDIAN_RISK_MODEL=claude env routes to Anthropic frontier model
-    for faster, higher-quality answers when privacy isn't a concern.
+    NOTE (2026-05-13): Hard-coded to use Claude because Railway's env-var
+    propagation is broken for this service — OLLAMA_BASE_URL and
+    GUARDIAN_RISK_MODEL show up in the Railway UI but don't reach the
+    container at runtime. ANTHROPIC_API_KEY does propagate, so we fall
+    back to it unconditionally until the Railway issue is resolved.
 
-    Raised HTTPException is caught by FastAPI and returned as 503 to
-    the frontend, which renders a "guardian unavailable" message
-    rather than a generic 500.
+    To restore the original pluggable behavior, revert this commit and
+    confirm `curl /api/_debug/risk-env` shows all OLLAMA_* vars as
+    present=true.
     """
-    choice = os.environ.get("GUARDIAN_RISK_MODEL", "ollama").lower()
-    if choice == "claude":
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
-        if not api_key:
-            raise HTTPException(
-                status_code=503,
-                detail="GUARDIAN_RISK_MODEL=claude but ANTHROPIC_API_KEY not set",
-            )
-        from anthropic_client import AnthropicClient
-        return AnthropicClient(api_key=api_key)
-    # Default: local Ollama.
-    base_url = os.environ.get("OLLAMA_BASE_URL", "")
-    if not base_url.strip():
-        # Diagnostic message reveals which env vars ARE seen at runtime
-        # so we can debug Railway env-var propagation issues.
-        seen_vars = sorted(
-            k for k in os.environ.keys()
-            if k.startswith(("OLLAMA_", "GUARDIAN_", "ANTHROPIC_"))
-        )
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
         raise HTTPException(
             status_code=503,
-            detail=(
-                f"OLLAMA_BASE_URL is empty at runtime. "
-                f"GUARDIAN_RISK_MODEL={choice!r}. "
-                f"Seen env vars: {seen_vars}. "
-                f"Either set OLLAMA_BASE_URL on this service, or set "
-                f"GUARDIAN_RISK_MODEL=claude (with ANTHROPIC_API_KEY)."
-            ),
+            detail="ANTHROPIC_API_KEY not set on the web service",
         )
-    from ollama_client import OllamaClient
-    return OllamaClient()
+    from anthropic_client import AnthropicClient
+    return AnthropicClient(api_key=api_key)
 
 
 @app.get("/api/_debug/risk-env")
