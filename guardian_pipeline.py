@@ -769,7 +769,8 @@ class RiskAssessment:
     analyzer_model: str              # which model produced this
     input_tokens: int
     output_tokens: int
-    indexed_summary_count: int       # how many summaries informed this
+    indexed_summary_count: int       # how many file summaries informed this
+    indexed_symbol_count: int = 0    # how many per-symbol summaries (Turn B)
 
 
 _RISK_SYSTEM_PROMPT = """You are the guardian: a code-understanding AI that helps engineers reason about proposed changes to a codebase.
@@ -811,6 +812,7 @@ def _build_risk_prompt(
     change_description: str,
     impact_set: list[str],
     summaries: dict[str, dict[str, Any]],
+    symbol_summaries: Optional[dict[str, list[dict[str, Any]]]] = None,
 ) -> str:
     """Render the user prompt for a risk-analysis call.
 
@@ -819,6 +821,10 @@ def _build_risk_prompt(
       2. The structural impact list — paths that depend on the target
       3. Semantic summaries (purpose, touches, assumes, failure_modes,
          risk_notes) for each affected file we have summaries for
+      4. Per-symbol summaries (Turn B) for the target file and any
+         impact-set files where we have them. Optional — when provided
+         the model is told to cite specific functions/methods in its
+         concerns rather than just file paths.
 
     Files in the impact set that we DON'T have summaries for are still
     listed — the model should note that its assessment is partial.
@@ -859,7 +865,36 @@ def _build_risk_prompt(
                 lines.append(f"    Failure modes: {'; '.join(failure_modes[:6])}")
             if risk_notes:
                 lines.append(f"    Existing risk notes: {'; '.join(risk_notes[:4])}")
+
+            # Symbol-level breakdown (Turn B). Listed under each file
+            # so the model can see "this file has these functions and
+            # here's what each does." Caps per-file so a 200-function
+            # file doesn't dominate the prompt.
+            syms = (symbol_summaries or {}).get(path, [])
+            if syms:
+                lines.append(f"    Symbols ({len(syms)}):")
+                for s in syms[:15]:  # 15-per-file cap is generous
+                    qname = s.get("qualified_name", s.get("symbol_name", "?"))
+                    kind = s.get("symbol_kind", "?")
+                    sp = s.get("purpose", "") or s.get("plain_english", "")
+                    s_risks = s.get("risk_notes", []) or []
+                    line = f"      - [{kind}] {qname}"
+                    if sp:
+                        line += f" — {sp[:140]}"
+                    lines.append(line)
+                    if s_risks:
+                        lines.append(
+                            f"        risk: {s_risks[0][:140]}"
+                        )
+                if len(syms) > 15:
+                    lines.append(f"      ... and {len(syms) - 15} more symbols")
     lines.append("")
+    if symbol_summaries:
+        lines.append(
+            "When citing concerns, name the specific symbol "
+            "(e.g. 'AuthService.login') rather than just the file when "
+            "the symbol breakdown above makes the responsible code clear."
+        )
     lines.append("Produce the structured JSON risk assessment.")
     return "\n".join(lines)
 
@@ -937,12 +972,28 @@ async def analyze_change_risk(
         if p in by_path:
             relevant_summaries[p] = by_path[p]
 
+    # Symbol-grained context (Turn B). For every file we'll include in
+    # the prompt, also load its per-symbol summaries if any exist. Cost
+    # is one ledger read per file; cheap. If symbol indexing hasn't run
+    # for some files, those entries are simply absent — the prompt falls
+    # back to file-level context for them, as before.
+    relevant_symbols: dict[str, list[dict[str, Any]]] = {}
+    for path in list(relevant_summaries.keys()):
+        try:
+            syms = list_symbol_summaries(store, project_id, file_path=path)
+            if syms:
+                relevant_symbols[path] = syms
+        except Exception as exc:
+            print(f"[guardian:risk] symbol load failed for {path}: "
+                  f"{type(exc).__name__}: {exc}", flush=True)
+
     # Step 3: prompt the model.
     prompt = _build_risk_prompt(
         target=target_path,
         change_description=change_description,
         impact_set=impact_paths,
         summaries=relevant_summaries,
+        symbol_summaries=relevant_symbols if relevant_symbols else None,
     )
     result = await client.complete(
         prompt,
@@ -990,6 +1041,9 @@ async def analyze_change_risk(
         input_tokens=result.input_tokens,
         output_tokens=result.output_tokens,
         indexed_summary_count=len(relevant_summaries),
+        indexed_symbol_count=sum(
+            len(v) for v in relevant_symbols.values()
+        ),
     )
 
 
@@ -1027,6 +1081,7 @@ def write_risk_assessment(
         "input_tokens": assessment.input_tokens,
         "output_tokens": assessment.output_tokens,
         "indexed_summary_count": assessment.indexed_summary_count,
+        "indexed_symbol_count": assessment.indexed_symbol_count,
         "asked_at": time.time(),
     }
     store.write_entry(

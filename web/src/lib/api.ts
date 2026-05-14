@@ -32,6 +32,7 @@ import type {
   MemoryReferencesResponse,
   ProjectListResponse,
   ProjectMemoryResponse,
+  ProjectMemorySymbolsResponse,
   RiskAssessment,
   RiskDecisionResponse,
   RiskQueryRequest,
@@ -247,6 +248,17 @@ export async function getProjectMemory(
 ): Promise<ProjectMemoryResponse> {
   return getJSON<ProjectMemoryResponse>(
     `/api/projects/${encodeURIComponent(projectId)}/memory`,
+  );
+}
+
+export async function getProjectMemorySymbols(
+  projectId: string, filePath?: string,
+): Promise<ProjectMemorySymbolsResponse> {
+  const qs = filePath
+    ? `?file_path=${encodeURIComponent(filePath)}`
+    : "";
+  return getJSON<ProjectMemorySymbolsResponse>(
+    `/api/projects/${encodeURIComponent(projectId)}/memory/symbols${qs}`,
   );
 }
 

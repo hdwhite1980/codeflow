@@ -1326,6 +1326,7 @@ class RiskAssessmentResponse(BaseModel):
     confidence: float
     analyzer_model: str
     indexed_summary_count: int
+    indexed_symbol_count: int = 0
     asked_at: float
 
 
@@ -1455,6 +1456,7 @@ async def analyze_risk(
         confidence=assessment.confidence,
         analyzer_model=assessment.analyzer_model,
         indexed_summary_count=assessment.indexed_summary_count,
+        indexed_symbol_count=assessment.indexed_symbol_count,
         asked_at=time.time(),
     )
 

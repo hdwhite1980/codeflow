@@ -205,8 +205,20 @@ export function RiskResult({
               {assessment.indexed_summary_count === 1
                 ? "summary"
                 : "summaries"}
-            </strong>{" "}
-            to produce this assessment.
+            </strong>
+            {assessment.indexed_symbol_count
+              && assessment.indexed_symbol_count > 0 ? (
+              <>
+                {" "}plus{" "}
+                <strong className="font-semibold">
+                  {assessment.indexed_symbol_count} symbol{" "}
+                  {assessment.indexed_symbol_count === 1
+                    ? "summary"
+                    : "summaries"}
+                </strong>
+              </>
+            ) : null}
+            {" "}to produce this assessment.
           </span>
         </div>
       )}

@@ -394,6 +394,7 @@ export interface RiskAssessment {
   confidence: number;
   analyzer_model: string;
   indexed_summary_count: number;
+  indexed_symbol_count?: number;
   asked_at: number;
 }
 
@@ -424,6 +425,7 @@ export interface AttachedRiskAssessment {
   confidence: number;
   analyzer_model: string;
   indexed_summary_count: number;
+  indexed_symbol_count?: number;
   asked_at: number;
 }
 
@@ -535,4 +537,37 @@ export interface ImportProjectResponse {
   project_id: string;
   slug: string;
   status: string;
+}
+
+// -- Symbol-grained memory (Turn B) -------------------------------
+//
+// Per-symbol semantic summary. Same kind/shape as ProjectMemoryEntry
+// but scoped to one function/class/method/constant inside a file
+// rather than the whole file. Backend persists these under artifact
+// keys `semantic_symbol:<pid>:<path>:<kind>:<qualified_name>`.
+
+export interface SymbolSummary {
+  file_path: string;
+  symbol_kind: string;      // function | method | class | constant | struct | enum | ...
+  symbol_name: string;      // short name, e.g. "verify_password"
+  qualified_name: string;   // e.g. "AuthService.verify_password"
+  start_line: number;
+  end_line: number;
+  plain_english: string;
+  purpose: string;
+  touches: string[];
+  assumes: string[];
+  failure_modes: string[];
+  risk_notes: string[];
+  indexed_at: number;
+  indexer_model: string;
+  input_tokens: number;
+  output_tokens: number;
+}
+
+export interface ProjectMemorySymbolsResponse {
+  project_id: string;
+  file_path: string | null;
+  symbols: SymbolSummary[];
+  count: number;
 }

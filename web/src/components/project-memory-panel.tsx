@@ -5,6 +5,7 @@ import {
   Brain,
   ChevronDown,
   ChevronRight,
+  Code2,
   Loader2,
   RefreshCw,
   Search,
@@ -12,10 +13,12 @@ import {
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { getProjectMemory, reindexFile } from "@/lib/api";
+import {
+  getProjectMemory, getProjectMemorySymbols, reindexFile,
+} from "@/lib/api";
 import { formatRelativeTime } from "@/lib/format";
 import { cn } from "@/lib/utils";
-import type { ProjectMemoryEntry } from "@/lib/types";
+import type { ProjectMemoryEntry, SymbolSummary } from "@/lib/types";
 
 interface ProjectMemoryPanelProps {
   projectId: string;
@@ -184,6 +187,7 @@ export function ProjectMemoryPanel({
           {filtered.map((entry) => (
             <MemoryEntryRow
               key={entry.file_path}
+              projectId={projectId}
               entry={entry}
               expanded={expanded.has(entry.file_path)}
               onToggleExpanded={() => toggleExpanded(entry.file_path)}
@@ -199,8 +203,9 @@ export function ProjectMemoryPanel({
 
 
 function MemoryEntryRow({
-  entry, expanded, onToggleExpanded, reindexing, onReindex,
+  projectId, entry, expanded, onToggleExpanded, reindexing, onReindex,
 }: {
+  projectId: string;
   entry: ProjectMemoryEntry;
   expanded: boolean;
   onToggleExpanded: () => void;
@@ -208,6 +213,37 @@ function MemoryEntryRow({
   onReindex: () => void;
 }) {
   const [showTech, setShowTech] = useState(false);
+
+  // Symbol drill-down (Turn B frontend). Lazily fetched the first
+  // time the user expands the file row and toggles "Symbols". Result
+  // is cached for the lifetime of the row component so re-toggling
+  // doesn't re-fetch.
+  const [showSymbols, setShowSymbols] = useState(false);
+  const [symbols, setSymbols] = useState<SymbolSummary[] | null>(null);
+  const [symbolsLoading, setSymbolsLoading] = useState(false);
+  const [symbolsError, setSymbolsError] = useState<string | null>(null);
+
+  async function fetchSymbolsIfNeeded() {
+    if (symbols !== null || symbolsLoading) return;
+    setSymbolsLoading(true);
+    setSymbolsError(null);
+    try {
+      const resp = await getProjectMemorySymbols(projectId, entry.file_path);
+      setSymbols(resp.symbols);
+    } catch (err) {
+      setSymbolsError(
+        err instanceof Error ? err.message : "Failed to load symbols",
+      );
+    } finally {
+      setSymbolsLoading(false);
+    }
+  }
+
+  async function handleToggleSymbols() {
+    const next = !showSymbols;
+    setShowSymbols(next);
+    if (next) await fetchSymbolsIfNeeded();
+  }
 
   // Risk badge — visible at-a-glance count if the file was flagged
   // anywhere. We pool both target and concern queries.
@@ -367,6 +403,64 @@ function MemoryEntryRow({
             </div>
           )}
 
+          {/* Symbol drill-down — function/class/method-level memory.
+              Toggle is lazy: we don't fetch symbols until the user
+              clicks. Result caches in component state so re-toggling
+              is cheap. */}
+          <div>
+            <button
+              type="button"
+              onClick={handleToggleSymbols}
+              className="flex items-center gap-1 text-[10px] text-violet-400 hover:text-violet-300"
+            >
+              {showSymbols ? (
+                <ChevronDown className="h-3 w-3" />
+              ) : (
+                <ChevronRight className="h-3 w-3" />
+              )}
+              <Code2 className="h-3 w-3" />
+              <span>
+                {showSymbols ? "Hide" : "Show"} symbols
+                {symbols !== null && (
+                  <span className="text-muted-foreground/70 ml-1">
+                    ({symbols.length})
+                  </span>
+                )}
+              </span>
+            </button>
+            {showSymbols && (
+              <div className="mt-1.5 ml-3 space-y-1">
+                {symbolsLoading && (
+                  <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
+                    <Loader2 className="h-3 w-3 animate-spin" />
+                    Loading symbols…
+                  </div>
+                )}
+                {symbolsError && (
+                  <div className="text-[10px] text-red-300">{symbolsError}</div>
+                )}
+                {!symbolsLoading && symbols !== null && symbols.length === 0 && (
+                  <div className="text-[10px] text-muted-foreground leading-relaxed">
+                    No symbols indexed for this file yet. Either symbol
+                    extraction isn't supported for this language, or the
+                    guardian's per-symbol pass is still running in the
+                    background.
+                  </div>
+                )}
+                {!symbolsLoading && symbols && symbols.length > 0 && (
+                  <div className="space-y-1">
+                    {symbols.map((sym) => (
+                      <SymbolRow
+                        key={`${sym.symbol_kind}:${sym.qualified_name}:${sym.start_line}`}
+                        symbol={sym}
+                      />
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
           {/* Metadata footer — when indexed, by which model. */}
           <div className="flex items-center gap-2 pt-1 border-t border-border text-[9px] text-muted-foreground/60">
             <span>
@@ -385,6 +479,120 @@ function MemoryEntryRow({
       )}
     </div>
   );
+}
+
+
+function SymbolRow({ symbol }: { symbol: SymbolSummary }) {
+  const [expanded, setExpanded] = useState(false);
+  const totalRiskNotes = symbol.risk_notes?.length ?? 0;
+
+  // Color the kind badge per-kind so users can tell functions from
+  // classes from constants at a glance.
+  const kindClass = kindBadgeClass(symbol.symbol_kind);
+
+  return (
+    <div className="rounded border border-border bg-background/30">
+      <button
+        type="button"
+        onClick={() => setExpanded((v) => !v)}
+        className="flex w-full items-start gap-2 px-2 py-1.5 text-left min-w-0"
+      >
+        {expanded ? (
+          <ChevronDown className="mt-0.5 h-2.5 w-2.5 shrink-0 text-muted-foreground" />
+        ) : (
+          <ChevronRight className="mt-0.5 h-2.5 w-2.5 shrink-0 text-muted-foreground" />
+        )}
+        <span
+          className={cn(
+            "text-[9px] px-1 rounded border flex-shrink-0 uppercase tracking-wide",
+            kindClass,
+          )}
+        >
+          {symbol.symbol_kind}
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-1.5 flex-wrap">
+            <code className="text-[10px] font-medium break-all">
+              {symbol.qualified_name}
+            </code>
+            <span className="text-[9px] text-muted-foreground/70 tabular-nums">
+              L{symbol.start_line}-{symbol.end_line}
+            </span>
+            {totalRiskNotes > 0 && (
+              <span
+                className="text-[9px] px-1 rounded bg-amber-950/40 border border-amber-700/40 text-amber-300"
+                title={`${totalRiskNotes} risk note(s) on this symbol`}
+              >
+                {totalRiskNotes} risk
+              </span>
+            )}
+          </div>
+          {!expanded && symbol.purpose && (
+            <div className="mt-0.5 truncate text-[10px] text-muted-foreground">
+              {symbol.purpose}
+            </div>
+          )}
+        </div>
+      </button>
+
+      {expanded && (
+        <div className="border-t border-border px-2 py-1.5 text-[10px] space-y-1.5">
+          {symbol.plain_english && (
+            <div className="leading-relaxed">{symbol.plain_english}</div>
+          )}
+          {symbol.touches && symbol.touches.length > 0 && (
+            <LabeledChips label="Touches" items={symbol.touches} />
+          )}
+          {symbol.assumes && symbol.assumes.length > 0 && (
+            <LabeledChips label="Assumes" items={symbol.assumes} />
+          )}
+          {symbol.failure_modes && symbol.failure_modes.length > 0 && (
+            <LabeledChips
+              label="Failure modes"
+              items={symbol.failure_modes}
+              chipClass="text-amber-200 border-amber-900/40 bg-amber-950/20"
+            />
+          )}
+          {symbol.risk_notes && symbol.risk_notes.length > 0 && (
+            <div>
+              <div className="text-[8px] uppercase tracking-wide text-amber-400">
+                Risk notes
+              </div>
+              <ul className="mt-0.5 space-y-0.5 list-disc list-inside text-[10px] text-amber-200">
+                {symbol.risk_notes.map((r, i) => (
+                  <li key={i}>{r}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+function kindBadgeClass(kind: string): string {
+  switch (kind) {
+    case "function":
+      return "text-emerald-300 border-emerald-900/40 bg-emerald-950/30";
+    case "method":
+      return "text-cyan-300 border-cyan-900/40 bg-cyan-950/30";
+    case "class":
+    case "struct":
+      return "text-violet-300 border-violet-900/40 bg-violet-950/30";
+    case "interface":
+    case "trait":
+      return "text-indigo-300 border-indigo-900/40 bg-indigo-950/30";
+    case "enum":
+      return "text-fuchsia-300 border-fuchsia-900/40 bg-fuchsia-950/30";
+    case "constant":
+      return "text-amber-300 border-amber-900/40 bg-amber-950/30";
+    case "module":
+      return "text-sky-300 border-sky-900/40 bg-sky-950/30";
+    default:
+      return "text-muted-foreground border-border bg-background/60";
+  }
 }
 
 
