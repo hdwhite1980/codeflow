@@ -94,6 +94,19 @@ class InMemoryLedgerStore:
     def set_project_status(self, project_id: str, status: str) -> None:
         self._projects[project_id].status = status
 
+    def list_projects(self, *, limit: int = 200) -> list[dict[str, Any]]:
+        """In-memory equivalent of LedgerStore.list_projects."""
+        out: list[dict[str, Any]] = []
+        for pid, proj in self._projects.items():
+            out.append({
+                "id": pid,
+                "slug": proj.slug,
+                "prompt": proj.prompt,
+                "status": proj.status,
+                "created_at": getattr(proj, "created_at", None),
+            })
+        return out[:limit]
+
     def delete_project(self, project_id: str) -> bool:
         """In-memory equivalent: drop the project and all of its
         ledger entries / nodes / edges / etc."""

@@ -80,6 +80,11 @@ class HandlerContext:
     # job kinds skip rather than crash. The rest of the pipeline works
     # without it.
     ollama: Optional["OllamaClient"] = None
+    # Continuous-indexer daemon reference (Turn C). Optional. Handlers
+    # call .mark_project_done(pid) at the end of guardian_index so the
+    # daemon knows it can re-evaluate this project on the next tick.
+    # Tests typically leave this None; the handler tolerates absence.
+    continuous_indexer: Optional[Any] = None
 
 
 # ---------------------------------------------------------------------------
@@ -1170,7 +1175,7 @@ async def handle_guardian_index(job: dict[str, Any], ctx: HandlerContext) -> Non
 
     # Build the work list.
     file_entries = ctx.store.all_current(project_id, ArtifactKind.FILE)
-    targets: list[tuple[str, str]] = []  # (path, content)
+    targets: list[tuple[str, str, str]] = []  # (path, content, blob_sha)
     for fe in file_entries:
         parts = fe.artifact_key.split(":", 2)
         if len(parts) < 3:
@@ -1191,7 +1196,7 @@ async def handle_guardian_index(job: dict[str, Any], ctx: HandlerContext) -> Non
         if not ok:
             print(f"[guardian] skipping {path}: {reason}", flush=True)
             continue
-        targets.append((path, content))
+        targets.append((path, content, fe.blob_sha256))
 
     if not targets:
         print(f"[handlers] guardian_index: no eligible files for "
@@ -1206,7 +1211,7 @@ async def handle_guardian_index(job: dict[str, Any], ctx: HandlerContext) -> Non
     # parallelize, but for now sequential is simpler and equivalent.
     indexed = 0
     failed: list[tuple[str, str]] = []
-    for path, content in targets:
+    for path, content, blob_sha in targets:
         try:
             language = _language_from_extension(path)
             summary = await summarize_file(
@@ -1215,6 +1220,11 @@ async def handle_guardian_index(job: dict[str, Any], ctx: HandlerContext) -> Non
                 language=language,
                 client=ctx.ollama,
             )
+            # Stamp the content hash so the continuous indexer (Turn C)
+            # can dedupe future ticks. Using replace() because FileSummary
+            # is a frozen dataclass.
+            from dataclasses import replace as _dc_replace
+            summary = _dc_replace(summary, source_blob_sha256=blob_sha)
             write_file_summary(ctx.store, project_id, summary)
             if ctx.recorder is not None:
                 # Record Ollama usage so the cost dashboard shows it,
@@ -1300,6 +1310,16 @@ async def handle_guardian_index(job: dict[str, Any], ctx: HandlerContext) -> Non
     print(f"[handlers] guardian_index: completed for {project_id} — "
           f"{indexed} indexed, {len(failed)} failed",
           flush=True)
+    # Tell the continuous indexer it can re-evaluate this project on
+    # the next tick. Without this call the daemon would treat the
+    # project as permanently in-flight after one autonomous queue.
+    # No-op when the daemon isn't running (tests, web service).
+    if ctx.continuous_indexer is not None:
+        try:
+            ctx.continuous_indexer.mark_project_done(project_id)
+        except Exception as exc:
+            print(f"[handlers] guardian_index: mark_done failed: "
+                  f"{type(exc).__name__}: {exc}", flush=True)
 
 
 def _language_from_extension(path: str) -> str:

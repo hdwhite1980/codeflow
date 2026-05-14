@@ -275,6 +275,32 @@ class LedgerStore:
             )
             conn.commit()
 
+    def list_projects(self, *, limit: int = 200) -> list[dict[str, Any]]:
+        """Return rows of {id, slug, prompt, status, created_at} for the
+        most recent `limit` projects, newest first.
+
+        Used by the continuous-indexer daemon (Turn C) and any internal
+        code path that needs to enumerate projects without going through
+        the HTTP layer. Caps at 200 by default — anything larger is a
+        sign we should paginate, not crank the limit.
+        """
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, slug, prompt, status, created_at "
+                "FROM projects ORDER BY created_at DESC LIMIT %s",
+                (limit,),
+            )
+            out: list[dict[str, Any]] = []
+            for r in cur.fetchall():
+                out.append({
+                    "id": str(r[0]),
+                    "slug": r[1],
+                    "prompt": r[2],
+                    "status": r[3],
+                    "created_at": r[4],
+                })
+            return out
+
     def delete_project(self, project_id: str) -> bool:
         """Delete a project and all its descendants.
 

@@ -39,6 +39,7 @@ iteration — Redis is the buffer.
 from __future__ import annotations
 
 import asyncio
+from typing import Optional
 import os
 import signal
 import time
@@ -142,13 +143,48 @@ class Worker:
         We keep the loop sequential rather than running build jobs and
         reconciliation concurrently — a misbehaving build shouldn't be able
         to starve reconciliation, and vice versa. If throughput becomes an
-        issue, split into two worker services with different roles."""
+        issue, split into two worker services with different roles.
+
+        The continuous indexer (Turn C) runs as a separate background
+        task so its periodic polling doesn't block the main job loop.
+        Its only side effect is enqueuing guardian_index jobs which then
+        get processed in the normal loop — no shared state contention."""
         print(f"[worker] started; queue backend = {type(self.queue).__name__}")
+
+        # Start the continuous indexer if we have Ollama configured.
+        # Without an Ollama client, indexing won't work anyway; no point
+        # polling.
+        indexer_task: Optional[asyncio.Task] = None
+        self._indexer = None
+        if self.ollama is not None:
+            from continuous_indexer import ContinuousIndexer
+            self._indexer = ContinuousIndexer(self.store, self.queue)
+            # Wire the daemon into the handler context so guardian_index
+            # handlers can mark the project as done when they finish.
+            # Without this, the daemon would queue exactly one job per
+            # project then permanently treat that project as inflight.
+            self.ctx.continuous_indexer = self._indexer
+            indexer_task = asyncio.create_task(
+                self._indexer.run(),
+                name="continuous_indexer",
+            )
+
         try:
             while not self.shutdown.is_set():
                 await self._maybe_process_build_job()
                 await self._maybe_tick_reconciliations()
         finally:
+            # Stop the daemon FIRST so it doesn't queue more work
+            # while we're shutting down the queue connection.
+            if self._indexer is not None:
+                self._indexer.stop()
+            if indexer_task is not None:
+                try:
+                    await asyncio.wait_for(indexer_task, timeout=5.0)
+                except asyncio.TimeoutError:
+                    indexer_task.cancel()
+                except Exception:
+                    pass
             await self.queue.close()
             if self.anthropic is not None:
                 await self.anthropic.aclose()

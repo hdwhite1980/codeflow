@@ -110,6 +110,12 @@ class FileSummary:
     indexer_model: str           # which Ollama model produced this
     input_tokens: int
     output_tokens: int
+    # Hash of the file content that produced this summary. Set by the
+    # caller (handle_guardian_index) when known. Used by the continuous
+    # indexer (Turn C) to skip files whose content hasn't changed since
+    # last index. Empty string means "we don't know" — the daemon then
+    # falls back to re-indexing, which is safe but wasteful.
+    source_blob_sha256: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +266,7 @@ def write_file_summary(
             "indexer_model": summary.indexer_model,
             "input_tokens": summary.input_tokens,
             "output_tokens": summary.output_tokens,
+            "source_blob_sha256": summary.source_blob_sha256,
         },
         rationale=(
             f"Guardian indexed {summary.file_path} "
