@@ -223,9 +223,13 @@ class ContinuousIndexer:
                 await self._tick()
             except Exception as exc:
                 # Daemon stays alive even when one tick blows up; loud log
-                # and try again next interval.
+                # and try again next interval. Include a traceback so
+                # production bugs are debuggable from the log line alone
+                # without having to add temporary instrumentation.
+                import traceback
                 print(f"[continuous_indexer] tick failed: "
-                      f"{type(exc).__name__}: {exc}", flush=True)
+                      f"{type(exc).__name__}: {exc}\n"
+                      f"{traceback.format_exc()}", flush=True)
             try:
                 await asyncio.wait_for(
                     self._stop_event.wait(),

@@ -290,14 +290,18 @@ class LedgerStore:
                 "FROM projects ORDER BY created_at DESC LIMIT %s",
                 (limit,),
             )
+            # _connect uses row_factory=dict_row, so cursor rows are
+            # dicts keyed by column name, not positional tuples. Using
+            # r[0] here crashed every continuous_indexer tick with
+            # KeyError: 0 in production until this fix landed.
             out: list[dict[str, Any]] = []
             for r in cur.fetchall():
                 out.append({
-                    "id": str(r[0]),
-                    "slug": r[1],
-                    "prompt": r[2],
-                    "status": r[3],
-                    "created_at": r[4],
+                    "id": str(r["id"]),
+                    "slug": r["slug"],
+                    "prompt": r["prompt"],
+                    "status": r["status"],
+                    "created_at": r["created_at"],
                 })
             return out
 
