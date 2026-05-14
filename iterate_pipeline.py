@@ -174,17 +174,34 @@ async def run_iteration(
     store: LedgerStore,
     client: AnthropicClient,
     recorder: Optional[UsageRecorder] = None,
+    risk_client: Optional[Any] = None,
+    risk_gate: Optional[Any] = None,
 ) -> IterationOutcome:
     """Top-level entry point. The job_handler calls this.
 
     Returns IterationOutcome. Writes ledger entries for:
       * iteration:<seq>:started   (at top)
       * iteration:<seq>:plan      (the plan JSON, after planning phase)
+      * iteration:<seq>:pre_risk  (optional — when risk_client provided)
+      * iteration:<seq>:cancelled (only if user cancelled at pre_risk)
       * file:<project_id>:<path>  (one per changed/new file, supersedes)
+      * iteration:<seq>:post_risk (optional — when risk_client provided)
       * iteration:<seq>:outcome   (at bottom — status, costs, errors)
 
     Audit dispatch is the job_handler's responsibility, not ours.
     We just return the list of paths that changed so it can audit them.
+
+    Risk integration (Turn D.1)
+    ---------------------------
+    When `risk_client` is provided (any LLM client with .complete()),
+    pre-flight and post-iteration risk assessments run automatically.
+    Pre-flight runs between planning and regeneration. If the
+    assessment severity is `critical`, the iteration pauses on
+    `risk_gate.wait_for_decision()` until the user proceeds or
+    cancels via API.
+
+    When `risk_client` is None, risk analysis is skipped entirely —
+    the pre-guardian iteration flow runs unchanged.
     """
     stage_tag = f"iteration:{iteration_seq}"
 
@@ -220,6 +237,8 @@ async def run_iteration(
             store=store,
             client=client,
             recorder=recorder,
+            risk_client=risk_client,
+            risk_gate=risk_gate,
         )
     except Exception as exc:
         print(f"[iterate] UNEXPECTED FAILURE in iteration {iteration_seq} "
@@ -246,6 +265,8 @@ async def _run_iteration_body(
     store: LedgerStore,
     client: AnthropicClient,
     recorder: Optional[UsageRecorder] = None,
+    risk_client: Optional[Any] = None,
+    risk_gate: Optional[Any] = None,
 ) -> IterationOutcome:
     """The actual iteration logic, extracted so run_iteration can wrap
     it in a single try/except that always writes an outcome record.
@@ -293,6 +314,85 @@ async def _run_iteration_body(
         rationale=f"Plan for iteration {iteration_seq}: {plan.rationale[:200]}",
         author=f"worker:iterate:{iteration_seq}",
     )
+
+    # Pre-flight risk analysis. Runs when risk_client is configured.
+    # Pause-on-critical behavior: if the assessment is `critical`, we
+    # block on risk_gate.wait_for_decision() until the user proceeds or
+    # cancels via API. Other severities log the assessment for the
+    # frontend to surface but don't interrupt the iteration.
+    #
+    # Any failure in the risk step is swallowed and logged — we never
+    # block iteration progress on a risk analysis error, only on a
+    # real critical user-confirmation requirement.
+    if risk_client is not None and not plan.is_empty():
+        try:
+            from guardian_pipeline import (
+                analyze_iteration_intent, write_iteration_risk,
+            )
+            pre_risk = await analyze_iteration_intent(
+                store=store,
+                project_id=project_id,
+                iteration_prompt=iteration_prompt,
+                planned_change_paths=[c.path for c in plan.changes],
+                planned_delete_paths=list(plan.deletes),
+                planned_new_paths=[f.path for f in plan.new_files],
+                client=risk_client,
+            )
+            write_iteration_risk(
+                store, project_id, iteration_seq, "pre_risk", pre_risk,
+            )
+            print(f"[iterate] pre_risk for iter {iteration_seq}: "
+                  f"severity={pre_risk.severity}, "
+                  f"confidence={pre_risk.confidence:.2f}", flush=True)
+
+            # Pause on critical, wait for proceed/cancel signal.
+            if pre_risk.severity == "critical" and risk_gate is not None:
+                from risk_gate import iteration_gate_key
+                gate_key = iteration_gate_key(project_id, iteration_seq)
+                print(f"[iterate] iter {iteration_seq} paused at pre_risk "
+                      f"(critical); awaiting user decision...", flush=True)
+                decision = await risk_gate.wait_for_decision(gate_key)
+                print(f"[iterate] iter {iteration_seq} decision: {decision}",
+                      flush=True)
+                if decision != "proceed":
+                    # User cancelled or timed out. Write a cancellation
+                    # record and bail out with a clean outcome — no
+                    # regeneration, no audit, no post_risk.
+                    store.write_entry(
+                        project_id=project_id,
+                        tier=Tier.SPEC,
+                        artifact_kind=ArtifactKind.DECISION_RECORD,
+                        artifact_key=f"iteration:{iteration_seq}:cancelled",
+                        body={
+                            "iteration_seq": iteration_seq,
+                            "reason": decision,
+                            "pre_risk_severity": pre_risk.severity,
+                            "cancelled_at": time.time(),
+                        },
+                        rationale=(
+                            f"Iteration {iteration_seq} cancelled by user "
+                            f"after critical pre-flight risk ({decision})."
+                        ),
+                        author=f"worker:iterate:{iteration_seq}",
+                    )
+                    outcome = IterationOutcome(
+                        iteration_seq=iteration_seq,
+                        changes_applied=[], new_files_created=[],
+                        files_deleted=[], failed=[],
+                        input_tokens=plan_in, output_tokens=plan_out,
+                        rationale=(
+                            f"Cancelled by user after critical pre-flight "
+                            f"risk assessment ({decision})."
+                        ),
+                    )
+                    _write_outcome(store, project_id, iteration_seq, outcome)
+                    return outcome
+        except Exception as exc:
+            print(f"[iterate] pre_risk analysis failed for iter "
+                  f"{iteration_seq}: {type(exc).__name__}: {exc}",
+                  flush=True)
+            # Continue without pre-flight assessment. The iteration
+            # still runs; only the risk panel will be empty.
 
     if plan.is_empty():
         outcome = IterationOutcome(
@@ -445,6 +545,37 @@ async def _run_iteration_body(
         output_tokens=total_out,
         rationale=plan.rationale,
     )
+
+    # Post-iteration risk analysis. Runs against the files that
+    # ACTUALLY changed, which may differ from the planner's prediction.
+    # Same skip-on-failure semantics as pre-flight: if risk_client is
+    # absent or the analysis crashes, we log and continue. The iteration
+    # outcome is unaffected.
+    if risk_client is not None and (changes_applied or new_files_created or files_deleted):
+        try:
+            from guardian_pipeline import (
+                analyze_iteration_outcome, write_iteration_risk,
+            )
+            post_risk = await analyze_iteration_outcome(
+                store=store,
+                project_id=project_id,
+                iteration_prompt=iteration_prompt,
+                actual_changed_paths=changes_applied,
+                actual_new_paths=new_files_created,
+                actual_deleted_paths=files_deleted,
+                client=risk_client,
+            )
+            write_iteration_risk(
+                store, project_id, iteration_seq, "post_risk", post_risk,
+            )
+            print(f"[iterate] post_risk for iter {iteration_seq}: "
+                  f"severity={post_risk.severity}, "
+                  f"confidence={post_risk.confidence:.2f}", flush=True)
+        except Exception as exc:
+            print(f"[iterate] post_risk analysis failed for iter "
+                  f"{iteration_seq}: {type(exc).__name__}: {exc}",
+                  flush=True)
+
     _write_outcome(store, project_id, iteration_seq, outcome)
     return outcome
 

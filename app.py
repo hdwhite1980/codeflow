@@ -1334,6 +1334,103 @@ async def list_risks(project_id: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Risk gate — proceed/cancel for paused iterations and fix-all passes.
+# ---------------------------------------------------------------------------
+#
+# When a pre-flight risk assessment returns severity=critical, the worker
+# pauses the iteration/fix-all and waits for a user decision via these
+# endpoints. The worker is blocking on a Redis BLPOP; calling proceed/
+# cancel here pushes onto the same list and wakes the worker.
+#
+# Auto-cancel after the gate's default timeout (1 hour) is handled by
+# the worker itself — these endpoints just record the explicit decision.
+
+class RiskDecisionResponse(BaseModel):
+    project_id: str
+    kind: str  # "iteration" or "fix_all"
+    seq: int
+    decision: str  # "proceed" or "cancel"
+    notified: bool
+
+
+@app.post(
+    "/api/projects/{project_id}/iterations/{seq}/proceed",
+    response_model=RiskDecisionResponse,
+)
+async def iteration_proceed(
+    project_id: str, seq: int,
+) -> RiskDecisionResponse:
+    """Resume a paused iteration after a critical pre-flight risk
+    assessment. Pushes 'proceed' to the iteration's risk gate; the
+    worker, which has been blocked on the gate, wakes up and continues
+    with regeneration. Idempotent — calling twice is harmless.
+    """
+    from risk_gate import make_risk_gate, iteration_gate_key
+    gate = make_risk_gate()
+    key = iteration_gate_key(project_id, seq)
+    notified = await gate.record_decision(key, "proceed")
+    return RiskDecisionResponse(
+        project_id=project_id, kind="iteration", seq=seq,
+        decision="proceed", notified=notified,
+    )
+
+
+@app.post(
+    "/api/projects/{project_id}/iterations/{seq}/cancel",
+    response_model=RiskDecisionResponse,
+)
+async def iteration_cancel(
+    project_id: str, seq: int,
+) -> RiskDecisionResponse:
+    """Cancel a paused iteration. The worker writes a cancellation
+    record and returns a clean outcome with no file changes."""
+    from risk_gate import make_risk_gate, iteration_gate_key
+    gate = make_risk_gate()
+    key = iteration_gate_key(project_id, seq)
+    notified = await gate.record_decision(key, "cancel")
+    return RiskDecisionResponse(
+        project_id=project_id, kind="iteration", seq=seq,
+        decision="cancel", notified=notified,
+    )
+
+
+@app.post(
+    "/api/projects/{project_id}/fix-all/{seq}/proceed",
+    response_model=RiskDecisionResponse,
+)
+async def fix_all_proceed(
+    project_id: str, seq: int,
+) -> RiskDecisionResponse:
+    """Same as iteration_proceed but for a paused fix-all pass."""
+    from risk_gate import make_risk_gate, fix_all_gate_key
+    gate = make_risk_gate()
+    key = fix_all_gate_key(project_id, seq)
+    notified = await gate.record_decision(key, "proceed")
+    return RiskDecisionResponse(
+        project_id=project_id, kind="fix_all", seq=seq,
+        decision="proceed", notified=notified,
+    )
+
+
+@app.post(
+    "/api/projects/{project_id}/fix-all/{seq}/cancel",
+    response_model=RiskDecisionResponse,
+)
+async def fix_all_cancel(
+    project_id: str, seq: int,
+) -> RiskDecisionResponse:
+    """Cancel a paused fix-all pass."""
+    from risk_gate import make_risk_gate, fix_all_gate_key
+    gate = make_risk_gate()
+    key = fix_all_gate_key(project_id, seq)
+    notified = await gate.record_decision(key, "cancel")
+    return RiskDecisionResponse(
+        project_id=project_id, kind="fix_all", seq=seq,
+        decision="cancel", notified=notified,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Impact analysis endpoints
 # ---------------------------------------------------------------------------
 

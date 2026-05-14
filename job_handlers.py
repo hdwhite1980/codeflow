@@ -83,6 +83,30 @@ class HandlerContext:
 
 
 # ---------------------------------------------------------------------------
+# Risk client selection (Turn D.1).
+# ---------------------------------------------------------------------------
+
+def _make_local_risk_client(ctx: HandlerContext):
+    """Construct a risk-analysis LLM client for use inside the worker.
+
+    Tries in order:
+      1. ctx.ollama (the worker's local model, when configured) — privacy-
+         preserving default for pre/post-iteration risk analysis.
+      2. ctx.anthropic — frontier API fallback. Used when the local model
+         isn't configured. ANTHROPIC_API_KEY is already in worker env for
+         the build/audit pipelines, so this is essentially free to enable.
+
+    Returns None when neither is available — callers must check and skip
+    the risk analysis step gracefully.
+    """
+    if ctx.ollama is not None:
+        return ctx.ollama
+    if ctx.anthropic is not None:
+        return ctx.anthropic
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Handler: build_project
 # ---------------------------------------------------------------------------
 
@@ -634,6 +658,20 @@ async def handle_iterate_project(job: dict[str, Any], ctx: HandlerContext) -> No
     print(f"[handlers] iterate_project: starting iteration "
           f"{iteration_seq} for {project_id}", flush=True)
 
+    # Risk integration: pass the local risk client + gate. The iteration
+    # writes pre_risk/post_risk records and pauses on critical pre-flight
+    # for user confirmation via the API.
+    risk_client = _make_local_risk_client(ctx)
+    risk_gate = None
+    if risk_client is not None:
+        try:
+            from risk_gate import make_risk_gate
+            risk_gate = make_risk_gate()
+        except Exception as exc:
+            print(f"[handlers] iterate_project: risk gate setup failed: "
+                  f"{type(exc).__name__}: {exc}; running without pause",
+                  flush=True)
+
     outcome = await run_iteration(
         project_id=project_id,
         iteration_prompt=iteration_prompt,
@@ -641,6 +679,8 @@ async def handle_iterate_project(job: dict[str, Any], ctx: HandlerContext) -> No
         store=ctx.store,
         client=ctx.anthropic,
         recorder=ctx.recorder,
+        risk_client=risk_client,
+        risk_gate=risk_gate,
     )
 
     print(f"[handlers] iterate_project: completed iteration "
@@ -737,6 +777,81 @@ async def handle_fix_all(job: dict[str, Any], ctx: HandlerContext) -> None:
           f"{len(pre_findings)} issue(s) across {files_affected} file(s)",
           flush=True)
 
+    # Phase 1.5: pre-flight risk for the fix-all. Same shape as
+    # iteration pre-flight: assess the implied changes, pause on
+    # critical pending user proceed/cancel.
+    if ctx.ollama is not None or os.environ.get("ANTHROPIC_API_KEY"):
+        try:
+            from guardian_pipeline import (
+                analyze_iteration_intent, write_fix_all_risk,
+            )
+            # Construct a description of what fix-all is about to do.
+            fix_prompt_summary = (
+                f"Fix-all pass #{seq}: address {len(pre_findings)} audit "
+                f"finding(s) across {files_affected} file(s)."
+            )
+            affected_paths = sorted({f.file_path for f in pre_findings})
+            risk_client = _make_local_risk_client(ctx)
+            if risk_client is not None:
+                pre_risk = await analyze_iteration_intent(
+                    store=ctx.store,
+                    project_id=project_id,
+                    iteration_prompt=fix_prompt_summary,
+                    planned_change_paths=affected_paths,
+                    planned_delete_paths=[],
+                    planned_new_paths=[],
+                    client=risk_client,
+                )
+                write_fix_all_risk(
+                    ctx.store, project_id, seq, "pre_risk", pre_risk,
+                )
+                print(f"[handlers] fix_all: pre_risk for pass {seq}: "
+                      f"severity={pre_risk.severity}", flush=True)
+
+                if pre_risk.severity == "critical":
+                    from risk_gate import (
+                        make_risk_gate, fix_all_gate_key,
+                    )
+                    gate = make_risk_gate()
+                    gate_key = fix_all_gate_key(project_id, seq)
+                    print(f"[handlers] fix_all: pass {seq} paused at "
+                          f"pre_risk (critical); awaiting decision...",
+                          flush=True)
+                    decision = await gate.wait_for_decision(gate_key)
+                    if decision != "proceed":
+                        ctx.store.write_entry(
+                            project_id=project_id,
+                            tier=Tier.SPEC,
+                            artifact_kind=ArtifactKind.DECISION_RECORD,
+                            artifact_key=f"fix_all:{seq}:cancelled",
+                            body={
+                                "fix_all_seq": seq,
+                                "reason": decision,
+                                "pre_risk_severity": "critical",
+                                "cancelled_at": time.time(),
+                            },
+                            rationale=(
+                                f"Fix-all pass {seq} cancelled by user "
+                                f"after critical pre-flight risk ({decision})."
+                            ),
+                            author=f"worker:fix_all:{seq}",
+                        )
+                        write_fix_all_report(
+                            ctx.store, project_id, seq,
+                            report=(
+                                f"Fix-all pass {seq} cancelled by user "
+                                f"after critical pre-flight risk "
+                                f"assessment ({decision})."
+                            ),
+                            pre_count=len(pre_findings),
+                            post_count=len(pre_findings),
+                            fixed=0, regressions=0,
+                        )
+                        return
+        except Exception as exc:
+            print(f"[handlers] fix_all: pre_risk failed: "
+                  f"{type(exc).__name__}: {exc}; continuing", flush=True)
+
     # Phase 2: run a normal iteration. We use the existing iterate
     # pipeline (not a fresh build) because the Builder is good at
     # taking a list-of-issues prompt + current file contents and
@@ -751,6 +866,19 @@ async def handle_fix_all(job: dict[str, Any], ctx: HandlerContext) -> None:
         and e.artifact_key.endswith(":started")
     ) + 1
 
+    # The iteration inherits risk-analysis behavior — it will write
+    # its own pre_risk/post_risk records under iteration:<k>:* keys,
+    # alongside the fix_all:<seq>:* records this handler writes.
+    iteration_risk_client = None
+    iteration_risk_gate = None
+    try:
+        iteration_risk_client = _make_local_risk_client(ctx)
+        if iteration_risk_client is not None:
+            from risk_gate import make_risk_gate
+            iteration_risk_gate = make_risk_gate()
+    except Exception:
+        pass
+
     try:
         outcome = await run_iteration(
             project_id=project_id,
@@ -759,6 +887,8 @@ async def handle_fix_all(job: dict[str, Any], ctx: HandlerContext) -> None:
             store=ctx.store,
             client=ctx.anthropic,
             recorder=ctx.recorder,
+            risk_client=iteration_risk_client,
+            risk_gate=iteration_risk_gate,
         )
     except Exception as exc:
         print(f"[handlers] fix_all: iteration failed: "
@@ -842,6 +972,37 @@ async def handle_fix_all(job: dict[str, Any], ctx: HandlerContext) -> None:
     persisted = len(pre_keys & post_keys)
     regressions = len(post_keys - pre_keys)
     fixed = len(pre_findings) - persisted
+
+    # Phase 4.5: post-fix-all risk assessment. Looks at the files that
+    # actually changed plus how the findings landscape shifted (regressions
+    # are worth assessing more carefully).
+    try:
+        risk_client_post = _make_local_risk_client(ctx)
+        if risk_client_post is not None:
+            from guardian_pipeline import (
+                analyze_iteration_outcome, write_fix_all_risk,
+            )
+            post_risk = await analyze_iteration_outcome(
+                store=ctx.store,
+                project_id=project_id,
+                iteration_prompt=(
+                    f"Fix-all pass #{seq} just completed. "
+                    f"Fixed {fixed} of {len(pre_findings)} issues; "
+                    f"{regressions} regression(s)."
+                ),
+                actual_changed_paths=outcome.changes_applied,
+                actual_new_paths=outcome.new_files_created,
+                actual_deleted_paths=outcome.files_deleted,
+                client=risk_client_post,
+            )
+            write_fix_all_risk(
+                ctx.store, project_id, seq, "post_risk", post_risk,
+            )
+            print(f"[handlers] fix_all: post_risk for pass {seq}: "
+                  f"severity={post_risk.severity}", flush=True)
+    except Exception as exc:
+        print(f"[handlers] fix_all: post_risk failed: "
+              f"{type(exc).__name__}: {exc}", flush=True)
 
     try:
         report = await generate_fix_all_report(

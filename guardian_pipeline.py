@@ -794,6 +794,250 @@ def next_risk_seq(store: "LedgerStore", project_id: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Iteration-attached risk analysis — pre-flight and post-iteration.
+# ---------------------------------------------------------------------------
+#
+# These wrap analyze_change_risk for the specific shape of risk queries
+# that flow out of iteration and fix-all pipelines. The difference from
+# the standalone risk analyzer:
+#
+#   - Multiple files are usually affected at once, not a single target.
+#     We synthesize a virtual target string that lists them.
+#   - The change_description comes from real pipeline data (the user's
+#     iteration prompt, or the set of audit findings being fixed) rather
+#     than from a free-text user query.
+#   - The result is persisted with a key tied to the iteration/fix-all
+#     seq, not a standalone risk seq, so the iteration card can render
+#     it inline.
+
+
+async def analyze_iteration_intent(
+    *,
+    store: "LedgerStore",
+    project_id: str,
+    iteration_prompt: str,
+    planned_change_paths: list[str],
+    planned_delete_paths: list[str],
+    planned_new_paths: list[str],
+    client: Any,
+) -> RiskAssessment:
+    """Pre-flight risk analysis for an iteration.
+
+    Runs AFTER the planner has decided what to change but BEFORE the
+    Builder regenerates anything. Lets the user (and the pipeline)
+    see what could break before any code is generated.
+
+    The target is a synthetic multi-file descriptor; the change
+    description includes both the user's prompt and the planner's
+    structural intent (changes/deletes/new files). The risk analyzer
+    reasons over the impact set of each changed file and the
+    semantic summaries of all involved files.
+
+    For the impact walk we use the FIRST changed file as the target —
+    this gives the analyzer a graph anchor. For projects where the
+    iteration touches many files, the analyzer also receives the full
+    list in the change_description so it knows what else is in play.
+    """
+    # Build a human-readable target. When only one file is changing,
+    # use just that path (cleaner narrative). When multiple, summarize.
+    all_paths = list(planned_change_paths) + list(planned_new_paths) + list(planned_delete_paths)
+    if len(all_paths) == 1:
+        target = all_paths[0]
+    elif len(all_paths) == 0:
+        # Empty plan — nothing to analyze. Return a minimal "no-op" assessment.
+        return RiskAssessment(
+            target="(empty plan)",
+            change_description=iteration_prompt,
+            severity="low",
+            plain_narrative="The iteration plan is empty — nothing will change.",
+            technical_narrative="No files were marked for change, creation, or deletion. The pipeline will skip regeneration.",
+            affected_paths=[],
+            concerns=[],
+            suggested_sequencing=[],
+            confidence=1.0,
+            analyzer_model="(skipped)",
+            input_tokens=0,
+            output_tokens=0,
+            indexed_summary_count=0,
+        )
+    else:
+        target = all_paths[0]  # graph anchor; full list in change_description
+
+    # Construct a rich change description so the analyzer sees both the
+    # user's intent and the planner's structural decision.
+    parts = [f"User iteration prompt: {iteration_prompt}"]
+    if planned_change_paths:
+        parts.append(f"Files to be regenerated: {', '.join(sorted(planned_change_paths))}")
+    if planned_new_paths:
+        parts.append(f"New files to be created: {', '.join(sorted(planned_new_paths))}")
+    if planned_delete_paths:
+        parts.append(f"Files to be deleted: {', '.join(sorted(planned_delete_paths))}")
+    change_description = "\n".join(parts)
+
+    return await analyze_change_risk(
+        store=store,
+        project_id=project_id,
+        target=target,
+        change_description=change_description,
+        client=client,
+    )
+
+
+async def analyze_iteration_outcome(
+    *,
+    store: "LedgerStore",
+    project_id: str,
+    iteration_prompt: str,
+    actual_changed_paths: list[str],
+    actual_new_paths: list[str],
+    actual_deleted_paths: list[str],
+    client: Any,
+) -> RiskAssessment:
+    """Post-iteration risk analysis.
+
+    Runs AFTER the Builder regenerates files and the audit completes.
+    The input is the set of files that ACTUALLY changed (which may
+    differ from what the planner predicted — the Builder sometimes
+    touches files the planner didn't anticipate). The analyzer
+    reasons over the impact of those real changes.
+
+    Same response shape as analyze_iteration_intent. The narratives
+    will be different in tone — past-tense, focused on what's now
+    deployed rather than what's being proposed.
+    """
+    all_paths = list(actual_changed_paths) + list(actual_new_paths) + list(actual_deleted_paths)
+    if not all_paths:
+        return RiskAssessment(
+            target="(no changes applied)",
+            change_description=iteration_prompt,
+            severity="low",
+            plain_narrative="The iteration completed without applying any file changes.",
+            technical_narrative="No files were regenerated, created, or deleted. Nothing to assess.",
+            affected_paths=[],
+            concerns=[],
+            suggested_sequencing=[],
+            confidence=1.0,
+            analyzer_model="(skipped)",
+            input_tokens=0,
+            output_tokens=0,
+            indexed_summary_count=0,
+        )
+
+    target = all_paths[0] if len(all_paths) >= 1 else "(no changes)"
+    parts = [f"Iteration prompt was: {iteration_prompt}",
+             "The iteration has just completed. Assess what may now be at risk."]
+    if actual_changed_paths:
+        parts.append(f"Files regenerated: {', '.join(sorted(actual_changed_paths))}")
+    if actual_new_paths:
+        parts.append(f"New files created: {', '.join(sorted(actual_new_paths))}")
+    if actual_deleted_paths:
+        parts.append(f"Files deleted: {', '.join(sorted(actual_deleted_paths))}")
+    change_description = "\n".join(parts)
+
+    return await analyze_change_risk(
+        store=store,
+        project_id=project_id,
+        target=target,
+        change_description=change_description,
+        client=client,
+    )
+
+
+def write_iteration_risk(
+    store: "LedgerStore",
+    project_id: str,
+    iteration_seq: int,
+    phase: str,  # "pre_risk" or "post_risk"
+    assessment: RiskAssessment,
+) -> None:
+    """Persist an iteration-attached risk assessment to the ledger.
+
+    Key shape: `iteration:<seq>:pre_risk` or `iteration:<seq>:post_risk`.
+    Stored as DECISION_RECORD so it shows up in the same query path as
+    the iteration's other markers (plan, started, outcome).
+    """
+    if phase not in ("pre_risk", "post_risk"):
+        raise ValueError(f"phase must be 'pre_risk' or 'post_risk', got {phase!r}")
+    store.write_entry(
+        project_id=project_id,
+        tier=Tier.SPEC,
+        artifact_kind=ArtifactKind.DECISION_RECORD,
+        artifact_key=f"iteration:{iteration_seq}:{phase}",
+        body={
+            "target": assessment.target,
+            "change_description": assessment.change_description,
+            "severity": assessment.severity,
+            "plain_narrative": assessment.plain_narrative,
+            "technical_narrative": assessment.technical_narrative,
+            "affected_paths": assessment.affected_paths,
+            "concerns": [
+                {"path": c.path, "reason": c.reason, "severity": c.severity}
+                for c in assessment.concerns
+            ],
+            "suggested_sequencing": assessment.suggested_sequencing,
+            "confidence": assessment.confidence,
+            "analyzer_model": assessment.analyzer_model,
+            "input_tokens": assessment.input_tokens,
+            "output_tokens": assessment.output_tokens,
+            "indexed_summary_count": assessment.indexed_summary_count,
+            "asked_at": time.time(),
+        },
+        rationale=(
+            f"Iteration #{iteration_seq} {phase.replace('_', ' ')}: "
+            f"severity={assessment.severity}, "
+            f"confidence={assessment.confidence:.2f}"
+        ),
+        author=f"guardian:iteration_{phase}:{assessment.analyzer_model}",
+    )
+
+
+def write_fix_all_risk(
+    store: "LedgerStore",
+    project_id: str,
+    fix_all_seq: int,
+    phase: str,  # "pre_risk" or "post_risk"
+    assessment: RiskAssessment,
+) -> None:
+    """Same as write_iteration_risk but for fix-all passes.
+
+    Key shape: `fix_all:<seq>:pre_risk` or `fix_all:<seq>:post_risk`.
+    """
+    if phase not in ("pre_risk", "post_risk"):
+        raise ValueError(f"phase must be 'pre_risk' or 'post_risk', got {phase!r}")
+    store.write_entry(
+        project_id=project_id,
+        tier=Tier.SPEC,
+        artifact_kind=ArtifactKind.DECISION_RECORD,
+        artifact_key=f"fix_all:{fix_all_seq}:{phase}",
+        body={
+            "target": assessment.target,
+            "change_description": assessment.change_description,
+            "severity": assessment.severity,
+            "plain_narrative": assessment.plain_narrative,
+            "technical_narrative": assessment.technical_narrative,
+            "affected_paths": assessment.affected_paths,
+            "concerns": [
+                {"path": c.path, "reason": c.reason, "severity": c.severity}
+                for c in assessment.concerns
+            ],
+            "suggested_sequencing": assessment.suggested_sequencing,
+            "confidence": assessment.confidence,
+            "analyzer_model": assessment.analyzer_model,
+            "input_tokens": assessment.input_tokens,
+            "output_tokens": assessment.output_tokens,
+            "indexed_summary_count": assessment.indexed_summary_count,
+            "asked_at": time.time(),
+        },
+        rationale=(
+            f"Fix-all pass #{fix_all_seq} {phase.replace('_', ' ')}: "
+            f"severity={assessment.severity}, "
+            f"confidence={assessment.confidence:.2f}"
+        ),
+        author=f"guardian:fix_all_{phase}:{assessment.analyzer_model}",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Helpers.
 # ---------------------------------------------------------------------------
 
