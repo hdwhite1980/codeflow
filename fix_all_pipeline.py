@@ -208,6 +208,11 @@ def build_fix_all_prompt(findings: list[Finding], truncated: bool) -> str:
     finding has severity + line + issue + suggestion. We explicitly
     tell the Builder: if a finding can't be safely fixed by changing
     this file, skip it — the report step will explain.
+
+    NOTE: this is the legacy single-prompt builder. The handler now
+    prefers cluster_findings_by_topic + build_cluster_prompt which
+    produces N smaller prompts with per-cluster memory context. We
+    keep this one for fallback (no memory available) and back-compat.
     """
     by_file: dict[str, list[Finding]] = {}
     for f in findings:
@@ -241,6 +246,297 @@ def build_fix_all_prompt(findings: list[Finding], truncated: bool) -> str:
             "this pass, audit will run again and surface what remains."
         )
     return prompt
+
+
+# ---------------------------------------------------------------------------
+# Memory-aware + cluster-aware fix-all (Turn fix-all-A+B).
+# ---------------------------------------------------------------------------
+#
+# Why this exists
+# ---------------
+# The legacy build_fix_all_prompt sends every finding in one giant prompt
+# without any guardian context. Three failure modes that produces:
+#   1. Builder doesn't know that fixing file X requires coordinated changes
+#      in file Y. Result: regressions.
+#   2. Multiple related findings (e.g. 6 schema-validation bugs in store.js)
+#      get fixed inconsistently — one with throw, another with default,
+#      another with silent drop. Result: incoherent file.
+#   3. No risk_notes context, so the Builder doesn't know which existing
+#      patterns to preserve.
+#
+# The new flow:
+#   - Cluster findings by topic-token overlap (same algorithm as ambient
+#     review). Issues that share concept (e.g. "schema validation",
+#     "rate limiting", "error swallowing") cluster together.
+#   - For each cluster, look up guardian summaries for every file in
+#     the cluster, plus their direct dependents.
+#   - Build a per-cluster prompt that includes both the findings and
+#     the memory context.
+#   - Run one iteration per cluster. Each iteration is smaller, more
+#     focused, and gets dedicated context.
+#
+# Tradeoffs:
+#   - N iterations instead of 1 means N Builder calls (~$). For a typical
+#     fix-all with 4-6 clusters that's a 4-6x cost increase per pass.
+#   - But: each iteration is smaller (fewer files in context), more
+#     accurate (memory context tells the Builder about consequences),
+#     and less likely to regress. Net cost over time should be lower
+#     because we don't have to run fix-all repeatedly to clean up
+#     regressions from the prior fix-all.
+
+@dataclass(frozen=True)
+class FindingCluster:
+    """Group of related findings to be fixed in one Builder call.
+
+    Clusters are identified by topic_key — a stable identifier derived
+    from token overlap of the issues. Files within a cluster are the
+    union of file_paths across all member findings; dependents are the
+    set of files that import/depend on those (extracted from the graph
+    by the caller, not stored here)."""
+    topic_key: str
+    topic_label: str           # short human-readable label for logs/UI
+    findings: list["Finding"]
+    file_paths: list[str]      # union of file_paths from findings
+
+
+def cluster_findings_by_topic(
+    findings: list["Finding"],
+    *,
+    max_clusters: int = 8,
+) -> list[FindingCluster]:
+    """Group findings into clusters that should be fixed together.
+
+    Topic key derivation matches ambient_review:
+      - Tokenize the issue text into meaningful words (stopwords removed)
+      - Use sorted token set as the cluster key
+      - Findings whose tokens have substantial overlap join the same
+        cluster
+
+    Approach: use ambient_review's _topic_tokens/_topic_key for stable
+    behavior across the codebase. Then merge clusters whose token sets
+    have >=50% overlap — catches near-duplicates like "missing input
+    validation on auth endpoint" + "no input validation on admin endpoint"
+    that have only one differing token.
+
+    Returns clusters sorted by max-severity within cluster (critical-first)
+    then by file count, capped at max_clusters. Findings that don't fit
+    anywhere become a final "miscellaneous" cluster.
+    """
+    from ambient_review import _topic_tokens, _topic_key
+
+    # Stage 1: initial bucketing by exact topic key
+    buckets: dict[str, list[tuple["Finding", list[str]]]] = {}
+    for f in findings:
+        # Combine issue + suggestion for richer token signal
+        text = f"{f.issue or ''} {f.suggestion or ''}".strip()
+        tokens = _topic_tokens(text)
+        if not tokens:
+            # Findings with no meaningful tokens (rare — would be all
+            # stopwords or empty). Group them under their file path so
+            # they at least share a Builder context.
+            key = f"misc:{f.file_path}"
+        else:
+            key = _topic_key(tokens)
+        buckets.setdefault(key, []).append((f, tokens))
+
+    # Stage 2: merge buckets with high token overlap (>=50%). Walk in
+    # descending size order so we extend the big clusters first rather
+    # than chasing small ones together.
+    sorted_keys = sorted(buckets.keys(), key=lambda k: -len(buckets[k]))
+    merged: dict[str, list[tuple["Finding", list[str]]]] = {}
+    consumed: set[str] = set()
+
+    for primary_key in sorted_keys:
+        if primary_key in consumed:
+            continue
+        primary_tokens = set()
+        for _, toks in buckets[primary_key]:
+            primary_tokens.update(toks)
+
+        members = list(buckets[primary_key])
+        consumed.add(primary_key)
+
+        # Find other buckets to merge in.
+        for other_key in sorted_keys:
+            if other_key in consumed:
+                continue
+            if other_key.startswith("misc:") or primary_key.startswith("misc:"):
+                continue  # don't merge misc buckets into real ones
+            other_tokens = set()
+            for _, toks in buckets[other_key]:
+                other_tokens.update(toks)
+            if not other_tokens or not primary_tokens:
+                continue
+            overlap = primary_tokens & other_tokens
+            smaller_size = min(len(primary_tokens), len(other_tokens))
+            if smaller_size > 0 and len(overlap) / smaller_size >= 0.5:
+                members.extend(buckets[other_key])
+                consumed.add(other_key)
+                primary_tokens.update(other_tokens)
+
+        merged[primary_key] = members
+
+    # Stage 3: build FindingCluster objects.
+    severity_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+    clusters: list[FindingCluster] = []
+    for key, members in merged.items():
+        cluster_findings = [m[0] for m in members]
+        file_paths = sorted({f.file_path for f in cluster_findings})
+
+        # Topic label: best-effort human-readable summary. Pick the
+        # 2-3 most distinctive tokens from the most severe finding.
+        worst = min(
+            cluster_findings,
+            key=lambda f: severity_rank.get(f.severity, 5),
+        )
+        worst_tokens = next(
+            (toks for fnd, toks in members if fnd is worst),
+            [],
+        )
+        # Filter out file-name and path-context tokens before labeling.
+        label_tokens = [
+            t for t in worst_tokens[:5]
+            if t not in {"file", "files", "function", "method", "class"}
+        ]
+        topic_label = " ".join(label_tokens[:3]) if label_tokens else "miscellaneous"
+
+        clusters.append(FindingCluster(
+            topic_key=key,
+            topic_label=topic_label,
+            findings=cluster_findings,
+            file_paths=file_paths,
+        ))
+
+    # Sort: highest-severity first, then most files affected.
+    def _cluster_sort_key(c: FindingCluster):
+        worst_sev = min(
+            severity_rank.get(f.severity, 5) for f in c.findings
+        )
+        return (worst_sev, -len(c.file_paths), -len(c.findings))
+
+    clusters.sort(key=_cluster_sort_key)
+    return clusters[:max_clusters]
+
+
+def build_cluster_prompt(
+    cluster: FindingCluster,
+    *,
+    cluster_index: int,
+    total_clusters: int,
+    guardian_context: str = "",
+    dependent_paths: list[str] | None = None,
+) -> str:
+    """Build the Builder prompt for one cluster, with memory context.
+
+    The prompt is structured to make consequences explicit:
+      1. Identify what concept the cluster is about
+      2. List the findings (issue + suggestion + severity + line)
+      3. Inject guardian semantic summaries for the target files
+      4. List dependent files explicitly: "fixing X must not break Y"
+      5. Tell the Builder to make coordinated changes consistently
+
+    `guardian_context` is the output of build_pipeline_context_with_paths
+    pre-filtered to relevant files. Empty string is fine — the prompt
+    still works without it but lacks the memory layer.
+    """
+    lines: list[str] = []
+    lines.append(
+        f"Fix cluster {cluster_index + 1} of {total_clusters}: "
+        f"{cluster.topic_label}"
+    )
+    lines.append("")
+    lines.append(
+        f"The following {len(cluster.findings)} finding"
+        f"{'s' if len(cluster.findings) != 1 else ''} share a common "
+        "concept. They MUST be fixed with a CONSISTENT approach — "
+        "do not apply different patterns to different findings in "
+        "this cluster. Decide the right fix once, then apply it "
+        "everywhere it's relevant within the files listed."
+    )
+    lines.append("")
+
+    # Findings grouped by file for readability.
+    by_file: dict[str, list["Finding"]] = {}
+    for f in cluster.findings:
+        by_file.setdefault(f.file_path, []).append(f)
+
+    lines.append("## Findings to fix")
+    for path in sorted(by_file.keys()):
+        lines.append(f"\n### {path}")
+        for f in by_file[path]:
+            loc = f" (line {f.line})" if f.line else ""
+            lines.append(f"- [{f.severity.upper()}]{loc} {f.issue}")
+            if f.suggestion:
+                lines.append(f"  Suggested fix: {f.suggestion}")
+
+    if guardian_context:
+        lines.append("")
+        lines.append("## Guardian semantic context")
+        lines.append(
+            "The following memory was indexed before this fix attempt. "
+            "Use it to understand the existing patterns and avoid "
+            "breaking dependent code:"
+        )
+        lines.append("")
+        lines.append(guardian_context)
+
+    if dependent_paths:
+        lines.append("")
+        lines.append("## Files that depend on what you're changing")
+        lines.append(
+            "These files are NOT being edited in this pass, but they "
+            "depend on the files you are editing. Your fixes must "
+            "remain compatible with them:"
+        )
+        for p in dependent_paths:
+            lines.append(f"  - {p}")
+
+    lines.append("")
+    lines.append(
+        "If a finding cannot be safely fixed without changes to files "
+        "outside this cluster — leave that specific finding alone and "
+        "continue with the others. Do not produce a half-fix that "
+        "leaves the codebase in a worse state. Unfixed findings will "
+        "be reported separately."
+    )
+    return "\n".join(lines)
+
+
+def discover_dependent_paths(
+    store: "LedgerStore", project_id: str, target_paths: list[str],
+) -> list[str]:
+    """Return files that depend on any of `target_paths` via the
+    project's graph edges. Used to warn the Builder which downstream
+    files need to remain compatible with its changes.
+
+    Falls back gracefully on graph errors — empty list means "we don't
+    know what depends on this, proceed without that hint."
+    """
+    if not target_paths:
+        return []
+    targets = set(target_paths)
+    dependents: set[str] = set()
+    try:
+        for path in target_paths:
+            try:
+                neighbors = store.neighbors(
+                    project_id, f"file:{project_id}:{path}",
+                )
+            except Exception:
+                continue
+            # neighbors() returns inbound edges (who points at me).
+            for n in neighbors or []:
+                key = getattr(n, "artifact_key", "")
+                parts = key.split(":", 2)
+                if len(parts) >= 3 and parts[0] == "file":
+                    dep = parts[2]
+                    if dep not in targets:
+                        dependents.add(dep)
+    except Exception as exc:
+        print(f"[fix_all] discover_dependent_paths failed: "
+              f"{type(exc).__name__}: {exc}", flush=True)
+        return []
+    return sorted(dependents)
 
 
 async def generate_fix_all_report(

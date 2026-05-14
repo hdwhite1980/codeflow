@@ -772,6 +772,8 @@ async def handle_fix_all(job: dict[str, Any], ctx: HandlerContext) -> None:
     # top-level import graph.
     from fix_all_pipeline import (
         collect_all_findings, build_fix_all_prompt,
+        build_cluster_prompt, cluster_findings_by_topic,
+        discover_dependent_paths,
         generate_fix_all_report, write_fix_all_started,
         write_fix_all_report, next_fix_all_seq, FIX_ALL_MAX_FINDINGS,
     )
@@ -930,23 +932,53 @@ async def handle_fix_all(job: dict[str, Any], ctx: HandlerContext) -> None:
     if await _check_stop("post-risk-pre-iteration"):
         return
 
-    # Phase 2: run a normal iteration. We use the existing iterate
-    # pipeline (not a fresh build) because the Builder is good at
-    # taking a list-of-issues prompt + current file contents and
-    # producing fixed versions.
-    iteration_prompt = build_fix_all_prompt(pre_findings, truncated)
+    # Phase 2: cluster + memory-aware iteration (fix-all-A+B upgrade).
+    #
+    # Before this change: one iteration with all findings shoved into a
+    # single prompt and no guardian memory. Caused cross-file regressions
+    # because the Builder didn't know about consequences in other files,
+    # and inconsistent fixes when multiple related findings got resolved
+    # with different patterns.
+    #
+    # New flow:
+    #   1. Cluster findings by topic-token overlap (issues that share
+    #      a concept: "schema validation", "rate limiting", etc.)
+    #   2. For each cluster, load guardian context for the affected
+    #      files plus their dependents (graph neighbors).
+    #   3. Run one iteration per cluster, with a focused prompt that
+    #      lists the cluster's findings AND the relevant memory.
+    #
+    # This trades 1 large iteration for N smaller ones. Each iteration
+    # is more accurate and less likely to regress, at the cost of more
+    # Builder calls. Net cost over time should be lower because we
+    # don't have to re-run fix-all to clean up the prior fix-all's mess.
+    clusters = cluster_findings_by_topic(pre_findings)
+    if not clusters:
+        # Defensive — shouldn't happen since pre_findings was non-empty.
+        print(f"[handlers] fix_all: no clusters produced from "
+              f"{len(pre_findings)} findings; skipping iteration",
+              flush=True)
+        write_fix_all_report(
+            ctx.store, project_id, seq,
+            report=(f"Fix-all pass {seq} couldn't cluster the "
+                    f"{len(pre_findings)} finding(s) — skipped."),
+            pre_count=len(pre_findings), post_count=len(pre_findings),
+            fixed=0, regressions=0,
+        )
+        return
 
-    # Compute the iteration_seq the same way the API does.
-    decisions = ctx.store.all_current(project_id, ArtifactKind.DECISION_RECORD)
-    iteration_seq = sum(
-        1 for e in decisions
-        if e.artifact_key.startswith("iteration:")
-        and e.artifact_key.endswith(":started")
-    ) + 1
+    print(f"[handlers] fix_all: {len(pre_findings)} findings clustered "
+          f"into {len(clusters)} group(s): "
+          f"{', '.join(c.topic_label for c in clusters[:5])}"
+          f"{'...' if len(clusters) > 5 else ''}",
+          flush=True)
 
-    # The iteration inherits risk-analysis behavior — it will write
-    # its own pre_risk/post_risk records under iteration:<k>:* keys,
-    # alongside the fix_all:<seq>:* records this handler writes.
+    # Load guardian context once for the whole pass; we'll filter per
+    # cluster from this. If indexing hasn't run, context will be empty
+    # and we degrade to issue-list-only prompts (same as legacy).
+    from guardian_pipeline import build_pipeline_context_with_paths
+
+    # Risk-analysis setup is identical across all cluster iterations.
     iteration_risk_client = None
     iteration_risk_gate = None
     try:
@@ -957,29 +989,94 @@ async def handle_fix_all(job: dict[str, Any], ctx: HandlerContext) -> None:
     except Exception:
         pass
 
-    try:
-        outcome = await run_iteration(
-            project_id=project_id,
-            iteration_prompt=iteration_prompt,
-            iteration_seq=iteration_seq,
-            store=ctx.store,
-            client=ctx.anthropic,
-            recorder=ctx.recorder,
-            risk_client=iteration_risk_client,
-            risk_gate=iteration_risk_gate,
+    # Track per-cluster results so the report can attribute outcomes.
+    cluster_outcomes: list[dict[str, Any]] = []
+
+    for cluster_idx, cluster in enumerate(clusters):
+        if await _check_stop(f"between-cluster-{cluster_idx}"):
+            return
+
+        # Pull guardian context for files in this cluster.
+        cluster_paths = list(cluster.file_paths)
+        try:
+            guardian_context, _ref_paths = build_pipeline_context_with_paths(
+                ctx.store, project_id,
+                focus_paths=cluster_paths,
+            )
+        except Exception as exc:
+            print(f"[handlers] fix_all: guardian context load failed "
+                  f"for cluster {cluster_idx}: "
+                  f"{type(exc).__name__}: {exc}", flush=True)
+            guardian_context = ""
+
+        # Discover dependent files from the graph. These are files
+        # that import/depend on the cluster's target files. The
+        # Builder is told it must remain compatible with them.
+        dependents = discover_dependent_paths(
+            ctx.store, project_id, cluster_paths,
         )
-    except Exception as exc:
-        print(f"[handlers] fix_all: iteration failed: "
-              f"{type(exc).__name__}: {exc}", flush=True)
-        write_fix_all_report(
-            ctx.store, project_id, seq,
-            report=f"Fix-all pass {seq} failed during iteration: "
-                   f"{type(exc).__name__}: {exc}. "
-                   f"The original {len(pre_findings)} issue(s) remain.",
-            pre_count=len(pre_findings), post_count=len(pre_findings),
-            fixed=0, regressions=0,
+
+        cluster_prompt = build_cluster_prompt(
+            cluster,
+            cluster_index=cluster_idx,
+            total_clusters=len(clusters),
+            guardian_context=guardian_context,
+            dependent_paths=dependents,
         )
-        return
+
+        # Compute iteration_seq fresh for each cluster so they all
+        # get distinct iteration records.
+        decisions = ctx.store.all_current(
+            project_id, ArtifactKind.DECISION_RECORD,
+        )
+        iteration_seq = sum(
+            1 for e in decisions
+            if e.artifact_key.startswith("iteration:")
+            and e.artifact_key.endswith(":started")
+        ) + 1
+
+        print(f"[handlers] fix_all: cluster {cluster_idx + 1}/"
+              f"{len(clusters)} '{cluster.topic_label}' — "
+              f"{len(cluster.findings)} finding(s) across "
+              f"{len(cluster_paths)} file(s), "
+              f"{len(dependents)} dependent(s), "
+              f"context={len(guardian_context)} chars",
+              flush=True)
+
+        try:
+            cluster_outcome = await run_iteration(
+                project_id=project_id,
+                iteration_prompt=cluster_prompt,
+                iteration_seq=iteration_seq,
+                store=ctx.store,
+                client=ctx.anthropic,
+                recorder=ctx.recorder,
+                risk_client=iteration_risk_client,
+                risk_gate=iteration_risk_gate,
+            )
+            cluster_outcomes.append({
+                "topic_label": cluster.topic_label,
+                "finding_count": len(cluster.findings),
+                "outcome": cluster_outcome,
+            })
+        except Exception as exc:
+            print(f"[handlers] fix_all: cluster {cluster_idx + 1} "
+                  f"failed: {type(exc).__name__}: {exc}",
+                  flush=True)
+            cluster_outcomes.append({
+                "topic_label": cluster.topic_label,
+                "finding_count": len(cluster.findings),
+                "outcome": None,
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+            # Continue to next cluster — one failed cluster shouldn't
+            # block the rest. Partial progress is still progress.
+
+    # Synthesize one outcome-shaped object for the audit comparison
+    # below, based on the union of cluster results. The audit uses
+    # `outcome` for nothing structural — only the post-findings
+    # collection matters. We just need *some* value here.
+    outcome = cluster_outcomes  # downstream code treats it as opaque
 
     if await _check_stop("post-iteration-pre-audit"):
         return
