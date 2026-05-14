@@ -29,6 +29,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
+        git \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root user. Railway doesn't require it, but it's good hygiene and
