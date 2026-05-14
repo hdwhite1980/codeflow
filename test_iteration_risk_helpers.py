@@ -200,3 +200,84 @@ class TestWriteFixAllRisk(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# list_iteration_risks / list_fix_all_risks — read back grouped records
+# ---------------------------------------------------------------------------
+
+class TestListIterationRisks(unittest.TestCase):
+    def test_empty_project_returns_empty_dict(self):
+        from guardian_pipeline import list_iteration_risks
+        store = InMemoryLedgerStore()
+        pid = store.create_project("t", "t")
+        self.assertEqual(list_iteration_risks(store, pid), {})
+
+    def test_groups_pre_and_post_by_seq(self):
+        from guardian_pipeline import (
+            RiskAssessment, write_iteration_risk, list_iteration_risks,
+        )
+        store = InMemoryLedgerStore()
+        pid = store.create_project("t", "t")
+        a = RiskAssessment(
+            target="x", change_description="x",
+            severity="medium", plain_narrative="", technical_narrative="",
+            affected_paths=[], concerns=[], suggested_sequencing=[],
+            confidence=0.7, analyzer_model="m",
+            input_tokens=0, output_tokens=0, indexed_summary_count=0,
+        )
+        write_iteration_risk(store, pid, 1, "pre_risk", a)
+        write_iteration_risk(store, pid, 1, "post_risk", a)
+        write_iteration_risk(store, pid, 2, "pre_risk", a)
+
+        result = list_iteration_risks(store, pid)
+        self.assertIn(1, result)
+        self.assertIn(2, result)
+        self.assertIn("pre_risk", result[1])
+        self.assertIn("post_risk", result[1])
+        self.assertIn("pre_risk", result[2])
+        self.assertNotIn("post_risk", result[2])
+
+    def test_ignores_non_iteration_records(self):
+        from guardian_pipeline import (
+            RiskAssessment, write_iteration_risk, write_fix_all_risk,
+            list_iteration_risks,
+        )
+        store = InMemoryLedgerStore()
+        pid = store.create_project("t", "t")
+        a = RiskAssessment(
+            target="x", change_description="x",
+            severity="low", plain_narrative="", technical_narrative="",
+            affected_paths=[], concerns=[], suggested_sequencing=[],
+            confidence=0.5, analyzer_model="m",
+            input_tokens=0, output_tokens=0, indexed_summary_count=0,
+        )
+        write_iteration_risk(store, pid, 1, "pre_risk", a)
+        write_fix_all_risk(store, pid, 1, "pre_risk", a)
+
+        result = list_iteration_risks(store, pid)
+        # Only the iteration:1 record, not fix_all:1.
+        self.assertEqual(set(result.keys()), {1})
+
+
+class TestListFixAllRisks(unittest.TestCase):
+    def test_groups_correctly(self):
+        from guardian_pipeline import (
+            RiskAssessment, write_fix_all_risk, list_fix_all_risks,
+        )
+        store = InMemoryLedgerStore()
+        pid = store.create_project("t", "t")
+        a = RiskAssessment(
+            target="x", change_description="x",
+            severity="high", plain_narrative="", technical_narrative="",
+            affected_paths=[], concerns=[], suggested_sequencing=[],
+            confidence=0.6, analyzer_model="m",
+            input_tokens=0, output_tokens=0, indexed_summary_count=0,
+        )
+        write_fix_all_risk(store, pid, 3, "pre_risk", a)
+        write_fix_all_risk(store, pid, 3, "post_risk", a)
+
+        result = list_fix_all_risks(store, pid)
+        self.assertEqual(set(result.keys()), {3})
+        self.assertIn("pre_risk", result[3])
+        self.assertIn("post_risk", result[3])

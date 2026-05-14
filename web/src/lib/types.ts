@@ -402,3 +402,75 @@ export interface RiskListResponse {
   risks: RiskAssessment[];
   count: number;
 }
+
+// -- Iteration / fix-all attached risk records (Turn D.1 + D.2) ----
+//
+// The risk records written by run_iteration() and handle_fix_all()
+// have the SAME body shape as RiskAssessment but without the
+// project_id/seq fields wrapped at the top (those are implied by the
+// containing iteration/fix-all). The frontend treats them as
+// "AttachedRiskAssessment" — same fields the user already understands
+// from the standalone risk panel, just inline in an iteration card.
+
+export interface AttachedRiskAssessment {
+  target: string;
+  change_description: string;
+  severity: RiskSeverity;
+  plain_narrative: string;
+  technical_narrative: string;
+  affected_paths: string[];
+  concerns: RiskConcern[];
+  suggested_sequencing: string[];
+  confidence: number;
+  analyzer_model: string;
+  indexed_summary_count: number;
+  asked_at: number;
+}
+
+export interface IterationCancellation {
+  iteration_seq: number;
+  reason: string;            // "cancel" | "timeout"
+  pre_risk_severity: string;
+  cancelled_at: number;
+}
+
+export interface FixAllCancellation {
+  fix_all_seq: number;
+  reason: string;
+  pre_risk_severity: string;
+  cancelled_at: number;
+}
+
+// One iteration's set of risk records. All three fields are optional;
+// when an iteration is paused at pre-flight, only `pre_risk` is set.
+export interface IterationRisks {
+  pre_risk?: AttachedRiskAssessment;
+  post_risk?: AttachedRiskAssessment;
+  cancelled?: IterationCancellation;
+}
+
+export interface FixAllRisks {
+  pre_risk?: AttachedRiskAssessment;
+  post_risk?: AttachedRiskAssessment;
+  cancelled?: FixAllCancellation;
+}
+
+// API response shape: keyed by iteration seq (number).
+export interface IterationRisksResponse {
+  project_id: string;
+  by_seq: Record<number, IterationRisks>;
+}
+
+export interface FixAllRisksResponse {
+  project_id: string;
+  by_seq: Record<number, FixAllRisks>;
+}
+
+// Proceed/cancel decision response from POST endpoints.
+export interface RiskDecisionResponse {
+  project_id: string;
+  kind: "iteration" | "fix_all";
+  seq: number;
+  decision: "proceed" | "cancel";
+  notified: boolean;
+}

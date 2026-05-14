@@ -20,13 +20,16 @@ import type {
   FixAllEstimate,
   FixAllPassesResponse,
   FixAllResponse,
+  FixAllRisksResponse,
   GraphResponse,
   Iteration,
   IterateRequest,
   IterateResponse,
   IterationListResponse,
+  IterationRisksResponse,
   ProjectListResponse,
   RiskAssessment,
+  RiskDecisionResponse,
   RiskQueryRequest,
   RiskListResponse,
   UsageSummary,
@@ -204,6 +207,65 @@ export async function getRiskHistory(
 ): Promise<RiskListResponse> {
   return getJSON<RiskListResponse>(
     `/api/projects/${encodeURIComponent(projectId)}/risks`,
+  );
+}
+
+// -- Iteration / fix-all attached risk records (Turn D.2) -----------
+
+export async function getIterationRisks(
+  projectId: string,
+): Promise<IterationRisksResponse> {
+  return getJSON<IterationRisksResponse>(
+    `/api/projects/${encodeURIComponent(projectId)}/risks/iteration`,
+  );
+}
+
+export async function getFixAllRisks(
+  projectId: string,
+): Promise<FixAllRisksResponse> {
+  return getJSON<FixAllRisksResponse>(
+    `/api/projects/${encodeURIComponent(projectId)}/risks/fix-all`,
+  );
+}
+
+// Proceed / cancel a paused iteration after critical pre-flight risk.
+// The backend pushes the decision onto the risk gate; the worker
+// wakes up and either proceeds with regen or writes a cancellation
+// record. Idempotent — safe to call twice.
+
+export async function proceedIteration(
+  projectId: string, seq: number,
+): Promise<RiskDecisionResponse> {
+  return postJSON<Record<string, never>, RiskDecisionResponse>(
+    `/api/projects/${encodeURIComponent(projectId)}/iterations/${seq}/proceed`,
+    {},
+  );
+}
+
+export async function cancelIteration(
+  projectId: string, seq: number,
+): Promise<RiskDecisionResponse> {
+  return postJSON<Record<string, never>, RiskDecisionResponse>(
+    `/api/projects/${encodeURIComponent(projectId)}/iterations/${seq}/cancel`,
+    {},
+  );
+}
+
+export async function proceedFixAll(
+  projectId: string, seq: number,
+): Promise<RiskDecisionResponse> {
+  return postJSON<Record<string, never>, RiskDecisionResponse>(
+    `/api/projects/${encodeURIComponent(projectId)}/fix-all/${seq}/proceed`,
+    {},
+  );
+}
+
+export async function cancelFixAll(
+  projectId: string, seq: number,
+): Promise<RiskDecisionResponse> {
+  return postJSON<Record<string, never>, RiskDecisionResponse>(
+    `/api/projects/${encodeURIComponent(projectId)}/fix-all/${seq}/cancel`,
+    {},
   );
 }
 

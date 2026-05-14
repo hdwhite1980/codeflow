@@ -1333,6 +1333,33 @@ async def list_risks(project_id: str) -> dict[str, Any]:
     return {"project_id": project_id, "risks": risks, "count": len(risks)}
 
 
+@app.get("/api/projects/{project_id}/risks/iteration")
+async def list_iteration_risk_records(project_id: str) -> dict[str, Any]:
+    """Return all iteration-attached risk records grouped by iteration seq.
+
+    Used by the iteration history UI to render pre/post risk panels
+    inline next to each iteration card. Shape:
+      {"by_seq": {7: {"pre_risk": {...}, "post_risk": {...}}, 6: {...}}}
+
+    Missing pre/post are simply absent from the inner dict; the frontend
+    treats absence as "not yet computed" (in-flight) vs "no record"
+    (older iteration, before Turn D.1 shipped) based on iteration status.
+    """
+    from guardian_pipeline import list_iteration_risks
+    store: LedgerStore = app.state.store
+    by_seq = list_iteration_risks(store, project_id)
+    return {"project_id": project_id, "by_seq": by_seq}
+
+
+@app.get("/api/projects/{project_id}/risks/fix-all")
+async def list_fix_all_risk_records(project_id: str) -> dict[str, Any]:
+    """Same shape as iteration risks but keyed by fix_all seq."""
+    from guardian_pipeline import list_fix_all_risks
+    store: LedgerStore = app.state.store
+    by_seq = list_fix_all_risks(store, project_id)
+    return {"project_id": project_id, "by_seq": by_seq}
+
+
 # ---------------------------------------------------------------------------
 # Risk gate — proceed/cancel for paused iterations and fix-all passes.
 # ---------------------------------------------------------------------------

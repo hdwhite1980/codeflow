@@ -16,15 +16,19 @@ import { Badge } from "@/components/ui/badge";
 import {
   getAudits,
   getFixAllPasses,
+  getFixAllRisks,
   getGraph,
+  getIterationRisks,
   getIterations,
 } from "@/lib/api";
 import type {
   AuditResponse,
   AuditVerdict,
   FixAllPass,
+  FixAllRisks,
   GraphResponse,
   Iteration,
+  IterationRisks,
   UsageRow,
   UsageSummary,
   WSEvent,
@@ -93,6 +97,17 @@ export function ProjectDetailClient({
   // (no ledger_entry event flows through the event bus in time).
   const [riskRefreshKey, setRiskRefreshKey] = useState(0);
 
+  // Iteration/fix-all attached risk records, keyed by seq. Fetched
+  // separately from iterations themselves since they live in the
+  // DECISION_RECORD ledger entries and are written by the worker as
+  // the iteration progresses (pre_risk → regen → post_risk).
+  const [iterationRisks, setIterationRisks] = useState<
+    Record<number, IterationRisks>
+  >({});
+  const [fixAllRisks, setFixAllRisks] = useState<
+    Record<number, FixAllRisks>
+  >({});
+
   // Initial graph fetch on mount.
   useEffect(() => {
     let cancelled = false;
@@ -140,6 +155,29 @@ export function ProjectDetailClient({
     };
   }, [projectId]);
 
+  // Initial fetch of iteration + fix-all risk records (Turn D.2).
+  // These are independent of the iterations/passes fetches above because
+  // they live in DECISION_RECORD entries. We fetch them once on mount;
+  // subsequent updates come through the refetch path.
+  useEffect(() => {
+    let cancelled = false;
+    Promise.allSettled([
+      getIterationRisks(projectId),
+      getFixAllRisks(projectId),
+    ]).then(([ir, fr]) => {
+      if (cancelled) return;
+      if (ir.status === "fulfilled") {
+        setIterationRisks(ir.value.by_seq ?? {});
+      }
+      if (fr.status === "fulfilled") {
+        setFixAllRisks(fr.value.by_seq ?? {});
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId]);
+
   // Refetch graph + audits + iterations + fix-all passes. Called when
   // WS events suggest the underlying ledger has changed in ways our
   // local state can't fully reconcile. Coalesced so a burst of events
@@ -157,11 +195,13 @@ export function ProjectDetailClient({
     if (refetchPending) return;
     setRefetchPending(true);
     try {
-      const [g, au, it, fa] = await Promise.allSettled([
+      const [g, au, it, fa, ir, fr] = await Promise.allSettled([
         getGraph(projectId),
         getAudits(projectId),
         getIterations(projectId),
         getFixAllPasses(projectId),
+        getIterationRisks(projectId),
+        getFixAllRisks(projectId),
       ]);
       if (g.status === "fulfilled") {
         setGraph((prev) => mergeGraphPreservingNodes(prev, g.value));
@@ -198,6 +238,14 @@ export function ProjectDetailClient({
           }
           return remaining;
         });
+      }
+      // Risk records — keyed by seq, replace wholesale (no merging needed
+      // because the records are immutable once written).
+      if (ir.status === "fulfilled") {
+        setIterationRisks(ir.value.by_seq ?? {});
+      }
+      if (fr.status === "fulfilled") {
+        setFixAllRisks(fr.value.by_seq ?? {});
       }
     } finally {
       setRefetchPending(false);
@@ -263,6 +311,25 @@ export function ProjectDetailClient({
           setGraph((prev) =>
             prev ? applyFileLanded(prev, entry.artifact_key) : prev,
           );
+        }
+        // Risk-related ledger entries (Turn D.1 backend wrote these):
+        //   iteration:<seq>:pre_risk
+        //   iteration:<seq>:post_risk
+        //   iteration:<seq>:cancelled
+        //   fix_all:<seq>:pre_risk
+        //   fix_all:<seq>:post_risk
+        //   fix_all:<seq>:cancelled
+        //   guardian:risk:<seq>     (standalone risk panel)
+        // We don't strictly need special handling here because
+        // scheduleRefetch() below pulls the risks endpoints too, but
+        // bumping the standalone risk panel's refresh key keeps it in
+        // sync when a guardian:risk:* entry arrives via WS.
+        if (
+          entry.artifact_key?.startsWith("guardian:risk:") ||
+          entry.artifact_key?.startsWith("iteration:") ||
+          entry.artifact_key?.startsWith("fix_all:")
+        ) {
+          setRiskRefreshKey((k) => k + 1);
         }
         // Service entries can land at create time; refetch picks them
         // up. Any entry type could mean new edges; defer to refetch.
@@ -425,10 +492,18 @@ export function ProjectDetailClient({
           events (more cost, more scope, more user attention warranted). */}
       <div className="pointer-events-none fixed right-6 top-20 z-20 w-80">
         <div className="pointer-events-auto max-h-[60vh] space-y-3 overflow-y-auto">
-          <FixAllHistory passes={fixAllPasses} />
+          <FixAllHistory
+            passes={fixAllPasses}
+            risksBySeq={fixAllRisks}
+            projectId={projectId}
+            onDecisionMade={() => scheduleRefetch()}
+          />
           <IterationHistory
             iterations={iterations}
             inFlightSeqs={inFlightSeqs}
+            risksBySeq={iterationRisks}
+            projectId={projectId}
+            onDecisionMade={() => scheduleRefetch()}
           />
         </div>
       </div>

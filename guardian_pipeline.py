@@ -774,6 +774,82 @@ def list_risk_assessments(
     return out
 
 
+def list_iteration_risks(
+    store: "LedgerStore", project_id: str,
+) -> dict[int, dict[str, Any]]:
+    """Return pre/post risk records grouped by iteration seq.
+
+    Result shape:
+      {
+        7: {"pre_risk": {...body...}, "post_risk": {...body...}, "cancelled": {...}},
+        6: {"pre_risk": {...}},  # post may be missing if iteration failed
+        ...
+      }
+
+    Used by the frontend's iteration history cards to render risk
+    panels inline next to each iteration. Missing pre/post are simply
+    absent from the inner dict, not None.
+    """
+    decisions = store.all_current(project_id, ArtifactKind.DECISION_RECORD)
+    by_seq: dict[int, dict[str, Any]] = {}
+    for d in decisions:
+        if not d.artifact_key.startswith("iteration:"):
+            continue
+        parts = d.artifact_key.split(":")
+        # Expected shapes:
+        #   iteration:<seq>:pre_risk
+        #   iteration:<seq>:post_risk
+        #   iteration:<seq>:cancelled
+        if len(parts) < 3:
+            continue
+        try:
+            seq = int(parts[1])
+        except ValueError:
+            continue
+        phase = parts[2]
+        if phase not in ("pre_risk", "post_risk", "cancelled"):
+            continue
+        try:
+            blob, _ = store.get_blob(d.blob_sha256)
+            body = json.loads(blob.decode("utf-8")) if blob else {}
+        except Exception as exc:
+            print(f"[guardian:risk] failed to load {d.artifact_key}: "
+                  f"{type(exc).__name__}: {exc}", flush=True)
+            continue
+        by_seq.setdefault(seq, {})[phase] = body
+    return by_seq
+
+
+def list_fix_all_risks(
+    store: "LedgerStore", project_id: str,
+) -> dict[int, dict[str, Any]]:
+    """Same shape as list_iteration_risks but for fix_all:<seq>:* keys."""
+    decisions = store.all_current(project_id, ArtifactKind.DECISION_RECORD)
+    by_seq: dict[int, dict[str, Any]] = {}
+    for d in decisions:
+        if not d.artifact_key.startswith("fix_all:"):
+            continue
+        parts = d.artifact_key.split(":")
+        if len(parts) < 3:
+            continue
+        try:
+            seq = int(parts[1])
+        except ValueError:
+            continue
+        phase = parts[2]
+        if phase not in ("pre_risk", "post_risk", "cancelled"):
+            continue
+        try:
+            blob, _ = store.get_blob(d.blob_sha256)
+            body = json.loads(blob.decode("utf-8")) if blob else {}
+        except Exception as exc:
+            print(f"[guardian:risk] failed to load {d.artifact_key}: "
+                  f"{type(exc).__name__}: {exc}", flush=True)
+            continue
+        by_seq.setdefault(seq, {})[phase] = body
+    return by_seq
+
+
 def next_risk_seq(store: "LedgerStore", project_id: str) -> int:
     """Allocate the next risk query sequence number for a project.
 
