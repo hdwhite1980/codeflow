@@ -1093,6 +1093,67 @@ async def list_guardian_summaries(project_id: str) -> dict[str, Any]:
     }
 
 
+@app.get("/api/projects/{project_id}/memory")
+async def get_project_memory(project_id: str) -> dict[str, Any]:
+    """Composite endpoint for the Project Memory panel.
+
+    Returns each indexed file's summary, plus for each file the seqs
+    of any risk queries that mentioned it. Lets the frontend render
+    'auth.py — purpose, risks, AND it was the target of risk query
+    #3 and was flagged as a concern in #7' without two more roundtrips.
+
+    Sorted by file_path for determinism. Per-file shape:
+        {
+          file_path, plain_english, technical, purpose,
+          touches, assumes, failure_modes, risk_notes,
+          indexed_at, indexer_model,
+          input_tokens, output_tokens,
+          # Cross-refs added by this endpoint:
+          risk_queries_as_target: [seq, ...],   # risk seqs where this file was the target
+          risk_queries_as_concern: [seq, ...],  # risk seqs where this file appeared as a concern
+        }
+    """
+    from guardian_pipeline import (
+        load_file_summaries, list_risk_assessments,
+    )
+    store: LedgerStore = app.state.store
+    summaries = load_file_summaries(store, project_id)
+
+    # Index risk queries by file path so we can attach cross-refs to
+    # each summary. For each risk query:
+    #   - If target == file_path → "as target"
+    #   - If any concern's path == file_path → "as concern"
+    risks = list_risk_assessments(store, project_id)
+    as_target: dict[str, list[int]] = {}
+    as_concern: dict[str, list[int]] = {}
+    for r in risks:
+        seq = r.get("seq")
+        if seq is None:
+            continue
+        target = r.get("target", "")
+        if target:
+            as_target.setdefault(target, []).append(int(seq))
+        for c in r.get("concerns") or []:
+            path = c.get("path", "")
+            if path:
+                as_concern.setdefault(path, []).append(int(seq))
+
+    enriched: list[dict[str, Any]] = []
+    for s in summaries:
+        path = s.get("file_path", "")
+        s_copy = dict(s)
+        s_copy["risk_queries_as_target"] = sorted(set(as_target.get(path, [])))
+        s_copy["risk_queries_as_concern"] = sorted(set(as_concern.get(path, [])))
+        enriched.append(s_copy)
+
+    enriched.sort(key=lambda x: x.get("file_path", ""))
+    return {
+        "project_id": project_id,
+        "summaries": enriched,
+        "count": len(enriched),
+    }
+
+
 @app.get("/api/projects/{project_id}/guardian/status")
 async def guardian_status(project_id: str) -> dict[str, Any]:
     """Quick status check the frontend can poll.

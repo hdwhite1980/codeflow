@@ -29,6 +29,7 @@ import type {
   IterationRisksResponse,
   MemoryReferencesResponse,
   ProjectListResponse,
+  ProjectMemoryResponse,
   RiskAssessment,
   RiskDecisionResponse,
   RiskQueryRequest,
@@ -234,6 +235,25 @@ export async function getMemoryReferences(
 ): Promise<MemoryReferencesResponse> {
   return getJSON<MemoryReferencesResponse>(
     `/api/projects/${encodeURIComponent(projectId)}/memory-references`,
+  );
+}
+
+// -- Project Memory panel (Turn G-B) ------------------------------
+
+export async function getProjectMemory(
+  projectId: string,
+): Promise<ProjectMemoryResponse> {
+  return getJSON<ProjectMemoryResponse>(
+    `/api/projects/${encodeURIComponent(projectId)}/memory`,
+  );
+}
+
+export async function reindexFile(
+  projectId: string, filePath: string,
+): Promise<{ project_id: string; status: string }> {
+  return postJSON<{ file_path: string }, { project_id: string; status: string }>(
+    `/api/projects/${encodeURIComponent(projectId)}/guardian/index`,
+    { file_path: filePath },
   );
 }
 

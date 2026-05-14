@@ -10,6 +10,7 @@ import { GraphView } from "@/components/graph-view";
 import { IterationHistory } from "@/components/iteration-history";
 import { IterationInput } from "@/components/iteration-input";
 import { LiveIndicator } from "@/components/live-indicator";
+import { ProjectMemoryPanel } from "@/components/project-memory-panel";
 import { RiskAnalyzer } from "@/components/risk-analyzer";
 import { RiskHistory } from "@/components/risk-history";
 import { Badge } from "@/components/ui/badge";
@@ -533,12 +534,20 @@ export function ProjectDetailClient({
           We collapse the analyzer when not in use so the cost ticker
           stays prominent. */}
       <div className="pointer-events-none fixed left-6 top-20 z-20 w-96">
-        <div className="pointer-events-auto max-h-[60vh] space-y-3 overflow-y-auto">
+        <div className="pointer-events-auto max-h-[70vh] space-y-3 overflow-y-auto">
           <RiskAnalyzer
             projectId={projectId}
             onAssessment={() => setRiskRefreshKey((k) => k + 1)}
           />
           <RiskHistory projectId={projectId} refreshKey={riskRefreshKey} />
+          {/* Project Memory panel — the literal "Project Memory" UI.
+              Lives in the same column as the risk panels because both
+              are guardian-driven; risk is reasoning, memory is the
+              substrate. */}
+          <ProjectMemoryPanel
+            projectId={projectId}
+            refreshKey={riskRefreshKey}
+          />
         </div>
       </div>
 

@@ -493,3 +493,33 @@ export interface MemoryReferencesResponse {
   project_id: string;
   by_seq: Record<number, MemoryReferences>;
 }
+
+// -- Project Memory panel (Turn G-B) -------------------------------
+//
+// One entry per guardian-indexed file. The data is the same FileSummary
+// shape the worker writes, plus cross-references to risk queries that
+// mentioned this file — so the panel can show "auth.py was the target
+// of risk query #3 and a concern in #7" without an extra fetch.
+
+export interface ProjectMemoryEntry {
+  file_path: string;
+  plain_english: string;
+  technical: string;
+  purpose: string;
+  touches: string[];
+  assumes: string[];
+  failure_modes: string[];
+  risk_notes: string[];
+  indexed_at: number;
+  indexer_model: string;
+  input_tokens: number;
+  output_tokens: number;
+  risk_queries_as_target: number[];
+  risk_queries_as_concern: number[];
+}
+
+export interface ProjectMemoryResponse {
+  project_id: string;
+  summaries: ProjectMemoryEntry[];
+  count: number;
+}
