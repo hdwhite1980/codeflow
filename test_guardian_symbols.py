@@ -227,6 +227,25 @@ class TestTreeSitterExtraction(unittest.TestCase):
         syms = extract_guardian_symbols(code, "ruby")
         self.assertTrue(any(s.kind == "class" for s in syms))
 
+    def test_go_method_qualification(self):
+        """Polish: Go methods should be qualified with their receiver
+        type, e.g. method:Foo.Bar not method:Bar."""
+        code = (
+            "package main\n"
+            "type Foo struct{}\n"
+            "func (f *Foo) Bar() {}\n"
+            "func (f Foo) Baz() {}\n"
+            "func Bare() {}\n"
+        )
+        syms = extract_guardian_symbols(code, "go")
+        methods = [s for s in syms if s.kind == "method"]
+        method_qnames = sorted(s.qualified_name for s in methods)
+        self.assertEqual(method_qnames, ["Foo.Bar", "Foo.Baz"])
+        # The bare function shouldn't have any qualification.
+        bare = [s for s in syms if s.kind == "function"]
+        self.assertEqual(len(bare), 1)
+        self.assertEqual(bare[0].qualified_name, "Bare")
+
     def test_truncated_source_returns_empty_or_partial(self):
         """Real-world: partial AI generations. Must not raise."""
         code = "function hello() {\n  if (x) {\n"  # unterminated

@@ -6,6 +6,7 @@ import {
   ChevronDown,
   ChevronRight,
   Code2,
+  HelpCircle,
   Loader2,
   RefreshCw,
   Search,
@@ -130,12 +131,21 @@ export function ProjectMemoryPanel({
         <span className="text-xs text-muted-foreground tabular-nums">
           {summaries.length} file{summaries.length === 1 ? "" : "s"}
         </span>
+        <a
+          href="/about-the-guardian"
+          target="_blank"
+          rel="noreferrer"
+          title="What is the guardian?"
+          className="ml-auto text-muted-foreground hover:text-violet-300"
+        >
+          <HelpCircle className="h-3 w-3" />
+        </a>
         <Button
           variant="ghost"
           size="sm"
           onClick={refetch}
           disabled={loading}
-          className="ml-auto h-6 w-6 p-0"
+          className="h-6 w-6 p-0"
           title="Refresh"
         >
           <RefreshCw className={cn("h-3 w-3", loading && "animate-spin")} />
@@ -188,6 +198,7 @@ export function ProjectMemoryPanel({
             <MemoryEntryRow
               key={entry.file_path}
               projectId={projectId}
+              refreshKey={refreshKey}
               entry={entry}
               expanded={expanded.has(entry.file_path)}
               onToggleExpanded={() => toggleExpanded(entry.file_path)}
@@ -203,9 +214,10 @@ export function ProjectMemoryPanel({
 
 
 function MemoryEntryRow({
-  projectId, entry, expanded, onToggleExpanded, reindexing, onReindex,
+  projectId, refreshKey, entry, expanded, onToggleExpanded, reindexing, onReindex,
 }: {
   projectId: string;
+  refreshKey: number;
   entry: ProjectMemoryEntry;
   expanded: boolean;
   onToggleExpanded: () => void;
@@ -217,11 +229,39 @@ function MemoryEntryRow({
   // Symbol drill-down (Turn B frontend). Lazily fetched the first
   // time the user expands the file row and toggles "Symbols". Result
   // is cached for the lifetime of the row component so re-toggling
-  // doesn't re-fetch.
+  // doesn't re-fetch. Refetched when refreshKey bumps (e.g. WS event
+  // says new symbol summaries landed in the ledger).
   const [showSymbols, setShowSymbols] = useState(false);
   const [symbols, setSymbols] = useState<SymbolSummary[] | null>(null);
   const [symbolsLoading, setSymbolsLoading] = useState(false);
   const [symbolsError, setSymbolsError] = useState<string | null>(null);
+
+  // Invalidate the symbol cache when the global refreshKey changes
+  // AND the user has the symbols panel open. If they don't have it
+  // open we don't waste an HTTP roundtrip — they'll fetch fresh
+  // whenever they next expand it.
+  useEffect(() => {
+    if (refreshKey === 0) return;  // initial mount, don't refetch
+    if (!showSymbols) {
+      // Clear stale cache silently so next open fetches fresh.
+      setSymbols(null);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const resp = await getProjectMemorySymbols(projectId, entry.file_path);
+        if (!cancelled) setSymbols(resp.symbols);
+      } catch (err) {
+        if (!cancelled) {
+          setSymbolsError(
+            err instanceof Error ? err.message : "Failed to refresh symbols",
+          );
+        }
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [refreshKey, projectId, entry.file_path, showSymbols]);
 
   async function fetchSymbolsIfNeeded() {
     if (symbols !== null || symbolsLoading) return;
@@ -275,6 +315,18 @@ function MemoryEntryRow({
                   title={`Referenced in ${totalRiskMentions} risk query/queries`}
                 >
                   {totalRiskMentions} risk
+                </span>
+              )}
+              {entry.is_stale && (
+                <span
+                  className="text-[9px] px-1 rounded bg-orange-950/40 border border-orange-700/40 text-orange-300"
+                  title={
+                    "This file has been written to the ledger after this " +
+                    "summary was produced. The summary may not reflect the " +
+                    "current contents. Click the re-index button to refresh."
+                  }
+                >
+                  stale
                 </span>
               )}
             </div>

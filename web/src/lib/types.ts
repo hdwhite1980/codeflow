@@ -518,6 +518,10 @@ export interface ProjectMemoryEntry {
   output_tokens: number;
   risk_queries_as_target: number[];
   risk_queries_as_concern: number[];
+  // Set by the backend when the file's ledger entry is newer than the
+  // summary's indexed_at (with a 30s grace). UI surfaces this as a
+  // "stale" pill so users know to re-index.
+  is_stale?: boolean;
 }
 
 export interface ProjectMemoryResponse {

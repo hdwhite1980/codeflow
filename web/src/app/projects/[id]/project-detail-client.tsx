@@ -346,7 +346,12 @@ export function ProjectDetailClient({
         if (
           entry.artifact_key?.startsWith("guardian:risk:") ||
           entry.artifact_key?.startsWith("iteration:") ||
-          entry.artifact_key?.startsWith("fix_all:")
+          entry.artifact_key?.startsWith("fix_all:") ||
+          // Guardian summaries landing in the ledger (file-level or
+          // symbol-level). Triggers a Memory panel refresh so users see
+          // new summaries arrive without manual reload.
+          entry.artifact_key?.startsWith(`semantic:`) ||
+          entry.artifact_key?.startsWith(`semantic_symbol:`)
         ) {
           setRiskRefreshKey((k) => k + 1);
         }

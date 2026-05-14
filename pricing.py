@@ -67,6 +67,16 @@ PRICING_PER_MTOK: dict[str, tuple[float, float]] = {
     "gemini-2.5-flash":            (0.30,   2.50),
     "gemini-2.5-pro":              (1.25,  10.00),
     "gemini-2.5-flash-lite":       (0.10,   0.40),
+
+    # --- Local Ollama models (Hetzner box) ---
+    # No dollar cost — these run on hardware we own. Recorded as zero
+    # so usage rows still capture token volume for capacity planning
+    # without polluting cost dashboards or generating "unknown model"
+    # warnings on every guardian call. Add new local models here as we
+    # roll them out.
+    "qwen2.5-coder:7b":       (0.0,    0.0),
+    "qwen2.5-coder:14b":      (0.0,    0.0),
+    "qwen2.5-coder":          (0.0,    0.0),  # version-less fallback
 }
 
 

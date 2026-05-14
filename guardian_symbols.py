@@ -377,28 +377,44 @@ def _extract_via_treesitter(
 
         qualified = name_text
         if kind == "method":
-            # Walk up to the enclosing class/struct/impl for qualification.
-            container = ancestor.parent
-            container_kinds = {
-                "class_declaration", "class_specifier", "class",
-                "struct_item", "impl_item", "interface_declaration",
-                "module",
-            }
-            while container and container.type not in container_kinds:
-                container = container.parent
-            if container is not None:
-                for child in container.children:
-                    if child.type in (
-                        "type_identifier", "identifier",
-                        "constant",  # Ruby constant for class name
-                        "name",      # PHP
-                    ):
-                        try:
-                            cls_name = child.text.decode("utf-8")
-                            qualified = f"{cls_name}.{name_text}"
-                        except (AttributeError, UnicodeDecodeError):
-                            pass
+            # Go's method_declaration carries the receiver as a child
+            # (parameter_list > parameter_declaration > type: ...), NOT
+            # as an enclosing container. Detect Go shape first and pull
+            # the type name from the receiver. Other languages keep the
+            # container-walk path below.
+            if ancestor.type == "method_declaration" and ts_language == "go":
+                receiver = None
+                for child in ancestor.children:
+                    if child.type == "parameter_list":
+                        receiver = child
                         break
+                if receiver is not None:
+                    type_name = _go_extract_receiver_type(receiver)
+                    if type_name:
+                        qualified = f"{type_name}.{name_text}"
+            else:
+                # Walk up to the enclosing class/struct/impl/etc.
+                container = ancestor.parent
+                container_kinds = {
+                    "class_declaration", "class_specifier", "class",
+                    "struct_item", "impl_item", "interface_declaration",
+                    "module",
+                }
+                while container and container.type not in container_kinds:
+                    container = container.parent
+                if container is not None:
+                    for child in container.children:
+                        if child.type in (
+                            "type_identifier", "identifier",
+                            "constant",  # Ruby constant for class name
+                            "name",      # PHP
+                        ):
+                            try:
+                                cls_name = child.text.decode("utf-8")
+                                qualified = f"{cls_name}.{name_text}"
+                            except (AttributeError, UnicodeDecodeError):
+                                pass
+                            break
 
         key = (kind, qualified, start_line)
         if key in seen:
@@ -416,6 +432,38 @@ def _extract_via_treesitter(
 # ---------------------------------------------------------------------------
 # Dispatch.
 # ---------------------------------------------------------------------------
+
+def _go_extract_receiver_type(receiver_list_node) -> str:
+    """Pull the receiver type name from a Go method's receiver list.
+
+    The grammar shape is:
+        parameter_list
+          parameter_declaration
+            name: (identifier)
+            type: (pointer_type (type_identifier))  -- for `*Foo`
+            type: (type_identifier)                 -- for `Foo`
+
+    We walk down to find the bare type_identifier text. Returns "" on
+    any structural surprise so the caller falls back to bare name.
+    """
+    for decl in receiver_list_node.children:
+        if decl.type != "parameter_declaration":
+            continue
+        for child in decl.children:
+            if child.type == "type_identifier":
+                try:
+                    return child.text.decode("utf-8")
+                except (AttributeError, UnicodeDecodeError):
+                    return ""
+            if child.type == "pointer_type":
+                # Walk one level deeper for the inner type_identifier.
+                for inner in child.children:
+                    if inner.type == "type_identifier":
+                        try:
+                            return inner.text.decode("utf-8")
+                        except (AttributeError, UnicodeDecodeError):
+                            return ""
+    return ""
 
 def _make_treesitter_extractor(
     ts_language: str, query: str,

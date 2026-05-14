@@ -1193,11 +1193,44 @@ async def get_project_memory(project_id: str) -> dict[str, Any]:
                 as_concern.setdefault(path, []).append(int(seq))
 
     enriched: list[dict[str, Any]] = []
+    # Build a lookup of file_path → file ledger entry created_at so we
+    # can compute is_stale per summary. A summary is stale if the file
+    # has been written to the ledger AFTER it was indexed. The auto-
+    # queue from G-D should keep things fresh, but indexing is async
+    # and can lag — staleness flag tells users when they're looking
+    # at an old summary.
+    file_entries = store.all_current(project_id, ArtifactKind.FILE)
+    file_updated: dict[str, float] = {}
+    for fe in file_entries:
+        # artifact_key shape: file:<pid>:<path>
+        parts = fe.artifact_key.split(":", 2)
+        if len(parts) < 3:
+            continue
+        path = parts[2]
+        # `created_at` on LedgerEntry is a datetime; convert to epoch
+        # seconds for comparison with summary.indexed_at (float epoch).
+        ts = getattr(fe, "created_at", None)
+        if ts is None:
+            continue
+        try:
+            file_updated[path] = ts.timestamp()
+        except Exception:
+            continue
+
     for s in summaries:
         path = s.get("file_path", "")
         s_copy = dict(s)
         s_copy["risk_queries_as_target"] = sorted(set(as_target.get(path, [])))
         s_copy["risk_queries_as_concern"] = sorted(set(as_concern.get(path, [])))
+        # Staleness: file_updated > indexed_at means the file was
+        # re-written after the summary was produced. A small grace of
+        # 30s avoids flagging summaries that landed mere seconds after
+        # the file write (which is the common case during a normal build).
+        indexed_at = float(s.get("indexed_at", 0) or 0)
+        file_at = file_updated.get(path, 0)
+        s_copy["is_stale"] = (
+            file_at > 0 and indexed_at > 0 and file_at > (indexed_at + 30)
+        )
         enriched.append(s_copy)
 
     enriched.sort(key=lambda x: x.get("file_path", ""))
@@ -1340,8 +1373,9 @@ def _make_risk_client() -> Any:
     back to it unconditionally until the Railway issue is resolved.
 
     To restore the original pluggable behavior, revert this commit and
-    confirm `curl /api/_debug/risk-env` shows all OLLAMA_* vars as
-    present=true.
+    confirm OLLAMA_* vars are visible to the web container at runtime
+    (e.g. via a one-off `printenv` from a Railway shell or by adding
+    a debug endpoint temporarily).
     """
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
@@ -1351,32 +1385,6 @@ def _make_risk_client() -> Any:
         )
     from anthropic_client import AnthropicClient
     return AnthropicClient(api_key=api_key)
-
-
-@app.get("/api/_debug/risk-env")
-async def risk_env_debug() -> dict[str, Any]:
-    """Debug endpoint: show which guardian-related env vars are visible
-    to the web service at runtime, WITHOUT leaking their values.
-
-    Returns just the presence/absence of each var. If OLLAMA_BASE_URL
-    is `false` here while the Railway UI shows it `true`, the variable
-    isn't propagating to the runtime — a Railway-side issue, not a
-    code issue.
-    """
-    keys = [
-        "OLLAMA_BASE_URL", "OLLAMA_API_TOKEN", "OLLAMA_VERIFY_TLS",
-        "OLLAMA_TIMEOUT", "OLLAMA_DEFAULT_MODEL",
-        "GUARDIAN_RISK_MODEL", "ANTHROPIC_API_KEY",
-        "DATABASE_URL", "REDIS_URL",  # control: these definitely should be set
-    ]
-    return {
-        "service": "web",
-        "env_present": {k: bool(os.environ.get(k, "").strip()) for k in keys},
-        "env_length": {k: len(os.environ.get(k, "")) for k in keys},
-        "guardian_risk_model_value": (
-            os.environ.get("GUARDIAN_RISK_MODEL", "(unset)") or "(empty)"
-        ),
-    }
 
 
 @app.post(
