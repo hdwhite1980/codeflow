@@ -1208,6 +1208,31 @@ async def get_project_memory(project_id: str) -> dict[str, Any]:
     }
 
 
+@app.get("/api/projects/{project_id}/memory/symbols")
+async def get_project_memory_symbols(
+    project_id: str, file_path: Optional[str] = None,
+) -> dict[str, Any]:
+    """Return per-symbol semantic summaries for this project (Turn B).
+
+    Optionally filter to one file via ?file_path=app/auth.py. The
+    Project Memory panel uses the filtered form to render the
+    expand-to-symbols drill-down for one file at a time.
+
+    Each summary describes one function/class/method/constant: what it
+    does, what it touches, what it assumes, how it can fail. Same
+    shape as file summaries but scoped to one symbol.
+    """
+    from guardian_pipeline import list_symbol_summaries
+    store: LedgerStore = app.state.store
+    symbols = list_symbol_summaries(store, project_id, file_path=file_path)
+    return {
+        "project_id": project_id,
+        "file_path": file_path,
+        "symbols": symbols,
+        "count": len(symbols),
+    }
+
+
 @app.get("/api/projects/{project_id}/guardian/status")
 async def guardian_status(project_id: str) -> dict[str, Any]:
     """Quick status check the frontend can poll.

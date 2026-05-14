@@ -1230,6 +1230,68 @@ async def handle_guardian_index(job: dict[str, Any], ctx: HandlerContext) -> Non
                     output_tokens=summary.output_tokens,
                 )
             indexed += 1
+
+            # Symbol-grained indexing (Turn B). Runs only for languages
+            # with symbol extraction support. For unsupported languages
+            # extract_guardian_symbols returns [] and we skip the loop
+            # entirely. Per-symbol calls are slow on CPU Ollama (~10s
+            # each on 7b), so this can balloon total indexing time on
+            # large projects — acceptable because indexing is background
+            # and the user iterates while it runs.
+            try:
+                from guardian_symbols import (
+                    extract_guardian_symbols, extract_symbol_body,
+                )
+                from guardian_pipeline import (
+                    summarize_symbol, write_symbol_summary,
+                )
+                symbols = extract_guardian_symbols(content, language)
+                if symbols:
+                    print(f"[guardian:symbols] {path}: {len(symbols)} "
+                          f"symbol(s) to index", flush=True)
+                for sym in symbols:
+                    body = extract_symbol_body(content, sym)
+                    if not body.strip():
+                        continue
+                    try:
+                        sym_summary = await summarize_symbol(
+                            file_path=path,
+                            file_summary=summary,
+                            symbol_kind=sym.kind,
+                            symbol_name=sym.name,
+                            qualified_name=sym.qualified_name,
+                            start_line=sym.start_line,
+                            end_line=sym.end_line,
+                            signature=sym.signature,
+                            body=body,
+                            client=ctx.ollama,
+                        )
+                        write_symbol_summary(
+                            ctx.store, project_id, sym_summary,
+                        )
+                        if ctx.recorder is not None:
+                            ctx.recorder.record(
+                                project_id=project_id,
+                                provider="ollama",
+                                model=sym_summary.indexer_model,
+                                stage="guardian:symbol_index",
+                                subject=f"{path}::{sym.qualified_name}",
+                                input_tokens=sym_summary.input_tokens,
+                                output_tokens=sym_summary.output_tokens,
+                            )
+                    except Exception as exc:
+                        # Symbol-level failure shouldn't block the rest
+                        # of the symbols or the next file.
+                        print(f"[guardian:symbols] {path}::"
+                              f"{sym.qualified_name} failed: "
+                              f"{type(exc).__name__}: {exc}", flush=True)
+            except Exception as exc:
+                # Symbol extraction itself (parsing) failed. File-level
+                # summary already landed; treat the symbol pass as best-
+                # effort and move on.
+                print(f"[guardian:symbols] {path}: extraction failed "
+                      f"({type(exc).__name__}: {exc}); file-level only",
+                      flush=True)
         except Exception as exc:
             failed.append((path, f"{type(exc).__name__}: {exc}"))
             print(f"[guardian] index failed for {path}: "

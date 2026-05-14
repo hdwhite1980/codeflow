@@ -270,6 +270,240 @@ def write_file_summary(
 
 
 # ---------------------------------------------------------------------------
+# Symbol-grained indexing (Turn B).
+# ---------------------------------------------------------------------------
+#
+# Per-file summaries (Turn A) describe what a file IS. Per-symbol
+# summaries describe what each function/class/method does. The risk
+# analyzer can then reason at function granularity: "what calls
+# verify_password" instead of just "what does auth.py do".
+#
+# Process: for each symbol the language extractor found, build a small
+# prompt with the file's plain-english summary as context plus the
+# symbol's source body, and ask the model for a structured per-symbol
+# summary. Cheaper than re-feeding the whole file each time.
+
+@dataclass(frozen=True)
+class SymbolSummary:
+    """Per-symbol semantic summary. Same shape as FileSummary except
+    purposeful for one function/class/method, not the whole file."""
+    file_path: str
+    symbol_kind: str          # function | method | class | constant | etc.
+    symbol_name: str          # short name
+    qualified_name: str       # ClassName.method or just name
+    start_line: int
+    end_line: int
+    plain_english: str        # 1-2 sentences, non-technical
+    purpose: str              # one phrase: what this symbol is for
+    touches: list[str]        # state/entities read or written
+    assumes: list[str]        # preconditions
+    failure_modes: list[str]  # how this symbol can fail
+    risk_notes: list[str]     # reviewer-flag concerns
+    indexed_at: float
+    indexer_model: str
+    input_tokens: int
+    output_tokens: int
+
+
+_SYMBOL_SYSTEM_PROMPT = """You are the guardian: a code-understanding AI that helps engineers reason about a codebase.
+
+You are summarizing ONE SYMBOL (a function, method, class, or constant) within a file. The file already has its own summary which you have as context. Your job is to describe what THIS SPECIFIC SYMBOL does — at the symbol level, not the file level.
+
+Be precise. A function summary should describe what calling that function does, what it touches, what it assumes about its inputs, and how it can fail. Don't restate the file's purpose. Don't comment on style.
+
+Your output must be STRICT JSON with this schema:
+
+{
+  "plain_english": "1-2 sentences a non-engineer leader could understand",
+  "purpose": "one phrase: what this symbol is for",
+  "touches": ["specific state, data, or services this symbol reads or writes"],
+  "assumes": ["preconditions or invariants this symbol relies on"],
+  "failure_modes": ["how this symbol can fail or produce bad output"],
+  "risk_notes": ["specific things a reviewer would flag"]
+}
+
+Rules:
+- 1-6 items per list, less is fine. Empty lists are acceptable.
+- No commentary, no markdown fences, no preamble. JSON only.
+- For classes, summarize the class as a whole; methods get separate summaries.
+- For constants, "purpose" is "configuration value for X"; touches/assumes/failure_modes
+  can be empty.
+"""
+
+
+def _build_symbol_prompt(
+    *,
+    file_path: str,
+    file_summary_plain: str,
+    file_summary_purpose: str,
+    symbol_kind: str,
+    qualified_name: str,
+    signature: str,
+    body: str,
+) -> str:
+    """Build the user prompt for one symbol. Includes file-level summary
+    as context so the model knows what the surrounding file does."""
+    return (
+        f"File: {file_path}\n"
+        f"File purpose: {file_summary_purpose}\n"
+        f"File overview: {file_summary_plain}\n"
+        f"\n"
+        f"Symbol kind: {symbol_kind}\n"
+        f"Symbol: {qualified_name}\n"
+        f"Signature: {signature}\n"
+        f"\n"
+        f"--- SYMBOL SOURCE ---\n"
+        f"{body}\n"
+        f"--- END SOURCE ---\n"
+        f"\n"
+        f"Produce the structured JSON summary for this symbol."
+    )
+
+
+async def summarize_symbol(
+    *,
+    file_path: str,
+    file_summary: FileSummary,
+    symbol_kind: str,
+    symbol_name: str,
+    qualified_name: str,
+    start_line: int,
+    end_line: int,
+    signature: str,
+    body: str,
+    client: OllamaClient,
+) -> SymbolSummary:
+    """Produce a per-symbol summary via the local Ollama model.
+
+    Returns SymbolSummary with model output parsed. JSON parse failures
+    fall back to a stub summary so a single bad symbol doesn't break
+    the whole file's symbol pass.
+
+    Raises OllamaError on transport failures. Callers handle that
+    higher up (e.g. fall back to file-only indexing for this file).
+    """
+    prompt = _build_symbol_prompt(
+        file_path=file_path,
+        file_summary_plain=file_summary.plain_english,
+        file_summary_purpose=file_summary.purpose,
+        symbol_kind=symbol_kind,
+        qualified_name=qualified_name,
+        signature=signature,
+        body=body,
+    )
+    result = await client.complete(
+        prompt,
+        system=_SYMBOL_SYSTEM_PROMPT,
+        max_tokens=800,  # symbols are smaller than files
+        temperature=0.1,
+    )
+    parsed = _parse_summary_json(result.text)
+    return SymbolSummary(
+        file_path=file_path,
+        symbol_kind=symbol_kind,
+        symbol_name=symbol_name,
+        qualified_name=qualified_name,
+        start_line=start_line,
+        end_line=end_line,
+        plain_english=str(parsed.get("plain_english", ""))[:800],
+        purpose=str(parsed.get("purpose", ""))[:300],
+        touches=_coerce_string_list(parsed.get("touches"), max_items=8),
+        assumes=_coerce_string_list(parsed.get("assumes"), max_items=8),
+        failure_modes=_coerce_string_list(parsed.get("failure_modes"), max_items=8),
+        risk_notes=_coerce_string_list(parsed.get("risk_notes"), max_items=8),
+        indexed_at=time.time(),
+        indexer_model=result.model,
+        input_tokens=result.input_tokens,
+        output_tokens=result.output_tokens,
+    )
+
+
+def write_symbol_summary(
+    store: LedgerStore,
+    project_id: str,
+    summary: SymbolSummary,
+) -> None:
+    """Persist a SymbolSummary as a SEMANTIC_SUMMARY ledger entry.
+
+    Artifact key:
+        `semantic_symbol:<project_id>:<path>:<kind>:<qualified_name>`
+
+    The path component is encoded into the key so different files can
+    have same-named symbols (Foo.bar in two different modules). The
+    kind is included so a function and a constant of the same name
+    don't collide (rare but possible).
+    """
+    key = (
+        f"semantic_symbol:{project_id}:{summary.file_path}:"
+        f"{summary.symbol_kind}:{summary.qualified_name}"
+    )
+    store.write_entry(
+        project_id=project_id,
+        tier=Tier.SPEC,
+        artifact_kind=ArtifactKind.SEMANTIC_SUMMARY,
+        artifact_key=key,
+        body={
+            "file_path": summary.file_path,
+            "symbol_kind": summary.symbol_kind,
+            "symbol_name": summary.symbol_name,
+            "qualified_name": summary.qualified_name,
+            "start_line": summary.start_line,
+            "end_line": summary.end_line,
+            "plain_english": summary.plain_english,
+            "purpose": summary.purpose,
+            "touches": summary.touches,
+            "assumes": summary.assumes,
+            "failure_modes": summary.failure_modes,
+            "risk_notes": summary.risk_notes,
+            "indexed_at": summary.indexed_at,
+            "indexer_model": summary.indexer_model,
+            "input_tokens": summary.input_tokens,
+            "output_tokens": summary.output_tokens,
+        },
+        rationale=(
+            f"Guardian indexed symbol {summary.qualified_name} in "
+            f"{summary.file_path} ({summary.indexer_model}): "
+            f"{summary.plain_english[:120]}"
+        ),
+        author="guardian:symbol_indexer",
+    )
+
+
+def list_symbol_summaries(
+    store: LedgerStore, project_id: str, *, file_path: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    """Return all per-symbol summaries for a project, optionally
+    filtered by file. Used by the Project Memory panel to drill from
+    file → symbols, and by future symbol-aware risk analysis.
+
+    The semantic_symbol:* artifact_key prefix lets us cheaply filter
+    from the project's full DECISION_RECORD / SEMANTIC_SUMMARY set.
+    """
+    entries = store.all_current(project_id, ArtifactKind.SEMANTIC_SUMMARY)
+    prefix = f"semantic_symbol:{project_id}:"
+    file_prefix = (
+        f"{prefix}{file_path}:" if file_path else prefix
+    )
+    out: list[dict[str, Any]] = []
+    for entry in entries:
+        if not entry.artifact_key.startswith(file_prefix):
+            continue
+        try:
+            blob, _ = store.get_blob(entry.blob_sha256)
+            body = json.loads(blob.decode("utf-8")) if blob else {}
+            out.append(body)
+        except Exception as exc:
+            print(f"[guardian:symbol] failed to load {entry.artifact_key}: "
+                  f"{type(exc).__name__}: {exc}", flush=True)
+            continue
+    # Stable order: file_path → start_line.
+    out.sort(key=lambda b: (
+        b.get("file_path", ""), b.get("start_line", 0),
+    ))
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Reader.
 # ---------------------------------------------------------------------------
 
