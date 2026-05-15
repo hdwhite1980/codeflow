@@ -161,7 +161,20 @@ def _audit_user_prompt(*, file_path: str, file_content: str,
     We deliberately do NOT include the project spec or other files.
     The auditor should audit each file on its own merits — does this
     file do what its declared purpose says? — rather than rubber-
-    stamping based on shared context with the generator."""
+    stamping based on shared context with the generator.
+
+    Documentation files (.md, .rst, .txt) get a *narrower* audit
+    that only flags claims contradicting the actual code. This is
+    deliberate: docs have no objectively correct phrasing, so
+    auditing them on style/completeness produces oscillating
+    findings (auditor A says "add cross-platform notes," next pass
+    auditor B says "remove cross-platform notes"). The narrower
+    audit kills that loop by refusing to flag opinion-shaped issues."""
+    if _is_documentation_file(file_path):
+        return _audit_docs_prompt(
+            file_path=file_path, file_content=file_content,
+            purpose=purpose,
+        )
     lang_block = _language_audit_block(language, file_path)
     return (
         f"File: {file_path}\n"
@@ -184,6 +197,105 @@ def _audit_user_prompt(*, file_path: str, file_content: str,
         f"are versions pinned? Are dependencies appropriate?\n"
         f"{lang_block}"
         f"\n{AUDIT_SCHEMA_DESCRIPTION}"
+    )
+
+
+# Extensions we treat as documentation. Casing-insensitive comparison
+# in _is_documentation_file. Conservative on purpose — README files
+# without an extension still match because of the basename fallback.
+_DOC_EXTENSIONS = frozenset({
+    ".md", ".markdown", ".rst", ".txt", ".adoc", ".asciidoc",
+})
+
+# Basenames that are unambiguously documentation regardless of extension.
+# Includes uppercase variants because GitHub conventions vary.
+_DOC_BASENAMES = frozenset({
+    "readme", "license", "licence", "changelog", "contributing",
+    "code_of_conduct", "authors", "notice", "security",
+})
+
+
+def _is_documentation_file(file_path: str) -> bool:
+    """True when the file should get the docs-only audit treatment.
+
+    Three signals, any one matches:
+      1. Path ends in a known doc extension
+      2. Basename (without extension) matches a known doc name
+      3. Path is inside a `docs/` or `doc/` directory at any depth
+    """
+    if not file_path:
+        return False
+    lowered = file_path.lower()
+    # Check directory components for docs/.
+    parts = lowered.replace("\\", "/").split("/")
+    if any(p in {"docs", "doc"} for p in parts[:-1]):
+        return True
+    # Check extension.
+    if "." in parts[-1]:
+        ext = "." + parts[-1].rsplit(".", 1)[1]
+        if ext in _DOC_EXTENSIONS:
+            return True
+    # Check basename without extension.
+    basename = parts[-1]
+    if "." in basename:
+        basename = basename.rsplit(".", 1)[0]
+    if basename in _DOC_BASENAMES:
+        return True
+    return False
+
+
+def _audit_docs_prompt(*, file_path: str, file_content: str,
+                      purpose: str) -> str:
+    """Docs-narrow audit prompt.
+
+    Three rules the auditor MUST follow when auditing documentation:
+      1. Only flag claims about the code that the code itself
+         contradicts (e.g., docs say function X takes 3 args, X
+         actually takes 4).
+      2. Only flag literal incompleteness (truncated mid-sentence,
+         missing required section based on declared purpose).
+      3. NEVER flag style, phrasing, completeness, or "could be
+         clearer" issues. Reasonable people disagree on these and
+         flagging them causes audit/fix oscillation.
+
+    This is deliberately narrower than the code audit. The system
+    used to chew on README files indefinitely, with each pass
+    "fixing" the previous pass's edits. Limiting findings to
+    objective contradictions stops that loop."""
+    return (
+        f"File: {file_path}\n"
+        f"Type: documentation\n"
+        f"Declared purpose: {purpose}\n\n"
+        f"--- FILE CONTENTS ---\n"
+        f"{file_content}\n"
+        f"--- END FILE ---\n\n"
+        f"This is a DOCUMENTATION file. Apply the narrower audit "
+        f"rules below — do NOT use the general code-audit checklist.\n\n"
+        f"Flag a finding ONLY if one of these conditions is met:\n"
+        f"  1. The doc makes a SPECIFIC, CONCRETE, FACTUAL claim that "
+        f"is verifiably wrong (e.g., 'function X takes 3 arguments' "
+        f"when X has 4; 'requires PowerShell 7+' when the manifest "
+        f"says 5.1). The wrongness must be checkable against actual "
+        f"code or config, not inferred from external knowledge.\n"
+        f"  2. The doc is literally truncated mid-content (cut off "
+        f"mid-sentence, missing closing tags, etc.).\n"
+        f"  3. The doc contains an example that, if copy-pasted, "
+        f"would error at runtime due to a typo or syntax mistake.\n\n"
+        f"DO NOT flag:\n"
+        f"  * Style, phrasing, tone, or organization\n"
+        f"  * 'Could be clearer' / 'could explain more' / 'missing "
+        f"detail' findings\n"
+        f"  * Suggestions to add safeguards, warnings, or caveats "
+        f"the doc 'should' mention\n"
+        f"  * Cross-platform / compatibility claims unless the manifest "
+        f"or code clearly contradicts the doc\n"
+        f"  * Anything that would require a design or policy decision "
+        f"to fix (e.g., 'docs should pick one identity format')\n\n"
+        f"If no findings meet the criteria above, return an empty "
+        f"findings list. That is the EXPECTED outcome for most doc "
+        f"audits. Generating findings to seem thorough is incorrect "
+        f"behavior.\n\n"
+        f"{AUDIT_SCHEMA_DESCRIPTION}"
     )
 
 

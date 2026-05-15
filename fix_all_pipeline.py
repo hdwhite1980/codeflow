@@ -737,6 +737,305 @@ def write_fix_all_report(
     )
 
 
+def write_fix_all_resolved(
+    store: LedgerStore, project_id: str, seq: int,
+    resolved_findings: list[Finding],
+) -> None:
+    """Persist the list of findings that THIS pass successfully resolved.
+
+    Used by the next pass's oscillation filter (Fix B). Each entry
+    captures path + issue text + line. Auditor name is intentionally
+    omitted — oscillation can be cross-auditor (one auditor "fixed" a
+    finding, the other auditor flips it on the next pass) and we want
+    to suppress that case.
+
+    Bounded size: cap at 200 entries to keep the ledger row reasonable.
+    """
+    store.write_entry(
+        project_id=project_id,
+        tier=Tier.AUDIT,
+        artifact_kind=ArtifactKind.DECISION_RECORD,
+        artifact_key=f"fix_all:{seq}:resolved",
+        body={
+            "seq": seq,
+            "resolved": [
+                {
+                    "file_path": f.file_path,
+                    "issue": f.issue,
+                    "line": f.line,
+                    "severity": f.severity,
+                }
+                for f in resolved_findings[:200]
+            ],
+            "resolved_at": time.time(),
+        },
+        rationale=f"Fix-all pass {seq} resolved {len(resolved_findings)} finding(s)",
+        author=f"worker:fix_all:{seq}",
+    )
+
+
+def load_recent_resolved_findings(
+    store: LedgerStore, project_id: str, *, lookback_passes: int = 2,
+) -> list[dict[str, Any]]:
+    """Return findings resolved by the last `lookback_passes` fix-all runs.
+
+    Used to detect oscillation: if a finding very similar to one of
+    these shows up in the next audit, it's probably the system flipping
+    the same property back and forth across passes, not a real new bug.
+
+    We default to lookback=2 because 1-pass oscillation is the common
+    case (A→B on pass N, B→A on pass N+1). 3+ passes get into territory
+    where actual code drift is plausible, so we don't suppress those.
+    """
+    decisions = store.all_current(project_id, ArtifactKind.DECISION_RECORD)
+    resolved_records: list[tuple[int, dict[str, Any]]] = []
+    for d in decisions:
+        if not d.artifact_key.startswith("fix_all:"):
+            continue
+        if not d.artifact_key.endswith(":resolved"):
+            continue
+        try:
+            blob, _ = store.get_blob(d.blob_sha256)
+            body = json.loads(blob.decode("utf-8")) if blob else {}
+        except Exception:
+            continue
+        seq = int(body.get("seq", 0))
+        resolved_records.append((seq, body))
+
+    # Take the most recent N passes.
+    resolved_records.sort(key=lambda x: -x[0])
+    out: list[dict[str, Any]] = []
+    for seq, body in resolved_records[:lookback_passes]:
+        for entry in body.get("resolved", []):
+            if isinstance(entry, dict):
+                out.append(entry)
+    return out
+
+
+def _normalize_issue_text(text: str) -> set[str]:
+    """Tokenize an issue into a set of meaningful words for similarity
+    comparison. Reuses ambient_review's stopword list for consistency.
+    Lowercased, stopwords removed, tokens shorter than 3 chars dropped."""
+    try:
+        from ambient_review import _topic_tokens
+        return set(_topic_tokens(text))
+    except Exception:
+        # Defensive fallback: simple lowercased split.
+        return {t.lower() for t in text.split() if len(t) > 2}
+
+
+def _findings_overlap_threshold(text_a: str, text_b: str) -> float:
+    """Jaccard similarity of meaningful tokens. 1.0 = identical token
+    sets, 0.0 = no overlap. >=0.6 is "very likely the same concern."
+
+    Why Jaccard instead of exact match: auditors paraphrase. "Hard-coded
+    API key" and "Hardcoded API token in source" describe the same bug
+    but won't match exactly. Token-set overlap catches it."""
+    a = _normalize_issue_text(text_a)
+    b = _normalize_issue_text(text_b)
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def filter_oscillating_findings(
+    findings: list[Finding],
+    recent_resolved: list[dict[str, Any]],
+    *,
+    similarity_threshold: float = 0.45,
+) -> tuple[list[Finding], list[Finding]]:
+    """Drop findings that look like the inverse of a recently-resolved one.
+
+    Returns (kept_findings, suppressed_findings). Suppression is per-file:
+    a newly-flagged finding on a.py is checked against resolved findings
+    on a.py only.
+
+    Threshold = 0.45 Jaccard on meaningful tokens. Tuned from production
+    cases where typical oscillations score 0.4–0.6 on shared concept
+    tokens (file/line/issue context produces lexical drift that 0.6
+    misses but 0.3 lets through). 0.45 catches the README.md flip-flop
+    pattern without trapping plausibly-distinct findings.
+
+    Why filter rather than re-prioritize: if pass N "fixed" a thing and
+    pass N+1 immediately flags it again with similar text, the Builder
+    is going to undo pass N's work. That's worse than silence — it
+    produces the visible "21 fixed / 19 regressions" pattern. Better to
+    surface the oscillation as a "needs decision" item (which Fix C
+    does for the cross-auditor case) than auto-act.
+    """
+    if not recent_resolved:
+        return list(findings), []
+
+    # Index recent resolved by file_path for cheap lookup.
+    by_file: dict[str, list[dict[str, Any]]] = {}
+    for entry in recent_resolved:
+        path = entry.get("file_path") or ""
+        if path:
+            by_file.setdefault(path, []).append(entry)
+
+    kept: list[Finding] = []
+    suppressed: list[Finding] = []
+    for f in findings:
+        candidates = by_file.get(f.file_path, [])
+        is_oscillation = False
+        for prior in candidates:
+            prior_issue = prior.get("issue") or ""
+            score = _findings_overlap_threshold(f.issue, prior_issue)
+            if score >= similarity_threshold:
+                is_oscillation = True
+                print(f"[fix-all] suppressing likely oscillation: "
+                      f"{f.file_path} '{f.issue[:80]}' "
+                      f"(overlap={score:.2f} with prior '{prior_issue[:80]}')",
+                      flush=True)
+                break
+        if is_oscillation:
+            suppressed.append(f)
+        else:
+            kept.append(f)
+    return kept, suppressed
+
+
+# ---------------------------------------------------------------------------
+# Auditor-disagreement detection (Fix C).
+# ---------------------------------------------------------------------------
+#
+# Two auditors (openai + gemini) flagging the SAME file at the SAME line
+# with CONTRADICTORY suggestions is a strong signal that the question is
+# judgment-dependent. Examples we've seen in production:
+#   * One auditor says "remove cross-platform claim, require PS 5.1"
+#   * Other auditor says "add cross-platform support, claim PS 7+"
+# Both findings get queued and fix-all flips the file each pass.
+#
+# Detection strategy: group findings by (file_path, line_bucket). If
+# multiple auditors contributed AND their suggestion tokens don't
+# overlap meaningfully (Jaccard < 0.3), we have disagreement. Those
+# findings get pulled out of the auto-fix queue and surfaced separately.
+
+# Window size for "same line" — strict equality misses cases where
+# one auditor flagged line 42 and another flagged line 43 for what's
+# clearly the same code region. 5 lines is generous without being so
+# loose that unrelated findings collide.
+_DISAGREEMENT_LINE_WINDOW = 5
+
+# Jaccard threshold for "suggestions don't overlap." We accept some
+# token overlap on incidental words (the, file, function, etc. that
+# survived stopword filtering) — true disagreement is when the
+# suggestions describe different actions.
+_DISAGREEMENT_OVERLAP_MAX = 0.3
+
+
+def detect_auditor_disagreements(
+    findings: list[Finding],
+) -> tuple[list[Finding], list[list[Finding]]]:
+    """Split findings into (consensus_findings, disagreement_groups).
+
+    A "disagreement group" is a set of findings on the same file region
+    flagged by different auditors with contradictory suggestions. These
+    are returned separately so the caller can:
+      - Skip them in fix-all (don't auto-act on judgment-dependent issues)
+      - Surface them to the user as a "needs decision" item
+
+    Detection is conservative: we only mark a group as disagreement
+    when there are findings from DIFFERENT auditors. Single-auditor
+    duplicates pass through normally.
+    """
+    if not findings:
+        return [], []
+
+    # Bucket by (file_path, line // window). Findings within the same
+    # window on the same file are candidates for disagreement clustering.
+    buckets: dict[tuple[str, int], list[Finding]] = {}
+    for f in findings:
+        line_bucket = (f.line or 0) // _DISAGREEMENT_LINE_WINDOW
+        key = (f.file_path, line_bucket)
+        buckets.setdefault(key, []).append(f)
+
+    consensus: list[Finding] = []
+    disagreement_groups: list[list[Finding]] = []
+    suppressed: set[int] = set()  # id() of findings already grouped
+
+    for key, group in buckets.items():
+        if len(group) < 2:
+            consensus.extend(group)
+            continue
+
+        # Find pairs from different auditors.
+        disagreeing: list[Finding] = []
+        for i in range(len(group)):
+            for j in range(i + 1, len(group)):
+                fi, fj = group[i], group[j]
+                if fi.auditor == fj.auditor:
+                    continue
+                # Compare suggestion tokens. If suggestions are empty,
+                # fall back to issue text.
+                a_text = fi.suggestion or fi.issue
+                b_text = fj.suggestion or fj.issue
+                overlap = _findings_overlap_threshold(a_text, b_text)
+                if overlap < _DISAGREEMENT_OVERLAP_MAX:
+                    if id(fi) not in suppressed:
+                        disagreeing.append(fi)
+                        suppressed.add(id(fi))
+                    if id(fj) not in suppressed:
+                        disagreeing.append(fj)
+                        suppressed.add(id(fj))
+
+        if disagreeing:
+            disagreement_groups.append(disagreeing)
+
+        # Anything in the bucket not flagged as disagreeing is consensus.
+        for f in group:
+            if id(f) not in suppressed:
+                consensus.append(f)
+
+    return consensus, disagreement_groups
+
+
+def write_audit_disagreements(
+    store: LedgerStore, project_id: str, seq: int,
+    disagreement_groups: list[list[Finding]],
+) -> None:
+    """Persist auditor disagreements as a ledger record so the UI can
+    surface them as "needs human decision" items.
+
+    Empty groups list is a no-op — we don't want to clutter the ledger
+    with empty markers."""
+    if not disagreement_groups:
+        return
+    payload = []
+    for grp in disagreement_groups:
+        payload.append({
+            "file_path": grp[0].file_path if grp else "",
+            "line": grp[0].line if grp else None,
+            "findings": [
+                {
+                    "auditor": f.auditor,
+                    "severity": f.severity,
+                    "line": f.line,
+                    "issue": f.issue,
+                    "suggestion": f.suggestion,
+                }
+                for f in grp
+            ],
+        })
+    store.write_entry(
+        project_id=project_id,
+        tier=Tier.AUDIT,
+        artifact_kind=ArtifactKind.DECISION_RECORD,
+        artifact_key=f"fix_all:{seq}:disagreements",
+        body={
+            "seq": seq,
+            "groups": payload,
+            "detected_at": time.time(),
+        },
+        rationale=(
+            f"Fix-all pass {seq} detected {len(disagreement_groups)} "
+            f"auditor disagreement group(s) — surfaced for human review "
+            f"instead of auto-fix."
+        ),
+        author=f"worker:fix_all:{seq}",
+    )
+
+
 def next_fix_all_seq(store: LedgerStore, project_id: str) -> int:
     """Compute the next fix_all sequence number from existing markers."""
     decisions = store.all_current(project_id, ArtifactKind.DECISION_RECORD)

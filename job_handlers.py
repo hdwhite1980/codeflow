@@ -774,6 +774,11 @@ async def handle_fix_all(job: dict[str, Any], ctx: HandlerContext) -> None:
         collect_all_findings, build_fix_all_prompt,
         build_cluster_prompt, cluster_findings_by_topic,
         discover_dependent_paths,
+        filter_oscillating_findings,
+        load_recent_resolved_findings,
+        detect_auditor_disagreements,
+        write_audit_disagreements,
+        write_fix_all_resolved,
         generate_fix_all_report, write_fix_all_started,
         write_fix_all_report, next_fix_all_seq, FIX_ALL_MAX_FINDINGS,
     )
@@ -952,7 +957,68 @@ async def handle_fix_all(job: dict[str, Any], ctx: HandlerContext) -> None:
     # is more accurate and less likely to regress, at the cost of more
     # Builder calls. Net cost over time should be lower because we
     # don't have to re-run fix-all to clean up the prior fix-all's mess.
-    clusters = cluster_findings_by_topic(pre_findings)
+    # Fix B: drop findings that look like inverses of recently-resolved
+    # ones (oscillation guard). Two-pass lookback: if the very last
+    # fix-all "fixed" a finding with similar text on the same file, and
+    # the new audit re-flagged it, that's the system flipping a property
+    # back and forth across passes, not a real new bug.
+    recent_resolved = load_recent_resolved_findings(
+        ctx.store, project_id, lookback_passes=2,
+    )
+    kept_findings, suppressed_oscillations = filter_oscillating_findings(
+        pre_findings, recent_resolved,
+    )
+    if suppressed_oscillations:
+        print(f"[handlers] fix_all: suppressed "
+              f"{len(suppressed_oscillations)} oscillating finding(s) "
+              f"from {len(pre_findings)} pre_findings",
+              flush=True)
+
+    # Fix C: detect auditor disagreement. Findings on the same file
+    # region from different auditors with contradictory suggestions
+    # are surfaced separately — they need a human decision, not auto-
+    # fix. Acting on either side of a disagreement causes oscillation
+    # because the next pass's audit may flip the verdict.
+    consensus_findings, disagreement_groups = detect_auditor_disagreements(
+        kept_findings,
+    )
+    if disagreement_groups:
+        print(f"[handlers] fix_all: detected "
+              f"{len(disagreement_groups)} auditor-disagreement "
+              f"group(s) — surfacing for human review",
+              flush=True)
+        write_audit_disagreements(
+            ctx.store, project_id, seq, disagreement_groups,
+        )
+
+    # If filtering ate everything, we're done — nothing to fix this pass.
+    if not consensus_findings:
+        msg_parts = [f"Fix-all pass {seq} had nothing to act on after filtering"]
+        if suppressed_oscillations:
+            msg_parts.append(
+                f"{len(suppressed_oscillations)} suppressed as "
+                f"oscillation"
+            )
+        if disagreement_groups:
+            msg_parts.append(
+                f"{len(disagreement_groups)} disagreement group(s) "
+                f"surfaced for human review"
+            )
+        print(f"[handlers] fix_all: {'; '.join(msg_parts)}", flush=True)
+        write_fix_all_report(
+            ctx.store, project_id, seq,
+            report=(
+                "; ".join(msg_parts) + ". "
+                "Either the remaining findings need a human decision "
+                "(see disagreements), or the system was about to undo "
+                "its previous fixes."
+            ),
+            pre_count=len(pre_findings), post_count=len(pre_findings),
+            fixed=0, regressions=0,
+        )
+        return
+
+    clusters = cluster_findings_by_topic(consensus_findings)
     if not clusters:
         # Defensive — shouldn't happen since pre_findings was non-empty.
         print(f"[handlers] fix_all: no clusters produced from "
@@ -1072,11 +1138,37 @@ async def handle_fix_all(job: dict[str, Any], ctx: HandlerContext) -> None:
             # Continue to next cluster — one failed cluster shouldn't
             # block the rest. Partial progress is still progress.
 
-    # Synthesize one outcome-shaped object for the audit comparison
-    # below, based on the union of cluster results. The audit uses
-    # `outcome` for nothing structural — only the post-findings
-    # collection matters. We just need *some* value here.
-    outcome = cluster_outcomes  # downstream code treats it as opaque
+    # Synthesize a combined outcome from all cluster iterations so the
+    # post-fix-all risk assessment (which expects iteration-shaped data)
+    # has a sane input. We union the changed/new/deleted file lists
+    # across clusters; the risk model cares about the actual file set,
+    # not which cluster touched what.
+    from types import SimpleNamespace
+    _all_changed: list[str] = []
+    _all_new: list[str] = []
+    _all_deleted: list[str] = []
+    _all_resolved_findings: list[Finding] = []
+    for entry in cluster_outcomes:
+        co = entry.get("outcome")
+        if co is None:
+            continue  # cluster failed; skip
+        _all_changed.extend(getattr(co, "changes_applied", []) or [])
+        _all_new.extend(getattr(co, "new_files_created", []) or [])
+        _all_deleted.extend(getattr(co, "files_deleted", []) or [])
+    # Dedup while preserving order.
+    def _dedup(seq):
+        seen = set()
+        out = []
+        for s in seq:
+            if s not in seen:
+                seen.add(s)
+                out.append(s)
+        return out
+    outcome = SimpleNamespace(
+        changes_applied=_dedup(_all_changed),
+        new_files_created=_dedup(_all_new),
+        files_deleted=_dedup(_all_deleted),
+    )
 
     if await _check_stop("post-iteration-pre-audit"):
         return
@@ -1151,6 +1243,27 @@ async def handle_fix_all(job: dict[str, Any], ctx: HandlerContext) -> None:
     regressions = len(post_keys - pre_keys)
     fixed = len(pre_findings) - persisted
 
+    # Persist the findings this pass actually resolved so the next pass
+    # can detect oscillation (Fix B). A finding is "resolved" if it was
+    # in pre but not in post — meaning the Builder fixed it. We exclude
+    # findings that persisted unchanged (still in post) and findings
+    # that newly appeared (regressions).
+    resolved_findings: list[Finding] = []
+    for f in pre_findings:
+        key = (f.file_path, f.severity, f.line or 0, (f.issue or "")[:80])
+        if key not in post_keys:
+            resolved_findings.append(f)
+    if resolved_findings:
+        try:
+            write_fix_all_resolved(
+                ctx.store, project_id, seq, resolved_findings,
+            )
+        except Exception as exc:
+            # Non-fatal: if we can't persist resolved history, the next
+            # pass simply runs without oscillation suppression.
+            print(f"[handlers] fix_all: failed to persist resolved "
+                  f"findings: {type(exc).__name__}: {exc}", flush=True)
+
     # Phase 4.5: post-fix-all risk assessment. Looks at the files that
     # actually changed plus how the findings landscape shifted (regressions
     # are worth assessing more carefully).
@@ -1192,13 +1305,23 @@ async def handle_fix_all(job: dict[str, Any], ctx: HandlerContext) -> None:
     except Exception as exc:
         print(f"[handlers] fix_all: report generation crashed: "
               f"{type(exc).__name__}: {exc}", flush=True)
-        report = (
-            f"Fix-all pass {seq} complete (report generation failed). "
-            f"Fixed {fixed} of {len(pre_findings)} issue(s); "
+        report_parts = [
+            f"Fix-all pass {seq} complete (report generation failed).",
+            f"Fixed {fixed} of {len(pre_findings)} issue(s);",
             f"{len(post_findings)} remain"
-            + (f", {regressions} new" if regressions else "")
-            + "."
-        )
+            + (f", {regressions} new." if regressions else "."),
+        ]
+        if suppressed_oscillations:
+            report_parts.append(
+                f"{len(suppressed_oscillations)} finding(s) suppressed as "
+                f"likely oscillation from a recent pass."
+            )
+        if disagreement_groups:
+            report_parts.append(
+                f"{len(disagreement_groups)} auditor disagreement(s) "
+                f"surfaced for human review instead of auto-fix."
+            )
+        report = " ".join(report_parts)
 
     write_fix_all_report(
         ctx.store, project_id, seq, report=report,
