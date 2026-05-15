@@ -780,6 +780,10 @@ async def handle_fix_all(job: dict[str, Any], ctx: HandlerContext) -> None:
         detect_auditor_disagreements,
         write_audit_disagreements,
         write_fix_all_resolved,
+        write_decisions_needed,
+        list_decisions_needed,
+        loaded_resolved_decisions_as_findings,
+        suppress_unfixable_from_regressions,
         generate_fix_all_report, write_fix_all_started,
         write_fix_all_report, next_fix_all_seq, FIX_ALL_MAX_FINDINGS,
     )
@@ -1019,6 +1023,32 @@ async def handle_fix_all(job: dict[str, Any], ctx: HandlerContext) -> None:
         print(f"[handlers] fix_all: resolved-disagreement injection "
               f"failed: {type(exc).__name__}: {exc}", flush=True)
 
+    # Re-inject findings the user resolved from the decisions-needed
+    # panel with action=provide_value. These are Builder refusals the
+    # user has now answered with concrete values, so we can synthesize
+    # findings that include the user's value as the suggested fix.
+    # Same dedup against consensus_findings as the disagreement path.
+    try:
+        user_decided = loaded_resolved_decisions_as_findings(
+            ctx.store, project_id,
+        )
+        if user_decided:
+            print(f"[handlers] fix_all: re-injecting {len(user_decided)} "
+                  f"user-resolved finding(s) from decisions panel",
+                  flush=True)
+            existing_keys = {
+                (f.file_path, f.severity, f.line or 0, (f.issue or "")[:80])
+                for f in consensus_findings
+            }
+            for f in user_decided:
+                key = (f.file_path, f.severity, f.line or 0,
+                       (f.issue or "")[:80])
+                if key not in existing_keys:
+                    consensus_findings.append(f)
+    except Exception as exc:
+        print(f"[handlers] fix_all: resolved-decision injection failed: "
+              f"{type(exc).__name__}: {exc}", flush=True)
+
     # If filtering ate everything, we're done — nothing to fix this pass.
     if not consensus_findings:
         msg_parts = [f"Fix-all pass {seq} had nothing to act on after filtering"]
@@ -1176,6 +1206,7 @@ async def handle_fix_all(job: dict[str, Any], ctx: HandlerContext) -> None:
     _all_new: list[str] = []
     _all_deleted: list[str] = []
     _all_resolved_findings: list[Finding] = []
+    _all_unfixable: list[dict[str, Any]] = []
     for entry in cluster_outcomes:
         co = entry.get("outcome")
         if co is None:
@@ -1183,6 +1214,7 @@ async def handle_fix_all(job: dict[str, Any], ctx: HandlerContext) -> None:
         _all_changed.extend(getattr(co, "changes_applied", []) or [])
         _all_new.extend(getattr(co, "new_files_created", []) or [])
         _all_deleted.extend(getattr(co, "files_deleted", []) or [])
+        _all_unfixable.extend(getattr(co, "unfixable_findings", []) or [])
     # Dedup while preserving order.
     def _dedup(seq):
         seen = set()
@@ -1197,6 +1229,24 @@ async def handle_fix_all(job: dict[str, Any], ctx: HandlerContext) -> None:
         new_files_created=_dedup(_all_new),
         files_deleted=_dedup(_all_deleted),
     )
+
+    # Persist Builder-flagged unfixable findings (Fix F). The Builder
+    # told us which findings it declined and why. We surface them on
+    # the decisions-needed panel so the user can supply the missing
+    # answer. These won't count as regressions in the audit-comparison
+    # block below — they're refused, not failed.
+    if _all_unfixable:
+        try:
+            write_decisions_needed(
+                ctx.store, project_id, seq, _all_unfixable,
+            )
+            print(f"[handlers] fix_all: persisted "
+                  f"{len(_all_unfixable)} unfixable finding(s) as "
+                  f"decisions-needed",
+                  flush=True)
+        except Exception as exc:
+            print(f"[handlers] fix_all: persist unfixable failed: "
+                  f"{type(exc).__name__}: {exc}", flush=True)
 
     if await _check_stop("post-iteration-pre-audit"):
         return
@@ -1263,6 +1313,33 @@ async def handle_fix_all(job: dict[str, Any], ctx: HandlerContext) -> None:
     post_findings, _ = collect_all_findings(
         ctx.store, project_id, max_findings=FIX_ALL_MAX_FINDINGS,
     )
+
+    # Subtract Builder-flagged unfixables from post_findings before
+    # computing the regression count. These aren't really regressions
+    # — the Builder explicitly declined them and the audit just
+    # re-flagged the same gap. They live in the decisions-needed
+    # panel for the user to resolve. We pull the union of THIS pass's
+    # unfixables plus any still-unresolved ones from prior passes so
+    # a previously-declared refusal stays suppressed across passes.
+    try:
+        all_pending_decisions = list_decisions_needed(
+            ctx.store, project_id, include_resolved=False,
+        )
+        post_findings_filtered, unfixable_suppressed = (
+            suppress_unfixable_from_regressions(
+                post_findings, all_pending_decisions,
+            )
+        )
+        if unfixable_suppressed:
+            print(f"[handlers] fix_all: suppressed "
+                  f"{len(unfixable_suppressed)} post-finding(s) that "
+                  f"match Builder-declined decisions; not counting as "
+                  f"regressions", flush=True)
+        post_findings = post_findings_filtered
+    except Exception as exc:
+        print(f"[handlers] fix_all: unfixable suppression failed: "
+              f"{type(exc).__name__}: {exc}", flush=True)
+
     pre_keys = {(f.file_path, f.severity, f.line or 0, (f.issue or "")[:80])
                 for f in pre_findings}
     post_keys = {(f.file_path, f.severity, f.line or 0, (f.issue or "")[:80])

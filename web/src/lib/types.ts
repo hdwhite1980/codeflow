@@ -649,3 +649,39 @@ export interface ResolveDisagreementResponse {
   action: string;
   queued_finding?: DisagreementFinding | null;
 }
+
+// -- Decisions needed (Fix D + Fix F UI) --------------------------
+//
+// When the Builder declines to fix a finding because it requires
+// human input (URL, architectural commitment, exception contract),
+// fix-all persists the refusal as a decision_needed record. Users
+// see them in the DecisionsNeededPanel and resolve them by
+// providing a value or dismissing the finding.
+
+export interface DecisionNeeded {
+  digest: string;
+  seq: number;
+  file_path: string;
+  line: number | null;
+  issue: string;
+  decision_needed: string;
+  decision_type: "value" | "architectural" | "contract" | "policy";
+  blocking_info: string;
+  detected_at: number;
+  resolved_at?: number | null;
+  resolved_value?: string | null;
+  resolved_action?: string | null;  // "provide_value" | "dismiss"
+}
+
+export interface DecisionsResponse {
+  project_id: string;
+  decisions: DecisionNeeded[];
+  count: number;
+}
+
+export interface ResolveDecisionResponse {
+  project_id: string;
+  digest: string;
+  resolved: boolean;
+  action: string;
+}

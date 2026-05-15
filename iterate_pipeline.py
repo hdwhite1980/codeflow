@@ -50,7 +50,7 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from anthropic_client import AnthropicClient, AnthropicError
@@ -94,6 +94,11 @@ class IterationPlan:
     new_files: list[SpecFile]  # reuse SpecFile so _generate_file works
     deletes: list[str]
     rationale: str
+    # Builder-flagged refusals: findings it declined to fix because they
+    # require human decision. Empty list is the common case for build/
+    # iterate flows that don't supply findings. Populated when the Builder
+    # is given an audit-findings prompt and judges some unfixable.
+    unfixable_findings: list[dict[str, Any]] = field(default_factory=list)
 
     def is_empty(self) -> bool:
         return (
@@ -111,6 +116,14 @@ class IterationOutcome:
     input_tokens: int
     output_tokens: int
     rationale: str
+    # Structured refusal signal (Fix F). When the Builder declines a
+    # finding because it requires human input — a real URL, an
+    # architectural commitment, a contract decision — it lists the
+    # finding here instead of silently leaving it unfixed. The fix-all
+    # handler reads this list and suppresses those findings from the
+    # regression count, persisting them as `decision_needed:*` records
+    # for the user to resolve. Empty list is the common case.
+    unfixable_findings: list[dict[str, Any]] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +138,14 @@ You will be shown:
 
 Your job is to decide exactly which files need to change, which need to be created, and which (if any) should be deleted. Make the SMALLEST change that satisfies the request. Touch as few files as possible.
 
+When the request lists specific audit findings to fix, you may encounter findings you cannot resolve mechanically. A finding is UNFIXABLE when fixing it requires information you don't have — for example:
+  * Placeholder values that need real project data (author name, URLs, license)
+  * Architectural decisions (mandatory vs optional dependency, error type contract)
+  * Policy choices (which exception to throw, what fallback to use)
+  * Behavioral contracts that aren't documented in the existing code
+
+Do NOT invent fake values, guess at architectural decisions, or apply a fix that requires information you're inferring rather than reading. Instead, list those findings in the `unfixable_findings` array with a clear explanation of what decision is needed from the human. Then proceed with the findings you CAN fix.
+
 Output STRICT JSON (no markdown fences, no commentary). Schema:
 {
   "rationale": "<1-3 sentences explaining the plan>",
@@ -134,7 +155,17 @@ Output STRICT JSON (no markdown fences, no commentary). Schema:
   "new_files": [
     {"path": "<new file path>", "purpose": "<1-line description>", "language": "<python|typescript|markdown|...>", "estimated_lines": <int>}
   ],
-  "delete": ["<path>"]
+  "delete": ["<path>"],
+  "unfixable_findings": [
+    {
+      "file_path": "<path>",
+      "line": <int or null>,
+      "issue": "<the finding text being declined>",
+      "decision_needed": "<one short sentence saying what the human must decide>",
+      "decision_type": "value | architectural | contract | policy",
+      "blocking_info": "<what specifically you'd need to proceed>"
+    }
+  ]
 }
 
 Rules:
@@ -142,7 +173,8 @@ Rules:
   - Paths in `new_files` MUST NOT exist in the inventory.
   - Prefer changing existing files over creating new ones.
   - If the request is unclear or impossible given the inventory, return all-empty lists and explain in rationale.
-  - Maximum 30 entries across all three lists combined.
+  - Maximum 30 entries across all three change lists combined.
+  - `unfixable_findings` is for findings you decline to fix because they need human input. An empty list is fine. Never invent values to avoid filling this in.
 """
 
 
@@ -567,6 +599,7 @@ async def _run_iteration_body(
         input_tokens=total_in,
         output_tokens=total_out,
         rationale=plan.rationale,
+        unfixable_findings=list(plan.unfixable_findings),
     )
 
     # Post-iteration risk analysis. Runs against the files that
@@ -707,7 +740,7 @@ def _parse_plan(raw_text: str, inventory: dict[str, str]) -> IterationPlan:
     except json.JSONDecodeError as exc:
         print(f"[iterate] plan JSON parse failed: {exc}; "
               f"first 500 chars: {raw_text[:500]!r}", flush=True)
-        return IterationPlan([], [], [], rationale="Plan parse failed.")
+        return IterationPlan([], [], [], rationale="Plan parse failed.", unfixable_findings=[])
 
     rationale = str(data.get("rationale", "")).strip()
     inv_paths = set(inventory.keys())
@@ -749,6 +782,41 @@ def _parse_plan(raw_text: str, inventory: dict[str, str]) -> IterationPlan:
         if isinstance(p, str) and p in inv_paths:
             deletes.append(p)
 
+    # Parse unfixable_findings (Fix F). The Builder emits these when it
+    # declines a finding because the fix requires human input. We validate
+    # the shape — anything malformed gets dropped with a log line; partial
+    # validity is acceptable since this is a feedback signal, not a hard
+    # contract. Capped at 50 to avoid runaway lists from a confused Builder.
+    raw_unfixable = data.get("unfixable_findings") or []
+    unfixable: list[dict[str, Any]] = []
+    if isinstance(raw_unfixable, list):
+        valid_types = {"value", "architectural", "contract", "policy"}
+        for u in raw_unfixable[:50]:
+            if not isinstance(u, dict):
+                continue
+            fpath = u.get("file_path")
+            issue = u.get("issue")
+            decision_needed = u.get("decision_needed")
+            if not (isinstance(fpath, str) and isinstance(issue, str)
+                    and isinstance(decision_needed, str)):
+                print(f"[iterate] dropped unfixable_finding "
+                      f"(missing required fields): {u}", flush=True)
+                continue
+            dtype = u.get("decision_type", "policy")
+            if dtype not in valid_types:
+                dtype = "policy"
+            line_val = u.get("line")
+            if not isinstance(line_val, int) or line_val < 0:
+                line_val = None
+            unfixable.append({
+                "file_path": fpath[:500],
+                "line": line_val,
+                "issue": issue[:500],
+                "decision_needed": decision_needed[:500],
+                "decision_type": dtype,
+                "blocking_info": str(u.get("blocking_info", ""))[:500],
+            })
+
     total = len(changes) + len(new_files) + len(deletes)
     if total > _MAX_FILES_PER_ITERATION:
         print(f"[iterate] plan touches {total} files; truncating to "
@@ -761,7 +829,10 @@ def _parse_plan(raw_text: str, inventory: dict[str, str]) -> IterationPlan:
         keep -= len(new_files)
         deletes = deletes[: max(0, keep)]
 
-    return IterationPlan(changes, new_files, deletes, rationale)
+    return IterationPlan(
+        changes=changes, new_files=new_files, deletes=deletes,
+        rationale=rationale, unfixable_findings=unfixable,
+    )
 
 
 async def _regenerate_file(

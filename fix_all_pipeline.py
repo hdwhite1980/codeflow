@@ -1264,3 +1264,302 @@ def next_fix_all_seq(store: LedgerStore, project_id: str) -> int:
         and d.artifact_key.endswith(":started")
     )
     return started + 1
+
+
+# ---------------------------------------------------------------------------
+# Decisions-needed surface (Fix D + Fix F).
+# ---------------------------------------------------------------------------
+#
+# Why this exists
+# ---------------
+# A class of audit findings can't be auto-fixed because the right answer
+# requires human input — fake URLs in a manifest, mandatory-vs-optional
+# dependency declarations, which exception type a function should raise.
+# When the Builder is asked to fix one of these, it can do one of three
+# things:
+#   1. Invent a value (bad — produces fake-looking output)
+#   2. Silently leave it unfixed (bad — looks like a regression next pass)
+#   3. Emit a structured refusal listing what decision is needed (this)
+#
+# Storage shape
+# -------------
+# Each pending decision lives under
+#   decision_needed:<project_id>:<digest>
+# Digest is stable over (file_path, issue_text), so the same Builder
+# refusal across multiple fix-all passes upserts in place. Body fields:
+#   - digest, file_path, line, issue, decision_needed, decision_type,
+#     blocking_info, detected_at, resolved_at, resolved_value
+#
+# Resolution flow
+# ---------------
+# User opens the decisions panel, reads the question, provides a value
+# or chooses "leave as-is." On `provide_value`, we synthesize a Finding
+# with the user's answer woven into the suggestion, and re-inject it
+# into the next fix-all pass via the same path used for resolved
+# disagreements (loaded_resolved_disagreements_as_findings has an
+# analogue here). On `dismiss`, we mark the finding as won't-fix and
+# suppress future audits flagging it (out of scope for this turn;
+# noted for follow-up).
+
+def _decision_digest(file_path: str, issue: str) -> str:
+    """Stable hash over file + issue text. Same Builder refusal across
+    runs gets the same digest so resolution state survives."""
+    seed = f"{file_path or ''}::{(issue or '')[:300]}"
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
+
+
+def write_decisions_needed(
+    store: LedgerStore, project_id: str, seq: int,
+    unfixable_findings: list[dict[str, Any]],
+) -> None:
+    """Persist a list of Builder-flagged unfixable findings.
+
+    Each entry writes its own artifact under
+    ``decision_needed:<project>:<digest>``. Prior resolution state on
+    the same digest is preserved if present.
+
+    Empty list is a no-op — fix-all may run many passes with nothing
+    to surface, and we don't want to clutter the ledger with empty
+    markers.
+    """
+    if not unfixable_findings:
+        return
+    for u in unfixable_findings:
+        if not isinstance(u, dict):
+            continue
+        file_path = u.get("file_path", "")
+        issue = u.get("issue", "")
+        if not file_path or not issue:
+            continue
+        digest = _decision_digest(file_path, issue)
+        body = {
+            "digest": digest,
+            "seq": seq,
+            "file_path": file_path,
+            "line": u.get("line"),
+            "issue": issue,
+            "decision_needed": u.get("decision_needed", ""),
+            "decision_type": u.get("decision_type", "policy"),
+            "blocking_info": u.get("blocking_info", ""),
+            "detected_at": time.time(),
+            "resolved_at": None,
+            "resolved_value": None,
+            "resolved_action": None,  # "provide_value" | "dismiss"
+        }
+        target_key = f"decision_needed:{project_id}:{digest}"
+        previous = store.current_entry(project_id, target_key)
+        if previous is not None:
+            try:
+                prev_blob, _ = store.get_blob(previous.blob_sha256)
+                prev_body = json.loads(prev_blob.decode("utf-8")) if prev_blob else {}
+                if prev_body.get("resolved_at"):
+                    body["resolved_at"] = prev_body["resolved_at"]
+                    body["resolved_value"] = prev_body.get("resolved_value")
+                    body["resolved_action"] = prev_body.get("resolved_action")
+            except Exception:
+                pass
+        store.write_entry(
+            project_id=project_id,
+            tier=Tier.AUDIT,
+            artifact_kind=ArtifactKind.DECISION_RECORD,
+            artifact_key=target_key,
+            body=body,
+            rationale=(
+                f"Builder declined to fix {file_path}"
+                + (f" line {u.get('line')}" if u.get("line") else "")
+                + f": {body['decision_needed'][:140]}"
+            ),
+            author=f"worker:fix_all:{seq}",
+        )
+
+
+def list_decisions_needed(
+    store: LedgerStore, project_id: str, *,
+    include_resolved: bool = False,
+) -> list[dict[str, Any]]:
+    """Return current pending decisions for a project.
+
+    Sorted: unresolved first (by decision_type priority — architectural
+    decisions surface before value/policy), then by detected_at desc.
+    """
+    decisions = store.all_current(project_id, ArtifactKind.DECISION_RECORD)
+    prefix = f"decision_needed:{project_id}:"
+    out: list[dict[str, Any]] = []
+    for d in decisions:
+        if not d.artifact_key.startswith(prefix):
+            continue
+        try:
+            blob, _ = store.get_blob(d.blob_sha256)
+            body = json.loads(blob.decode("utf-8")) if blob else {}
+        except Exception:
+            continue
+        if not include_resolved and body.get("resolved_at"):
+            continue
+        out.append(body)
+    # Sort so architectural decisions surface above value/policy ones —
+    # they tend to block more downstream work. Then by recency.
+    type_rank = {
+        "architectural": 0, "contract": 1, "policy": 2, "value": 3,
+    }
+    out.sort(key=lambda b: (
+        b.get("resolved_at") is not None,
+        type_rank.get(b.get("decision_type", "policy"), 9),
+        -(b.get("detected_at") or 0),
+    ))
+    return out
+
+
+def resolve_decision_needed(
+    store: LedgerStore, project_id: str, digest: str,
+    *,
+    action: str,
+    value: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    """Record a user resolution.
+
+    Two actions:
+      - ``"provide_value"``: user supplied an answer. ``value`` must be
+        non-empty. Returns the resolved-record dict so the caller can
+        synthesize a Finding for re-injection into the next fix-all.
+      - ``"dismiss"``: user decided the finding is fine as-is (e.g.,
+        the placeholder URL is intentional for an internal tool).
+        Returns None.
+    """
+    if action not in {"provide_value", "dismiss"}:
+        raise ValueError(
+            f"action must be 'provide_value' or 'dismiss', got {action!r}"
+        )
+    if action == "provide_value" and not (value and value.strip()):
+        raise ValueError("provide_value requires a non-empty value")
+
+    target_key = f"decision_needed:{project_id}:{digest}"
+    current = store.current_entry(project_id, target_key)
+    if current is None:
+        return None
+    try:
+        blob, _ = store.get_blob(current.blob_sha256)
+        body = json.loads(blob.decode("utf-8")) if blob else {}
+    except Exception:
+        return None
+
+    body["resolved_at"] = time.time()
+    body["resolved_action"] = action
+    body["resolved_value"] = value.strip() if (action == "provide_value" and value) else None
+
+    store.write_entry(
+        project_id=project_id,
+        tier=Tier.AUDIT,
+        artifact_kind=ArtifactKind.DECISION_RECORD,
+        artifact_key=target_key,
+        body=body,
+        rationale=(
+            f"User resolved decision on {body.get('file_path', '?')}: "
+            + (f"provided value (len={len(value or '')})"
+               if action == "provide_value" else "dismissed (leave as-is)")
+        ),
+        author="user:resolve_decision",
+    )
+    return body if action == "provide_value" else None
+
+
+def loaded_resolved_decisions_as_findings(
+    store: LedgerStore, project_id: str,
+) -> list[Finding]:
+    """Return Finding objects synthesized from user-resolved decisions
+    with action=provide_value, capped so a resolution that's already
+    been acted on by a later fix-all pass isn't re-queued.
+
+    The synthesized Finding includes the user's value woven into the
+    suggestion so the Builder knows what to write. Auditor is set to
+    'user:decision' so disagreement detection doesn't pull it into a
+    new group.
+    """
+    decisions = store.all_current(project_id, ArtifactKind.DECISION_RECORD)
+    prefix = f"decision_needed:{project_id}:"
+
+    most_recent_report_at = 0.0
+    for d in decisions:
+        if (d.artifact_key.startswith("fix_all:")
+                and d.artifact_key.endswith(":report")):
+            try:
+                blob, _ = store.get_blob(d.blob_sha256)
+                body = json.loads(blob.decode("utf-8")) if blob else {}
+                completed = float(body.get("completed_at") or 0)
+                if completed > most_recent_report_at:
+                    most_recent_report_at = completed
+            except Exception:
+                continue
+
+    out: list[Finding] = []
+    for d in decisions:
+        if not d.artifact_key.startswith(prefix):
+            continue
+        try:
+            blob, _ = store.get_blob(d.blob_sha256)
+            body = json.loads(blob.decode("utf-8")) if blob else {}
+        except Exception:
+            continue
+        if body.get("resolved_action") != "provide_value":
+            continue
+        resolved_at = float(body.get("resolved_at") or 0)
+        if resolved_at <= most_recent_report_at:
+            continue
+        value = body.get("resolved_value") or ""
+        if not value:
+            continue
+        out.append(Finding(
+            file_path=body.get("file_path", ""),
+            severity="warning",
+            line=body.get("line"),
+            issue=body.get("issue", ""),
+            suggestion=(
+                f"User-provided value: {value}. "
+                f"Apply this exactly where the original finding pointed."
+            ),
+            auditor="user:decision",
+        ))
+    return out
+
+
+def suppress_unfixable_from_regressions(
+    post_findings: list[Finding],
+    unfixable_records: list[dict[str, Any]],
+    *,
+    similarity_threshold: float = 0.45,
+) -> tuple[list[Finding], list[Finding]]:
+    """Drop from `post_findings` any finding that matches a Builder-
+    flagged unfixable record. These aren't really regressions — the
+    Builder explicitly declined to fix them and surfaced them as
+    decisions-needed.
+
+    Returns (filtered_post, suppressed). Matching is per-file + Jaccard
+    overlap on issue text, same threshold as the oscillation filter.
+
+    `unfixable_records` should be the union of pending decisions from
+    this pass and previous passes (we don't want a previously-flagged
+    refusal to bounce back into the regression count just because the
+    Builder didn't re-emit it this pass).
+    """
+    if not unfixable_records:
+        return list(post_findings), []
+    by_file: dict[str, list[str]] = {}
+    for r in unfixable_records:
+        path = r.get("file_path") or ""
+        issue = r.get("issue") or ""
+        if path and issue:
+            by_file.setdefault(path, []).append(issue)
+
+    kept: list[Finding] = []
+    suppressed: list[Finding] = []
+    for f in post_findings:
+        candidates = by_file.get(f.file_path, [])
+        suppressed_here = False
+        for prior_issue in candidates:
+            if _findings_overlap_threshold(f.issue, prior_issue) >= similarity_threshold:
+                suppressed_here = True
+                break
+        if suppressed_here:
+            suppressed.append(f)
+        else:
+            kept.append(f)
+    return kept, suppressed

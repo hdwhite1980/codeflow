@@ -12,6 +12,7 @@ import { IterationInput } from "@/components/iteration-input";
 import { LiveIndicator } from "@/components/live-indicator";
 import { AmbientFindingsPanel } from "@/components/ambient-findings-panel";
 import { AuditorDisagreementsPanel } from "@/components/auditor-disagreements-panel";
+import { DecisionsNeededPanel } from "@/components/decisions-needed-panel";
 import { ProjectMemoryPanel } from "@/components/project-memory-panel";
 import { RiskAnalyzer } from "@/components/risk-analyzer";
 import { RiskHistory } from "@/components/risk-history";
@@ -361,7 +362,11 @@ export function ProjectDetailClient({
           // Auditor disagreements (Fix C UI) — surfaced by fix-all
           // when OpenAI and Gemini contradict each other on the
           // same finding.
-          entry.artifact_key?.startsWith(`audit_disagreement:`)
+          entry.artifact_key?.startsWith(`audit_disagreement:`) ||
+          // Decisions needed (Fix D + F UI) — surfaced by fix-all
+          // when the Builder declines a finding that requires
+          // human input.
+          entry.artifact_key?.startsWith(`decision_needed:`)
         ) {
           setRiskRefreshKey((k) => k + 1);
         }
@@ -561,6 +566,14 @@ export function ProjectDetailClient({
               risk is on-demand reasoning, concerns are proactive
               reasoning, memory is the substrate both rely on. */}
           <AmbientFindingsPanel
+            projectId={projectId}
+            refreshKey={riskRefreshKey}
+          />
+          {/* Decisions Needed — findings the Builder declined to fix
+              because they require human input (URLs, contracts,
+              architectural choices). Sibling of Disagreements; both
+              are "I can't decide this, can you?" surfaces. */}
+          <DecisionsNeededPanel
             projectId={projectId}
             refreshKey={riskRefreshKey}
           />

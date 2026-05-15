@@ -18,6 +18,8 @@ import type {
   CreateProjectRequest,
   CreateProjectResponse,
   DisagreementsResponse,
+  DecisionsResponse,
+  ResolveDecisionResponse,
   ResolveDisagreementResponse,
   FixAllEstimate,
   FixAllPassesResponse,
@@ -315,6 +317,30 @@ export async function resolveDisagreement(
   if (chosenAuditor) body.chosen_auditor = chosenAuditor;
   return postJSON<typeof body, ResolveDisagreementResponse>(
     `/api/projects/${encodeURIComponent(projectId)}/disagreements/${encodeURIComponent(digest)}/resolve`,
+    body,
+  );
+}
+
+// -- Decisions needed (Fix D + Fix F UI) --------------------------
+
+export async function getDecisions(
+  projectId: string,
+): Promise<DecisionsResponse> {
+  return getJSON<DecisionsResponse>(
+    `/api/projects/${encodeURIComponent(projectId)}/decisions`,
+  );
+}
+
+export async function resolveDecision(
+  projectId: string,
+  digest: string,
+  action: "provide_value" | "dismiss",
+  value?: string,
+): Promise<ResolveDecisionResponse> {
+  const body: { action: string; value?: string } = { action };
+  if (value !== undefined) body.value = value;
+  return postJSON<typeof body, ResolveDecisionResponse>(
+    `/api/projects/${encodeURIComponent(projectId)}/decisions/${encodeURIComponent(digest)}/resolve`,
     body,
   );
 }

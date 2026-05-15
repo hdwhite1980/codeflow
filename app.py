@@ -1682,6 +1682,86 @@ async def resolve_disagreement_endpoint(
 
 
 # ---------------------------------------------------------------------------
+# Decisions needed (Fix D + Fix F UI).
+# ---------------------------------------------------------------------------
+#
+# When the Builder declines to fix a finding because the answer requires
+# human input (a real URL, an architectural decision, an exception
+# contract), fix-all persists the refusal as a decision_needed record.
+# These endpoints let users enumerate pending decisions and resolve them
+# by either providing a value (which gets re-injected into the next
+# fix-all pass) or dismissing the finding entirely.
+
+@app.get("/api/projects/{project_id}/decisions")
+async def list_decisions_endpoint(
+    project_id: str, include_resolved: bool = False,
+) -> dict[str, Any]:
+    """Return pending decisions for a project. Sorted by decision_type
+    priority (architectural first), then recency desc."""
+    from fix_all_pipeline import list_decisions_needed
+    store: LedgerStore = app.state.store
+    items = list_decisions_needed(
+        store, project_id, include_resolved=include_resolved,
+    )
+    return {
+        "project_id": project_id,
+        "decisions": items,
+        "count": len(items),
+    }
+
+
+class ResolveDecisionRequest(BaseModel):
+    action: str = Field(..., pattern="^(provide_value|dismiss)$")
+    value: Optional[str] = Field(None, max_length=2000)
+
+
+class ResolveDecisionResponse(BaseModel):
+    project_id: str
+    digest: str
+    resolved: bool
+    action: str
+
+
+@app.post(
+    "/api/projects/{project_id}/decisions/{digest}/resolve",
+    response_model=ResolveDecisionResponse,
+)
+async def resolve_decision_endpoint(
+    project_id: str, digest: str, req: ResolveDecisionRequest,
+) -> ResolveDecisionResponse:
+    """Resolve a pending decision.
+
+    - ``provide_value``: user supplied an answer. Body must include
+      ``value``. The synthesized finding gets re-injected into the next
+      fix-all pass.
+    - ``dismiss``: user decided the finding is fine as-is.
+
+    Idempotent — re-resolving the same digest supersedes the prior
+    resolution. The user can change their mind."""
+    from fix_all_pipeline import resolve_decision_needed
+    store: LedgerStore = app.state.store
+    try:
+        result = resolve_decision_needed(
+            store, project_id, digest,
+            action=req.action, value=req.value,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if result is None and req.action == "provide_value":
+        # Either the digest doesn't exist or some other miss.
+        raise HTTPException(
+            status_code=404,
+            detail=f"No decision {digest!r} found for project {project_id}.",
+        )
+    return ResolveDecisionResponse(
+        project_id=project_id,
+        digest=digest,
+        resolved=True,
+        action=req.action,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Risk gate — proceed/cancel for paused iterations and fix-all passes.
 # ---------------------------------------------------------------------------
 #
