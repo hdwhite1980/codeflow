@@ -11,6 +11,7 @@ import { IterationHistory } from "@/components/iteration-history";
 import { IterationInput } from "@/components/iteration-input";
 import { LiveIndicator } from "@/components/live-indicator";
 import { AmbientFindingsPanel } from "@/components/ambient-findings-panel";
+import { AuditorDisagreementsPanel } from "@/components/auditor-disagreements-panel";
 import { ProjectMemoryPanel } from "@/components/project-memory-panel";
 import { RiskAnalyzer } from "@/components/risk-analyzer";
 import { RiskHistory } from "@/components/risk-history";
@@ -356,7 +357,11 @@ export function ProjectDetailClient({
           // Ambient findings (Turn E) — generated after every
           // guardian_index pass. Bumping refreshKey makes the
           // Concerns panel pull the new list.
-          entry.artifact_key?.startsWith(`ambient_finding:`)
+          entry.artifact_key?.startsWith(`ambient_finding:`) ||
+          // Auditor disagreements (Fix C UI) — surfaced by fix-all
+          // when OpenAI and Gemini contradict each other on the
+          // same finding.
+          entry.artifact_key?.startsWith(`audit_disagreement:`)
         ) {
           setRiskRefreshKey((k) => k + 1);
         }
@@ -556,6 +561,15 @@ export function ProjectDetailClient({
               risk is on-demand reasoning, concerns are proactive
               reasoning, memory is the substrate both rely on. */}
           <AmbientFindingsPanel
+            projectId={projectId}
+            refreshKey={riskRefreshKey}
+          />
+          {/* Auditor Disagreements — cases where OpenAI and Gemini
+              gave contradictory suggestions for the same finding.
+              Fix-all skips these and waits for human decision.
+              Slotted between Concerns (which auto-actions) and
+              Memory (which is the substrate). */}
+          <AuditorDisagreementsPanel
             projectId={projectId}
             refreshKey={riskRefreshKey}
           />

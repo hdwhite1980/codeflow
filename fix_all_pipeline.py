@@ -37,6 +37,7 @@ project. Matches the estimate the frontend showed the user.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from dataclasses import dataclass
@@ -990,22 +991,58 @@ def detect_auditor_disagreements(
     return consensus, disagreement_groups
 
 
+def _disagreement_digest(group: list[Finding]) -> str:
+    """Stable hash for a disagreement group. Same disagreement re-
+    emerging in a later pass produces the same digest, which means
+    resolution state survives across passes.
+
+    Inputs to the hash:
+      - file path (the disagreement is file-scoped)
+      - lowest line number in the group (collapses adjacent-line cases)
+      - sorted set of (auditor, issue) tuples (who said what, content-
+        identifying)
+
+    Suggestion text intentionally excluded because the model may
+    paraphrase suggestions slightly across passes while still raising
+    the same underlying concern.
+    """
+    if not group:
+        return ""
+    file_path = group[0].file_path or ""
+    min_line = min((f.line or 0) for f in group)
+    parts = sorted({(f.auditor, (f.issue or "").strip()[:200]) for f in group})
+    seed = f"{file_path}::{min_line}::" + "||".join(
+        f"{a}:{i}" for a, i in parts
+    )
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
+
+
 def write_audit_disagreements(
     store: LedgerStore, project_id: str, seq: int,
     disagreement_groups: list[list[Finding]],
 ) -> None:
-    """Persist auditor disagreements as a ledger record so the UI can
-    surface them as "needs human decision" items.
+    """Persist auditor disagreements as ledger records the UI surfaces
+    as "needs human decision" items.
+
+    Each group writes its OWN artifact under
+    ``audit_disagreement:<project>:<digest>``. Digest is stable across
+    passes (same disagreement re-emerging upserts in place), so
+    resolution state survives indexer re-runs.
 
     Empty groups list is a no-op — we don't want to clutter the ledger
-    with empty markers."""
+    with empty markers.
+    """
     if not disagreement_groups:
         return
-    payload = []
     for grp in disagreement_groups:
-        payload.append({
+        digest = _disagreement_digest(grp)
+        if not digest:
+            continue
+        body = {
+            "digest": digest,
+            "seq": seq,
             "file_path": grp[0].file_path if grp else "",
-            "line": grp[0].line if grp else None,
+            "line": min((f.line or 0) for f in grp) if grp else None,
             "findings": [
                 {
                     "auditor": f.auditor,
@@ -1016,24 +1053,206 @@ def write_audit_disagreements(
                 }
                 for f in grp
             ],
-        })
+            "detected_at": time.time(),
+            "resolved_at": None,
+            "resolved_auditor": None,
+            "resolved_action": None,  # "queue_fix" | "dismiss_both"
+        }
+        # If a resolution exists from a prior pass, preserve it. Same
+        # logic as ambient findings' dismissal preservation.
+        target_key = f"audit_disagreement:{project_id}:{digest}"
+        previous = store.current_entry(project_id, target_key)
+        if previous is not None:
+            try:
+                prev_blob, _ = store.get_blob(previous.blob_sha256)
+                prev_body = json.loads(prev_blob.decode("utf-8")) if prev_blob else {}
+                if prev_body.get("resolved_at"):
+                    body["resolved_at"] = prev_body.get("resolved_at")
+                    body["resolved_auditor"] = prev_body.get("resolved_auditor")
+                    body["resolved_action"] = prev_body.get("resolved_action")
+            except Exception:
+                pass
+        store.write_entry(
+            project_id=project_id,
+            tier=Tier.AUDIT,
+            artifact_kind=ArtifactKind.DECISION_RECORD,
+            artifact_key=target_key,
+            body=body,
+            rationale=(
+                f"Auditor disagreement on {body['file_path']}"
+                + (f" line {body['line']}" if body['line'] else "")
+                + f" between {' vs '.join(sorted({f.auditor for f in grp}))}"
+            ),
+            author=f"worker:fix_all:{seq}",
+        )
+
+
+def list_audit_disagreements(
+    store: LedgerStore, project_id: str, *,
+    include_resolved: bool = False,
+) -> list[dict[str, Any]]:
+    """Return current disagreements for a project.
+
+    Unresolved-only by default. Use ``include_resolved=True`` for an
+    audit-log view.
+
+    Sorted: unresolved first, then by detected_at descending.
+    """
+    decisions = store.all_current(project_id, ArtifactKind.DECISION_RECORD)
+    out: list[dict[str, Any]] = []
+    prefix = f"audit_disagreement:{project_id}:"
+    for d in decisions:
+        if not d.artifact_key.startswith(prefix):
+            continue
+        try:
+            blob, _ = store.get_blob(d.blob_sha256)
+            body = json.loads(blob.decode("utf-8")) if blob else {}
+        except Exception:
+            continue
+        if not include_resolved and body.get("resolved_at"):
+            continue
+        out.append(body)
+
+    out.sort(key=lambda b: (
+        b.get("resolved_at") is not None,  # unresolved first (False sorts before True)
+        -(b.get("detected_at") or 0),
+    ))
+    return out
+
+
+def resolve_audit_disagreement(
+    store: LedgerStore, project_id: str, digest: str,
+    *,
+    action: str,
+    chosen_auditor: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    """Record a user's resolution of an auditor disagreement.
+
+    Two valid actions:
+      - ``"queue_fix"``: user picked one auditor's finding as correct.
+        ``chosen_auditor`` must be set. The selected finding gets
+        returned so the caller can re-queue it via the normal fix-all
+        flow. The other auditor's finding is implicitly dismissed.
+      - ``"dismiss_both"``: user decided neither auditor was right
+        (e.g. both findings are opinion-based). Both findings dropped.
+
+    Returns the chosen finding body (dict) when action=queue_fix, or
+    None for dismiss_both or when the digest isn't found.
+
+    The disagreement record's resolved_* fields are stamped; the entry
+    is superseded with the new body. Future fix-all passes that
+    re-detect this disagreement see the prior resolution and preserve
+    the dismissal/queue state.
+    """
+    if action not in {"queue_fix", "dismiss_both"}:
+        raise ValueError(
+            f"action must be 'queue_fix' or 'dismiss_both', got {action!r}"
+        )
+    if action == "queue_fix" and not chosen_auditor:
+        raise ValueError("queue_fix requires chosen_auditor")
+
+    target_key = f"audit_disagreement:{project_id}:{digest}"
+    current = store.current_entry(project_id, target_key)
+    if current is None:
+        return None
+    try:
+        blob, _ = store.get_blob(current.blob_sha256)
+        body = json.loads(blob.decode("utf-8")) if blob else {}
+    except Exception:
+        return None
+
+    chosen_finding: Optional[dict[str, Any]] = None
+    if action == "queue_fix":
+        for f in body.get("findings", []):
+            if f.get("auditor") == chosen_auditor:
+                chosen_finding = f
+                break
+        if chosen_finding is None:
+            raise ValueError(
+                f"no finding from auditor {chosen_auditor!r} in this group"
+            )
+
+    body["resolved_at"] = time.time()
+    body["resolved_auditor"] = chosen_auditor
+    body["resolved_action"] = action
+
     store.write_entry(
         project_id=project_id,
         tier=Tier.AUDIT,
         artifact_kind=ArtifactKind.DECISION_RECORD,
-        artifact_key=f"fix_all:{seq}:disagreements",
-        body={
-            "seq": seq,
-            "groups": payload,
-            "detected_at": time.time(),
-        },
+        artifact_key=target_key,
+        body=body,
         rationale=(
-            f"Fix-all pass {seq} detected {len(disagreement_groups)} "
-            f"auditor disagreement group(s) — surfaced for human review "
-            f"instead of auto-fix."
+            f"User resolved disagreement on {body.get('file_path', '?')}: "
+            + (f"chose {chosen_auditor}'s position"
+               if action == "queue_fix" else "dismissed both auditors")
         ),
-        author=f"worker:fix_all:{seq}",
+        author="user:resolve_disagreement",
     )
+    return chosen_finding
+
+
+def loaded_resolved_disagreements_as_findings(
+    store: LedgerStore, project_id: str,
+) -> list[Finding]:
+    """Return Finding objects from disagreements the user resolved with
+    ``queue_fix`` action. Caller adds these back into the next fix-all
+    pass's findings list so the chosen-auditor finding actually gets
+    fixed.
+
+    Once a resolution-queued finding has been acted upon — i.e. it
+    appears in the resolved set of a later fix-all pass — it stops
+    being re-queued. We detect this by checking whether the resolution
+    timestamp predates the most recent fix-all completion.
+    """
+    decisions = store.all_current(project_id, ArtifactKind.DECISION_RECORD)
+    prefix = f"audit_disagreement:{project_id}:"
+
+    # Find the most recent fix-all completion to know whether resolutions
+    # have been acted on. If a resolution timestamp is OLDER than the
+    # most recent fix-all report, the chosen finding has had its shot.
+    most_recent_report_at = 0.0
+    for d in decisions:
+        if (d.artifact_key.startswith("fix_all:")
+                and d.artifact_key.endswith(":report")):
+            try:
+                blob, _ = store.get_blob(d.blob_sha256)
+                body = json.loads(blob.decode("utf-8")) if blob else {}
+                completed = float(body.get("completed_at") or 0)
+                if completed > most_recent_report_at:
+                    most_recent_report_at = completed
+            except Exception:
+                continue
+
+    out: list[Finding] = []
+    for d in decisions:
+        if not d.artifact_key.startswith(prefix):
+            continue
+        try:
+            blob, _ = store.get_blob(d.blob_sha256)
+            body = json.loads(blob.decode("utf-8")) if blob else {}
+        except Exception:
+            continue
+        if body.get("resolved_action") != "queue_fix":
+            continue
+        resolved_at = float(body.get("resolved_at") or 0)
+        if resolved_at <= most_recent_report_at:
+            # The resolution predates the most recent fix-all completion
+            # — it's already had its chance to run. Don't re-queue.
+            continue
+        chosen_auditor = body.get("resolved_auditor")
+        for f in body.get("findings", []):
+            if f.get("auditor") == chosen_auditor:
+                out.append(Finding(
+                    file_path=body.get("file_path", ""),
+                    severity=f.get("severity", "warning"),
+                    line=f.get("line"),
+                    issue=f.get("issue", ""),
+                    suggestion=f.get("suggestion", ""),
+                    auditor=f.get("auditor", "unknown"),
+                ))
+                break
+    return out
 
 
 def next_fix_all_seq(store: LedgerStore, project_id: str) -> int:

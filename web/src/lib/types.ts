@@ -607,3 +607,45 @@ export interface AmbientFindingsResponse {
   findings: AmbientFinding[];
   count: number;
 }
+
+// -- Auditor disagreements (Fix C UI) -----------------------------
+//
+// When fix-all detects that OpenAI and Gemini disagree on a
+// finding (same file/line region, contradictory suggestions), it
+// surfaces the group here instead of auto-fixing either side.
+// The user picks which auditor was right (or dismisses both)
+// via /disagreements/<digest>/resolve.
+
+export interface DisagreementFinding {
+  auditor: string;
+  severity: string;
+  line: number | null;
+  issue: string;
+  suggestion: string;
+}
+
+export interface AuditorDisagreement {
+  digest: string;
+  seq: number;
+  file_path: string;
+  line: number | null;
+  findings: DisagreementFinding[];
+  detected_at: number;
+  resolved_at?: number | null;
+  resolved_auditor?: string | null;
+  resolved_action?: string | null;  // "queue_fix" | "dismiss_both"
+}
+
+export interface DisagreementsResponse {
+  project_id: string;
+  disagreements: AuditorDisagreement[];
+  count: number;
+}
+
+export interface ResolveDisagreementResponse {
+  project_id: string;
+  digest: string;
+  resolved: boolean;
+  action: string;
+  queued_finding?: DisagreementFinding | null;
+}

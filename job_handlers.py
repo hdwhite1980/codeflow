@@ -776,6 +776,7 @@ async def handle_fix_all(job: dict[str, Any], ctx: HandlerContext) -> None:
         discover_dependent_paths,
         filter_oscillating_findings,
         load_recent_resolved_findings,
+        loaded_resolved_disagreements_as_findings,
         detect_auditor_disagreements,
         write_audit_disagreements,
         write_fix_all_resolved,
@@ -990,6 +991,33 @@ async def handle_fix_all(job: dict[str, Any], ctx: HandlerContext) -> None:
         write_audit_disagreements(
             ctx.store, project_id, seq, disagreement_groups,
         )
+
+    # Re-inject findings the user previously resolved from disagreement
+    # groups with action=queue_fix. These are user-decided concerns and
+    # should run through the fix pipeline regardless of what the auditors
+    # said this pass. We add them AFTER disagreement detection so they
+    # don't get re-grouped into a new disagreement (the user already
+    # decided).
+    try:
+        user_chosen = loaded_resolved_disagreements_as_findings(
+            ctx.store, project_id,
+        )
+        if user_chosen:
+            print(f"[handlers] fix_all: re-injecting {len(user_chosen)} "
+                  f"user-resolved finding(s) from disagreement panel",
+                  flush=True)
+            existing_keys = {
+                (f.file_path, f.severity, f.line or 0, (f.issue or "")[:80])
+                for f in consensus_findings
+            }
+            for f in user_chosen:
+                key = (f.file_path, f.severity, f.line or 0,
+                       (f.issue or "")[:80])
+                if key not in existing_keys:
+                    consensus_findings.append(f)
+    except Exception as exc:
+        print(f"[handlers] fix_all: resolved-disagreement injection "
+              f"failed: {type(exc).__name__}: {exc}", flush=True)
 
     # If filtering ate everything, we're done — nothing to fix this pass.
     if not consensus_findings:

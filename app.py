@@ -1593,6 +1593,95 @@ async def dismiss_finding_endpoint(
 
 
 # ---------------------------------------------------------------------------
+# Auditor disagreements (Fix C + UI).
+# ---------------------------------------------------------------------------
+#
+# When OpenAI and Gemini flag the same code with contradictory suggestions,
+# fix-all writes a disagreement record under audit_disagreement:<pid>:<digest>
+# and refuses to auto-fix either side. These endpoints let the user
+# enumerate open disagreements and resolve them by picking which auditor
+# was right (or dismissing both). Resolved-with-queue_fix findings get
+# re-injected into the next fix-all pass.
+
+@app.get("/api/projects/{project_id}/disagreements")
+async def list_disagreements_endpoint(
+    project_id: str, include_resolved: bool = False,
+) -> dict[str, Any]:
+    """Return current auditor disagreements for a project.
+
+    Unresolved-only by default. ?include_resolved=true returns the
+    full history (useful for an audit log; not normally rendered)."""
+    from fix_all_pipeline import list_audit_disagreements
+    store: LedgerStore = app.state.store
+    items = list_audit_disagreements(
+        store, project_id, include_resolved=include_resolved,
+    )
+    return {
+        "project_id": project_id,
+        "disagreements": items,
+        "count": len(items),
+    }
+
+
+class ResolveDisagreementRequest(BaseModel):
+    action: str = Field(..., pattern="^(queue_fix|dismiss_both)$")
+    chosen_auditor: Optional[str] = Field(None, max_length=64)
+
+
+class ResolveDisagreementResponse(BaseModel):
+    project_id: str
+    digest: str
+    resolved: bool
+    action: str
+    queued_finding: Optional[dict[str, Any]] = None
+
+
+@app.post(
+    "/api/projects/{project_id}/disagreements/{digest}/resolve",
+    response_model=ResolveDisagreementResponse,
+)
+async def resolve_disagreement_endpoint(
+    project_id: str, digest: str, req: ResolveDisagreementRequest,
+) -> ResolveDisagreementResponse:
+    """Resolve a disagreement.
+
+    Two valid actions:
+      - ``queue_fix``: user picked one auditor's position. Body must
+        include ``chosen_auditor``. The selected finding gets queued
+        for the next fix-all pass via the disagreement-injection
+        path in handle_fix_all.
+      - ``dismiss_both``: user decided neither auditor was right.
+        Both findings dropped; the disagreement marked resolved.
+
+    Idempotent — resolving the same digest twice with the same action
+    succeeds. Re-resolving with a different action supersedes the
+    prior resolution (the user changed their mind)."""
+    from fix_all_pipeline import resolve_audit_disagreement
+    store: LedgerStore = app.state.store
+    try:
+        chosen = resolve_audit_disagreement(
+            store, project_id, digest,
+            action=req.action, chosen_auditor=req.chosen_auditor,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if chosen is None and req.action == "queue_fix":
+        # No matching digest, or chosen_auditor not in group.
+        raise HTTPException(
+            status_code=404,
+            detail=f"No disagreement {digest!r} found, or chosen_auditor "
+                   f"not in its findings.",
+        )
+    return ResolveDisagreementResponse(
+        project_id=project_id,
+        digest=digest,
+        resolved=True,
+        action=req.action,
+        queued_finding=chosen,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Risk gate — proceed/cancel for paused iterations and fix-all passes.
 # ---------------------------------------------------------------------------
 #

@@ -14,10 +14,11 @@
 
 import type {
   AmbientFindingsResponse,
-  ArtifactListResponse,
-  AuditResponse,
+  ArtifactListResponse,  AuditResponse,
   CreateProjectRequest,
   CreateProjectResponse,
+  DisagreementsResponse,
+  ResolveDisagreementResponse,
   FixAllEstimate,
   FixAllPassesResponse,
   FixAllResponse,
@@ -291,6 +292,30 @@ export async function dismissFinding(
   >(
     `/api/projects/${encodeURIComponent(projectId)}/findings/${encodeURIComponent(digest)}/dismiss`,
     reason ? { reason } : {},
+  );
+}
+
+// -- Auditor disagreements (Fix C UI) ------------------------------
+
+export async function getDisagreements(
+  projectId: string,
+): Promise<DisagreementsResponse> {
+  return getJSON<DisagreementsResponse>(
+    `/api/projects/${encodeURIComponent(projectId)}/disagreements`,
+  );
+}
+
+export async function resolveDisagreement(
+  projectId: string,
+  digest: string,
+  action: "queue_fix" | "dismiss_both",
+  chosenAuditor?: string,
+): Promise<ResolveDisagreementResponse> {
+  const body: { action: string; chosen_auditor?: string } = { action };
+  if (chosenAuditor) body.chosen_auditor = chosenAuditor;
+  return postJSON<typeof body, ResolveDisagreementResponse>(
+    `/api/projects/${encodeURIComponent(projectId)}/disagreements/${encodeURIComponent(digest)}/resolve`,
+    body,
   );
 }
 
