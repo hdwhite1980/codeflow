@@ -39,7 +39,7 @@ iteration — Redis is the buffer.
 from __future__ import annotations
 
 import asyncio
-from typing import Optional
+from typing import Any, Optional
 import os
 import signal
 import time
@@ -110,21 +110,27 @@ class Worker:
             if self.openai: auditors.append("openai")
             if self.gemini: auditors.append("gemini")
             print(f"[worker] auditors configured: {', '.join(auditors)}")
-        # Ollama is optional. The guardian subsystem reuses this client.
-        # If OLLAMA_BASE_URL is unset, we skip construction entirely and
-        # guardian_index jobs write disabled-records when they run.
-        self.ollama: OllamaClient | None = None
-        if os.environ.get("OLLAMA_BASE_URL") or os.environ.get("OLLAMA_ENABLED") == "true":
-            try:
-                self.ollama = OllamaClient()
-                print(f"[worker] guardian local AI configured "
-                      f"(model={self.ollama._default_model}, "
-                      f"base={self.ollama._base_url})")
-            except Exception as exc:
-                print(f"[worker] Ollama setup failed: "
-                      f"{type(exc).__name__}: {exc}; guardian disabled.")
-        else:
-            print("[worker] OLLAMA_BASE_URL not set; guardian disabled.")
+        # Guardian indexing client. Two backends supported via the
+        # GUARDIAN_INDEXING_BACKEND env var:
+        #   - claude-haiku (default): Claude Haiku 4.5, ~20-30x faster
+        #   - ollama: local Qwen 2.5 Coder on the Hetzner box
+        #
+        # Both expose the same .complete(prompt, system=, max_tokens=,
+        # temperature=) interface that guardian_pipeline expects, so
+        # the rest of the code is backend-agnostic.
+        #
+        # The attribute is still named `self.ollama` for historical
+        # reasons — HandlerContext.ollama, continuous_indexer's startup
+        # check, and several handler call sites all use that name.
+        # Renaming would touch ~10 files for no functional gain. Treat
+        # it as "guardian indexing client" semantically.
+        from guardian_client_factory import (
+            make_guardian_client, chosen_backend,
+        )
+        self.ollama: Any | None = make_guardian_client()
+        if self.ollama is None:
+            print(f"[worker] guardian indexing DISABLED "
+                  f"(backend={chosen_backend()}; required env not set)")
         self.ctx = HandlerContext(
             store=self.store,
             anthropic=self.anthropic,

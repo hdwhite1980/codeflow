@@ -1109,11 +1109,12 @@ async def guardian_index(
 
     Behaviour
     ---------
-    The actual indexing runs on the worker. The worker requires
-    OLLAMA_BASE_URL to be set and the Ollama daemon to be reachable;
-    if not, the job writes a `guardian:disabled:*` decision record
-    and returns without indexing. The frontend can surface this so
-    the operator knows the guardian isn't running.
+    The actual indexing runs on the worker. The worker picks the
+    backend from GUARDIAN_INDEXING_BACKEND env var (default
+    ``claude-haiku``; ``ollama`` also supported). If the chosen
+    backend isn't configured, the job writes a ``guardian:disabled:*``
+    decision record and returns without indexing — the frontend can
+    surface this so the operator knows guardian isn't running.
     """
     queue: JobQueue = app.state.queue
     payload: dict[str, Any] = {"project_id": project_id}
