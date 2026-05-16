@@ -146,6 +146,40 @@ When the request lists specific audit findings to fix, you may encounter finding
 
 Do NOT invent fake values, guess at architectural decisions, or apply a fix that requires information you're inferring rather than reading. Instead, list those findings in the `unfixable_findings` array with a clear explanation of what decision is needed from the human. Then proceed with the findings you CAN fix.
 
+EXAMPLES of unfixable_findings entries (use this shape exactly):
+
+Example 1 — placeholder URL in a manifest:
+{
+  "file_path": "module.psd1",
+  "line": 84,
+  "issue": "LicenseUri is empty",
+  "decision_needed": "What URL should LicenseUri point to?",
+  "decision_type": "value",
+  "blocking_info": "No repository URL or license-host URL appears anywhere in the codebase to infer from."
+}
+
+Example 2 — architectural choice (mandatory vs optional dependency):
+{
+  "file_path": "module.psd1",
+  "line": 21,
+  "issue": "ActiveDirectory not listed in RequiredModules",
+  "decision_needed": "Should ActiveDirectory be a mandatory dependency, or kept optional because the module has a local-account fallback?",
+  "decision_type": "architectural",
+  "blocking_info": "The .psm1 has fallback logic suggesting AD is optional. Making it required would break that path. The user must decide which behavior is intended."
+}
+
+Example 3 — exception-contract choice:
+{
+  "file_path": "module.psm1",
+  "line": 153,
+  "issue": "Remove-User catches generic Exception",
+  "decision_needed": "Which specific exception type should Remove-User throw when the user is not found?",
+  "decision_type": "contract",
+  "blocking_info": "No type annotation, no docstring contract, no test asserts a specific type."
+}
+
+CRITICAL: an unfixable_findings entry is BETTER than a fake fix. A fake fix (placeholder URL like 'https://example.com', invented company name, guessed exception type) is a regression. Refusing the finding via unfixable_findings is not a failure — it's how the system collects human decisions.
+
 Output STRICT JSON (no markdown fences, no commentary). Schema:
 {
   "rationale": "<1-3 sentences explaining the plan>",
@@ -174,7 +208,7 @@ Rules:
   - Prefer changing existing files over creating new ones.
   - If the request is unclear or impossible given the inventory, return all-empty lists and explain in rationale.
   - Maximum 30 entries across all three change lists combined.
-  - `unfixable_findings` is for findings you decline to fix because they need human input. An empty list is fine. Never invent values to avoid filling this in.
+  - `unfixable_findings` is for findings you decline to fix because they need human input. An empty list is fine when every finding is mechanically fixable. Never invent values to avoid filling this in.
 """
 
 
@@ -722,6 +756,14 @@ async def _plan_iteration(
         )
 
     plan = _parse_plan(result.text, inventory)
+    # Diagnostic: log how many findings the Builder declined as
+    # unfixable on this plan. Zero is fine when the cluster has only
+    # mechanical fixes; persistent zero across passes where we
+    # expect refusals is a sign the prompt isn't landing.
+    print(f"[iterate] plan parsed: {len(plan.changes)} changes, "
+          f"{len(plan.new_files)} new, {len(plan.deletes)} deletes, "
+          f"{len(plan.unfixable_findings)} unfixable",
+          flush=True)
     return plan, result.input_tokens, result.output_tokens
 
 

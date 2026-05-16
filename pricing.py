@@ -48,7 +48,12 @@ PRICING_PER_MTOK: dict[str, tuple[float, float]] = {
     "claude-sonnet-4-6":   (3.00,  15.00),
     "claude-opus-4-7":     (5.00,  25.00),
     "claude-opus-4-6":     (5.00,  25.00),
-    "claude-haiku-4-5":    (1.00,   5.00),
+    "claude-haiku-4-5":            (1.00,   5.00),
+    # Anthropic API returns the dated model identifier in responses,
+    # not the alias we send. Both need to resolve to a price or the
+    # logs spam "no price for model" on every guardian call. Add new
+    # dated variants here as Anthropic publishes them.
+    "claude-haiku-4-5-20251001":   (1.00,   5.00),
 
     # --- OpenAI ---
     # gpt-5.4-mini is what the audit pipeline uses by default.

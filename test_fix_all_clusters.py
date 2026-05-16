@@ -210,6 +210,24 @@ class TestBuildClusterPrompt(unittest.TestCase):
         # a half-fix" — both are the same idea.
         self.assertIn("half-fix", prompt.lower())
 
+    def test_unfixable_instruction_present(self):
+        """Cluster prompt must teach the Builder to use unfixable_findings
+        for human-input cases, not invent values. This is the post-mortem
+        fix for the Builder ignoring the system prompt's refusal path
+        when the user prompt was pushing it to fix everything."""
+        prompt = build_cluster_prompt(
+            self._basic_cluster(),
+            cluster_index=0, total_clusters=1,
+        )
+        self.assertIn("unfixable_findings", prompt)
+        self.assertIn("decision_needed", prompt)
+        # The cluster prompt should explicitly warn against inventing values.
+        prompt_lower = prompt.lower()
+        self.assertTrue(
+            "invent" in prompt_lower or "fake values" in prompt_lower,
+            "Cluster prompt should warn against inventing fake values",
+        )
+
 
 class TestDiscoverDependentPaths(unittest.TestCase):
     def test_no_targets_returns_empty(self):

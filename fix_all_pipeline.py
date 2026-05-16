@@ -449,10 +449,21 @@ def build_cluster_prompt(
     lines.append(
         f"The following {len(cluster.findings)} finding"
         f"{'s' if len(cluster.findings) != 1 else ''} share a common "
-        "concept. They MUST be fixed with a CONSISTENT approach — "
+        "concept. When you can fix them, use a CONSISTENT approach — "
         "do not apply different patterns to different findings in "
         "this cluster. Decide the right fix once, then apply it "
         "everywhere it's relevant within the files listed."
+    )
+    lines.append("")
+    lines.append(
+        "Some findings in this cluster MAY require human input you "
+        "don't have — a real URL, an architectural decision, a "
+        "behavioral contract that isn't documented. For those, do NOT "
+        "invent values, guess intent, or apply a placeholder. Instead, "
+        "list them in the plan's `unfixable_findings` array with a "
+        "concrete `decision_needed` question and proceed with the "
+        "findings you CAN fix. The unfixable list is how you tell us "
+        "what decision the human needs to make."
     )
     lines.append("")
 
@@ -494,11 +505,17 @@ def build_cluster_prompt(
 
     lines.append("")
     lines.append(
+        "Reminder: if a finding requires information you don't have — "
+        "real URLs, architectural decisions, exception-contract choices, "
+        "policy decisions about fallback behavior — DO NOT FIX IT. List "
+        "it in `unfixable_findings` with a clear `decision_needed` "
+        "question. That signal is how the system asks the human for "
+        "input. Inventing fake values or applying speculative fixes is "
+        "actively worse than leaving the finding alone.\n\n"
         "If a finding cannot be safely fixed without changes to files "
-        "outside this cluster — leave that specific finding alone and "
-        "continue with the others. Do not produce a half-fix that "
-        "leaves the codebase in a worse state. Unfixed findings will "
-        "be reported separately."
+        "OUTSIDE this cluster (other cross-cluster work) — leave that "
+        "specific finding alone. Do not produce a half-fix that leaves "
+        "the codebase in a worse state."
     )
     return "\n".join(lines)
 
